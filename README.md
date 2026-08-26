@@ -1,70 +1,41 @@
-# Getting Started with Create React App
+# BuildWise SmartScan
 
-This project was bootstrapped with [Create React App](https://github.com/facebook/create-react-app).
+BuildWise SmartScan is a web-first room capture and customization prototype.
 
-## Available Scripts
+## Web workflow
 
-In the project directory, you can run:
+1. Open the site over HTTPS on a mobile phone. Camera and motion permissions do not work from an insecure phone URL.
+2. Tap **Start scan** and follow the guided movement checkpoints.
+3. The mobile browser captures real JPEG keyframes and records heading, timestamps, and an estimated local movement path.
+4. Finish the scan, open the room customizer, or export the scan as a JSON session.
+5. Open the site on a desktop browser and use **Load scan** to import that JSON session. The captured frames, room footprint, and customization controls are then available on desktop.
 
-### `npm start`
+The website also works as a desktop review/customization tool without a camera. Desktop users can load a scan exported from a phone.
 
-Runs the app in the development mode.\
-Open [http://localhost:3000](http://localhost:3000) to view it in your browser.
+## What is real today
 
-The page will reload when you make changes.\
-You may also see any lint errors in the console.
+- Camera frames come from `getUserMedia`, not the placeholder room illustration.
+- Movement and heading signals advance guidance when the browser grants sensor access.
+- Checkpoint progress is manual when sensors are unavailable; a timer does not fake scan progress.
+- Scan sessions contain embedded images, poses, timestamps, and a version number, so they can move between phone and desktop without a backend.
+- The room customizer can review captured frames, visualize the estimated path, preview furniture assets, change material tone and scale, and show a camera overlay.
 
-### `npm test`
+## Important limitation
 
-Launches the test runner in the interactive watch mode.\
-See the section about [running tests](https://facebook.github.io/create-react-app/docs/running-tests) for more information.
+Web browsers do not expose ARKit's room-mesh reconstruction across all mobile devices. This prototype creates a reliable capture package for a reconstruction service and provides a camera-overlay customization fallback. Exact wall geometry and world-locked AR placement require either a WebXR-capable device/browser or a backend that reconstructs the room from the exported images.
 
-### `npm run build`
+## Run locally
 
-Builds the app for production to the `build` folder.\
-It correctly bundles React in production mode and optimizes the build for the best performance.
+```bash
+npm install
+npm start
+```
 
-The build is minified and the filenames include the hashes.\
-Your app is ready to be deployed!
+For a phone on the same network, use an HTTPS dev tunnel or deploy the production build to HTTPS. A plain `http://localhost` works on the development computer, but phone camera access normally requires HTTPS.
 
-See the section about [deployment](https://facebook.github.io/create-react-app/docs/deployment) for more information.
+```bash
+npm test -- --watchAll=false --runInBand
+npm run build
+```
 
-### `npm run eject`
-
-**Note: this is a one-way operation. Once you `eject`, you can't go back!**
-
-If you aren't satisfied with the build tool and configuration choices, you can `eject` at any time. This command will remove the single build dependency from your project.
-
-Instead, it will copy all the configuration files and the transitive dependencies (webpack, Babel, ESLint, etc) right into your project so you have full control over them. All of the commands except `eject` will still work, but they will point to the copied scripts so you can tweak them. At this point you're on your own.
-
-You don't have to ever use `eject`. The curated feature set is suitable for small and middle deployments, and you shouldn't feel obligated to use this feature. However we understand that this tool wouldn't be useful if you couldn't customize it when you are ready for it.
-
-## Learn More
-
-You can learn more in the [Create React App documentation](https://facebook.github.io/create-react-app/docs/getting-started).
-
-To learn React, check out the [React documentation](https://reactjs.org/).
-
-### Code Splitting
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/code-splitting](https://facebook.github.io/create-react-app/docs/code-splitting)
-
-### Analyzing the Bundle Size
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/analyzing-the-bundle-size](https://facebook.github.io/create-react-app/docs/analyzing-the-bundle-size)
-
-### Making a Progressive Web App
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/making-a-progressive-web-app](https://facebook.github.io/create-react-app/docs/making-a-progressive-web-app)
-
-### Advanced Configuration
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/advanced-configuration](https://facebook.github.io/create-react-app/docs/advanced-configuration)
-
-### Deployment
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/deployment](https://facebook.github.io/create-react-app/docs/deployment)
-
-### `npm run build` fails to minify
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/troubleshooting#npm-run-build-fails-to-minify](https://facebook.github.io/create-react-app/docs/troubleshooting#npm-run-build-fails-to-minify)
+The earlier native ARKit proof of feasibility remains under `ios/BuildWiseSmartScan`, but the primary product flow is now the web capture/import/customization path.
