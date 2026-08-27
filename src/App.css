@@ -109,6 +109,7 @@ button { font: inherit; }
 .scanner-debug-heading strong { color: var(--green); font-weight: 600; }
 .scanner-debug-instruction { margin-top: 6px; color: var(--accent-hot); }
 .scanner-debug-grid { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 3px 12px; margin-top: 8px; }
+.scanner-debug-section { margin-top: 10px; padding-top: 8px; border-top: 1px solid rgba(151, 216, 177, 0.2); color: var(--green); text-transform: uppercase; letter-spacing: .08em; }
 .scanner-debug-grid b { color: var(--paper); font-weight: 500; text-align: right; white-space: nowrap; }
 
 .target-reticle { position: absolute; left: 50%; top: 51%; width: 84px; height: 84px; transform: translate(-50%, -50%); }
@@ -120,6 +121,8 @@ button { font: inherit; }
 .reticle-cross { position: absolute; left: 50%; top: 50%; background: rgba(255, 194, 124, 0.83); transform: translate(-50%, -50%); }
 .reticle-cross-horizontal { width: 19px; height: 1px; } .reticle-cross-vertical { width: 1px; height: 19px; }
 .camera-footer { margin-top: 21px; padding: 0 2px; }
+.camera-footer-simple { display: flex; justify-content: space-between; gap: 14px; align-items: center; color: var(--paper-muted); font-size: 11px; }
+.camera-footer-simple strong { color: var(--green); font-family: 'SFMono-Regular', Consolas, monospace; font-size: 10px; font-weight: 500; }
 .telemetry-heading, .panel-heading-row, .progress-heading, .progress-footing, .instruction-topline, .instruction-meter-row { display: flex; justify-content: space-between; align-items: center; }
 .section-label { color: var(--accent); font-family: 'SFMono-Regular', Consolas, monospace; font-size: 10px; letter-spacing: 0.11em; text-transform: uppercase; }
 .telemetry-heading h2, .panel-heading-row h2 { margin: 5px 0 0; font-size: 16px; letter-spacing: -0.03em; font-weight: 600; }
@@ -166,6 +169,7 @@ button { font: inherit; }
 
 .instruction-panel { margin-top: 20px; padding: 20px; border: 1px solid rgba(240, 168, 90, 0.4); border-radius: var(--radius); background: rgba(240, 168, 90, 0.07); }
 .instruction-panel-complete { border-color: rgba(151, 216, 177, 0.45); background: rgba(151, 216, 177, 0.07); }
+.instruction-panel-recovery { border-color: rgba(255, 194, 124, 0.46); background: rgba(255, 194, 124, 0.05); }
 .instruction-label { color: var(--accent-hot); font-family: 'SFMono-Regular', Consolas, monospace; font-size: 10px; letter-spacing: 0.09em; }
 .instruction-panel-complete .instruction-label { color: var(--green); }
 .instruction-step { color: var(--ink-muted); font-family: 'SFMono-Regular', Consolas, monospace; font-size: 10px; }
@@ -183,6 +187,10 @@ button { font: inherit; }
 .instruction-helper { margin: 11px 0 0; color: var(--ink-muted); font-size: 11px; line-height: 1.4; }
 .event-line { display: flex; align-items: center; gap: 8px; min-height: 41px; color: var(--ink-muted); font-size: 11px; }
 .event-pulse { width: 5px; height: 5px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 4px rgba(151, 216, 177, 0.11); }
+.completion-suggestion { display: grid; gap: 4px; margin-top: 12px; padding: 11px 13px; border-left: 2px solid var(--green); background: rgba(151, 216, 177, 0.07); color: var(--paper-muted); font-size: 11px; line-height: 1.4; }
+.completion-suggestion strong { color: var(--green); font-weight: 600; }
+.completion-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 7px; }
+.completion-actions button { min-height: 36px; }
 
 .control-actions { display: grid; grid-template-columns: 1.3fr 0.9fr; gap: 10px; margin-top: 22px; }
 .primary-button, .secondary-button { min-height: 47px; border-radius: 8px; cursor: pointer; font-size: 12px; font-weight: 650; transition: transform 150ms ease, background 150ms ease, color 150ms ease, border-color 150ms ease; }
@@ -376,6 +384,7 @@ button:focus-visible { outline: 2px solid var(--accent-hot); outline-offset: 3px
     backdrop-filter: blur(14px);
     pointer-events: auto;
   }
+  .workspace-scanning .completion-suggestion { pointer-events: auto; }
   .workspace-scanning .coverage-panel {
     position: absolute;
     z-index: 2;

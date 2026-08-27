@@ -7,8 +7,15 @@ BuildWise SmartScan is a web-first room capture and customization prototype.
 1. Open the site over HTTPS on a mobile phone. Camera and motion permissions do not work from an insecure phone URL.
 2. Tap **Start scan** and walk through the room while the camera is running.
 3. The browser analyzes frame sharpness, exposure, visual detail, scene change, orientation, motion, and camera translation. It saves overlapping keyframes only when they add usable coverage.
-4. Follow the live next-best-view instruction and coverage map. Guidance changes when the scanner detects low coverage, weak lighting, blur, excessive speed, rotation without translation, or a need for more parallax.
-5. Finish when the measured coverage and viewpoint diversity are sufficient. Use **Build real 3D room** to send the frames to the reconstruction worker, or export the JSON session for processing elsewhere.
+4. Follow the calm next-best-view instruction and coverage map. Guidance is based on the next useful room area, not on individual blur, exposure, speed, or feature-count readings.
+5. Finish when the measured coverage and viewpoint diversity are sufficient, or use **Finish anyway** after the minimum usable scan has been collected. Use **Build real 3D room** to send the frames to the reconstruction worker, or export the JSON session for processing elsewhere.
+
+### Scan behavior and debugging
+
+- Every camera frame is evaluated, but only usable keyframes advance coverage. Blurry, dark, low-feature, and duplicate frames are discarded without interrupting the user.
+- `SCANNING_WITH_WARNING` may briefly show **Move a little slower**; it never resets progress or enters recovery. `TRACKING_LOST` requires severe tracking, feature, image, relocalization, and recent-keyframe signals to agree for about 3.2 seconds.
+- Readiness uses accepted keyframes, weighted structural coverage, floor and wall coverage, and viewpoint diversity. It does not require 100% of the view-sector map.
+- Add `?scannerDebug=1` in development to show motion EMA values, adaptive thresholds, tracking state, relocalization attempts, accepted/rejected keyframe counts, rejection reasons, coverage, and readiness.
 
 The website also works as a desktop review/customization tool without a camera. Desktop users can load a scan exported from a phone or an API result containing `room.glb`/`meshPLY`.
 
