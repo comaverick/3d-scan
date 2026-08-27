@@ -3721,6 +3721,7 @@ function App() {
             <div className="room-fallback" aria-hidden={cameraState === 'live'}><span>LIVE CAMERA REQUIRED</span></div>
             <div className="camera-shade" />
             {isScanning && <CoverageOverlay scanState={scanState} />}
+            {isScanning && <LiveRoomMap scanState={scanState} />}
             {SCANNER_TARGET_DEBUG && (
               <>
                 <div className="target-debug-quadrants" aria-hidden="true">
@@ -4609,6 +4610,352 @@ function RoomCustomizer({ session, onExport, isExporting, onReconstruct, isRecon
           )}
           <p className="customizer-disclaimer">This simulator shows measured LiDAR geometry or the reconstructed GLB. It never invents walls, furniture, or image panels.</p>
         </aside>
+      </div>
+    </div>
+  );
+}
+
+function disposeLiveMapObject(object) {
+  object?.traverse?.((child) => {
+    child.geometry?.dispose?.();
+    const materials = Array.isArray(child.material) ? child.material : [child.material];
+    materials.filter(Boolean).forEach((material) => material.dispose?.());
+  });
+}
+
+function LiveRoomMap({ scanState }) {
+  const viewportRef = useRef(null);
+  const canvasRef = useRef(null);
+  const sourceRef = useRef(scanState);
+  const [renderError, setRenderError] = useState('');
+  sourceRef.current = scanState;
+
+  const roomCoverage = Math.round(((Number(scanState?.displayProgress) || Number(scanState?.scanProgress) || 0) * 100));
+  const sparsePointCount = Array.isArray(scanState?.sparsePoints)
+    ? scanState.sparsePoints.length
+    : Array.isArray(scanState?.liveMap?.sparsePoints) ? scanState.liveMap.sparsePoints.length : 0;
+  const mapStatus = isInitialTrackingPhase(scanState?.phase)
+    ? 'Building map'
+    : scanState?.scanReady ? 'Map ready' : 'Live mapping';
+
+  useEffect(() => {
+    const viewport = viewportRef.current;
+    const canvas = canvasRef.current;
+    if (!viewport || !canvas || /jsdom/i.test(window.navigator?.userAgent || '')) return undefined;
+
+    let renderer;
+    try {
+      renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true, powerPreference: 'low-power' });
+    } catch (error) {
+      setRenderError('3D preview unavailable');
+      return undefined;
+    }
+
+    let disposed = false;
+    let animationFrame = 0;
+    let lastMapSignature = '';
+    let mapProjector = (point) => new THREE.Vector3(Number(point?.x) || 0, 0.16, Number(point?.z) || 0);
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(38, 1, 0.1, 30);
+    const mapRoot = new THREE.Group();
+    const tileRoot = new THREE.Group();
+    const geometryRoot = new THREE.Group();
+    const cameraRoot = new THREE.Group();
+    mapRoot.add(tileRoot, geometryRoot, cameraRoot);
+    scene.add(mapRoot);
+
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.setClearColor(0x061223, 0.96);
+
+    const roomSize = 6.4;
+    const roomHeight = 2.7;
+    const halfRoom = roomSize / 2;
+    const shellMaterial = new THREE.MeshBasicMaterial({
+      color: 0x1e6eff,
+      transparent: true,
+      opacity: 0.1,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    });
+    const floor = new THREE.Mesh(new THREE.PlaneGeometry(roomSize, roomSize), shellMaterial);
+    floor.rotation.x = -Math.PI / 2;
+    floor.position.y = 0.02;
+    mapRoot.add(floor);
+    [
+      { position: [0, roomHeight / 2, -halfRoom], rotation: [0, 0, 0] },
+      { position: [-halfRoom, roomHeight / 2, 0], rotation: [0, Math.PI / 2, 0] },
+      { position: [halfRoom, roomHeight / 2, 0], rotation: [0, -Math.PI / 2, 0] },
+    ].forEach((wall) => {
+      const mesh = new THREE.Mesh(new THREE.PlaneGeometry(roomSize, roomHeight), shellMaterial.clone());
+      mesh.position.set(...wall.position);
+      mesh.rotation.set(...wall.rotation);
+      mapRoot.add(mesh);
+    });
+    const grid = new THREE.GridHelper(roomSize, 16, 0x7ad5ff, 0x194975);
+    grid.position.y = 0.04;
+    grid.material.transparent = true;
+    grid.material.opacity = 0.32;
+    grid.material.depthWrite = false;
+    mapRoot.add(grid);
+    const roomOutline = new THREE.LineSegments(
+      new THREE.EdgesGeometry(new THREE.BoxGeometry(roomSize, roomHeight, roomSize)),
+      new THREE.LineBasicMaterial({ color: 0x8bdcff, transparent: true, opacity: 0.58 }),
+    );
+    roomOutline.position.y = roomHeight / 2;
+    mapRoot.add(roomOutline);
+
+    const target = new THREE.Vector3(0, 1.1, 0);
+    const orbit = { azimuth: 0.65, elevation: 0.62, distance: 8.5 };
+    const pointer = { active: false, x: 0, y: 0 };
+    const updateCamera = () => {
+      const horizontalDistance = Math.cos(orbit.elevation) * orbit.distance;
+      camera.position.set(
+        Math.sin(orbit.azimuth) * horizontalDistance,
+        target.y + (Math.sin(orbit.elevation) * orbit.distance),
+        Math.cos(orbit.azimuth) * horizontalDistance,
+      );
+      camera.lookAt(target);
+    };
+    updateCamera();
+
+    const handlePointerDown = (event) => {
+      pointer.active = true;
+      pointer.x = event.clientX;
+      pointer.y = event.clientY;
+      canvas.setPointerCapture?.(event.pointerId);
+    };
+    const handlePointerMove = (event) => {
+      if (!pointer.active) return;
+      orbit.azimuth -= (event.clientX - pointer.x) * 0.009;
+      orbit.elevation = clamp(orbit.elevation + (event.clientY - pointer.y) * 0.007, 0.18, 1.05);
+      pointer.x = event.clientX;
+      pointer.y = event.clientY;
+      updateCamera();
+    };
+    const handlePointerUp = () => {
+      pointer.active = false;
+    };
+    const handleWheel = (event) => {
+      event.preventDefault();
+      orbit.distance = clamp(orbit.distance + (event.deltaY * 0.008), 5.8, 11);
+      updateCamera();
+    };
+    canvas.addEventListener('pointerdown', handlePointerDown);
+    canvas.addEventListener('pointermove', handlePointerMove);
+    canvas.addEventListener('pointerup', handlePointerUp);
+    canvas.addEventListener('pointercancel', handlePointerUp);
+    canvas.addEventListener('wheel', handleWheel, { passive: false });
+
+    const clearDynamicRoot = (root) => {
+      while (root.children.length > 0) {
+        const child = root.children[root.children.length - 1];
+        root.remove(child);
+        disposeLiveMapObject(child);
+      }
+    };
+
+    const rawMapPoint = (point, mapBounds) => {
+      const x = Number(point?.x) || 0;
+      const z = Number(point?.z) || 0;
+      const y = Number(point?.y);
+      return new THREE.Vector3(
+        (x - mapBounds.centerX) * mapBounds.scale,
+        Number.isFinite(y) ? clamp(y - 0.25, 0.12, roomHeight - 0.12) : 0.16,
+        (z - mapBounds.centerZ) * mapBounds.scale,
+      );
+    };
+
+    const rebuildMap = (state) => {
+      clearDynamicRoot(tileRoot);
+      clearDynamicRoot(geometryRoot);
+      clearDynamicRoot(cameraRoot);
+
+      const path = Array.isArray(state?.liveMap?.cameraPath) ? state.liveMap.cameraPath.filter(Boolean) : [];
+      const sparsePoints = Array.isArray(state?.sparsePoints)
+        ? state.sparsePoints
+        : Array.isArray(state?.liveMap?.sparsePoints) ? state.liveMap.sparsePoints : [];
+      const rawGeometryPoints = [
+        ...path,
+        ...sparsePoints.map((point) => point.estimatedPosition).filter(Boolean),
+      ];
+      const bounds = rawGeometryPoints.length > 0
+        ? rawGeometryPoints.reduce((result, point) => ({
+          minX: Math.min(result.minX, Number(point.x) || 0),
+          maxX: Math.max(result.maxX, Number(point.x) || 0),
+          minZ: Math.min(result.minZ, Number(point.z) || 0),
+          maxZ: Math.max(result.maxZ, Number(point.z) || 0),
+        }), { minX: Infinity, maxX: -Infinity, minZ: Infinity, maxZ: -Infinity })
+        : { minX: -1, maxX: 1, minZ: -1, maxZ: 1 };
+      const span = Math.max(2.8, bounds.maxX - bounds.minX, bounds.maxZ - bounds.minZ);
+      const mapBounds = {
+        centerX: (bounds.minX + bounds.maxX) / 2,
+        centerZ: (bounds.minZ + bounds.maxZ) / 2,
+        scale: Math.min(1.65, 4.7 / span),
+      };
+      mapProjector = (point) => rawMapPoint(point, mapBounds);
+
+      const cells = Array.isArray(state?.directionalCells) && state.directionalCells.length > 0
+        ? state.directionalCells
+        : createDirectionalCoverageGrid(Number(state?.mapping?.keyframes?.[0]?.orientation?.heading) || 0);
+      const bandHeights = { upper: 2.15, middle: 1.35, lower: 0.55 };
+      const bandSizes = { upper: 0.48, middle: 0.58, lower: 0.48 };
+      cells.forEach((cell) => {
+        const yaw = ((Number(cell.yaw) || 0) * Math.PI) / 180;
+        const directionX = Math.sin(yaw);
+        const directionZ = -Math.cos(yaw);
+        const perimeterScale = halfRoom / Math.max(Math.abs(directionX), Math.abs(directionZ), 0.001);
+        const coverage = clamp(Number(cell.coverage) || 0, 0, 1);
+        const mapped = cell.status === 'SUFFICIENT' || coverage >= 0.78;
+        const material = new THREE.MeshBasicMaterial({
+          color: mapped ? 0x9bd8b1 : 0x1e6eff,
+          transparent: true,
+          opacity: mapped ? 0.15 : 0.18 + ((1 - coverage) * 0.34),
+          side: THREE.DoubleSide,
+          depthWrite: false,
+        });
+        const tile = new THREE.Mesh(
+          new THREE.BoxGeometry(Math.max(0.5, (Math.PI * roomSize / 18) * 0.76), bandSizes[cell.band] || 0.5, 0.045),
+          material,
+        );
+        tile.position.set(directionX * perimeterScale, bandHeights[cell.band] || 1.35, directionZ * perimeterScale);
+        tile.rotation.y = yaw;
+        tileRoot.add(tile);
+      });
+
+      const pathPoints = path.map((point) => mapProjector(point).setY(0.09));
+      if (pathPoints.length > 1) {
+        geometryRoot.add(new THREE.Line(
+          new THREE.BufferGeometry().setFromPoints(pathPoints),
+          new THREE.LineBasicMaterial({ color: 0xffc27c, transparent: true, opacity: 0.95 }),
+        ));
+      }
+      pathPoints.forEach((point) => {
+        const node = new THREE.Mesh(
+          new THREE.SphereGeometry(0.055, 8, 6),
+          new THREE.MeshBasicMaterial({ color: 0xffc27c }),
+        );
+        node.position.copy(point);
+        geometryRoot.add(node);
+      });
+
+      const pointPositions = sparsePoints
+        .filter((point) => point?.estimatedPosition && (Number(point.confidence) || 0) >= 0.35)
+        .slice(0, 700)
+        .map((point) => mapProjector(point.estimatedPosition));
+      if (pointPositions.length > 0) {
+        const pointGeometry = new THREE.BufferGeometry().setFromPoints(pointPositions);
+        geometryRoot.add(new THREE.Points(
+          pointGeometry,
+          new THREE.PointsMaterial({ color: 0xd8f7ff, size: 0.07, transparent: true, opacity: 0.92, sizeAttenuation: true }),
+        ));
+      }
+
+      const structuralEdges = Array.isArray(state?.liveMap?.structuralEdges) ? state.liveMap.structuralEdges : [];
+      const edgePoints = structuralEdges.flatMap((edge) => {
+        if (!edge?.point || !edge?.direction) return [];
+        const spanLength = 1.25;
+        const first = {
+          x: edge.point.x - (edge.direction.x * spanLength),
+          y: edge.point.y - (edge.direction.y * spanLength),
+          z: edge.point.z - (edge.direction.z * spanLength),
+        };
+        const second = {
+          x: edge.point.x + (edge.direction.x * spanLength),
+          y: edge.point.y + (edge.direction.y * spanLength),
+          z: edge.point.z + (edge.direction.z * spanLength),
+        };
+        return [mapProjector(first), mapProjector(second)];
+      });
+      if (edgePoints.length > 1) {
+        geometryRoot.add(new THREE.LineSegments(
+          new THREE.BufferGeometry().setFromPoints(edgePoints),
+          new THREE.LineBasicMaterial({ color: 0xf5fdff, transparent: true, opacity: 0.6 }),
+        ));
+      }
+
+      const cameraPose = state?.cameraPose || state?.mapping?.keyframes?.[state.mapping.keyframes.length - 1]?.pose;
+      if (cameraPose) {
+        const cameraMarker = new THREE.Mesh(
+          new THREE.ConeGeometry(0.16, 0.34, 8),
+          new THREE.MeshBasicMaterial({ color: 0x9bd8b1 }),
+        );
+        cameraMarker.position.copy(mapProjector(cameraPose).setY(0.25));
+        cameraMarker.rotation.x = Math.PI / 2;
+        cameraRoot.add(cameraMarker);
+        const halo = new THREE.Mesh(
+          new THREE.RingGeometry(0.2, 0.23, 24),
+          new THREE.MeshBasicMaterial({ color: 0x9bd8b1, transparent: true, opacity: 0.75, side: THREE.DoubleSide }),
+        );
+        halo.rotation.x = -Math.PI / 2;
+        halo.position.copy(mapProjector(cameraPose).setY(0.08));
+        cameraRoot.add(halo);
+      }
+    };
+
+    const resize = () => {
+      const bounds = viewport.getBoundingClientRect();
+      const width = Math.max(1, bounds.width);
+      const height = Math.max(1, bounds.height);
+      renderer.setSize(width, height, false);
+      camera.aspect = width / height;
+      camera.updateProjectionMatrix();
+    };
+    resize();
+    window.addEventListener('resize', resize);
+
+    const draw = () => {
+      if (disposed) return;
+      const state = sourceRef.current || {};
+      const directionalCells = Array.isArray(state.directionalCells) ? state.directionalCells : [];
+      const directionalCoverage = directionalCells.reduce((sum, cell) => sum + (Number(cell.coverage) || 0), 0);
+      const signature = [
+        state.phase,
+        state.acceptedFrames,
+        state.liveMap?.cameraPath?.length || 0,
+        state.sparsePoints?.length || state.liveMap?.sparsePoints?.length || 0,
+        Math.round(directionalCoverage * 100),
+        Math.round((Number(state.cameraPose?.x) || 0) * 20),
+        Math.round((Number(state.cameraPose?.z) || 0) * 20),
+      ].join('|');
+      if (signature !== lastMapSignature) {
+        rebuildMap(state);
+        lastMapSignature = signature;
+      }
+      if (!pointer.active) orbit.azimuth += 0.00045;
+      updateCamera();
+      renderer.render(scene, camera);
+      animationFrame = window.requestAnimationFrame(draw);
+    };
+    draw();
+
+    return () => {
+      disposed = true;
+      window.cancelAnimationFrame(animationFrame);
+      window.removeEventListener('resize', resize);
+      canvas.removeEventListener('pointerdown', handlePointerDown);
+      canvas.removeEventListener('pointermove', handlePointerMove);
+      canvas.removeEventListener('pointerup', handlePointerUp);
+      canvas.removeEventListener('pointercancel', handlePointerUp);
+      canvas.removeEventListener('wheel', handleWheel);
+      disposeLiveMapObject(scene);
+      renderer.dispose();
+    };
+  }, []);
+
+  return (
+    <div className="live-room-map" ref={viewportRef}>
+      <div className="live-room-map-heading">
+        <div>
+          <span className="live-room-map-kicker"><span className="live-room-map-pulse" /> Live 3D map</span>
+          <strong>{mapStatus}</strong>
+        </div>
+        <b>{roomCoverage}%</b>
+      </div>
+      <canvas className="live-room-map-canvas" ref={canvasRef} aria-label="Real-time 3D room mapping preview" />
+      <div className="live-room-map-footer">
+        <span><i className="live-room-map-key live-room-map-key-unmapped" /> Unmapped</span>
+        <span><i className="live-room-map-key live-room-map-key-mapped" /> Mapped</span>
+        <small>{renderError || (sparsePointCount > 0 ? `${sparsePointCount} points` : 'Collecting geometry')}</small>
       </div>
     </div>
   );
