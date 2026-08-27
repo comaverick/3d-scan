@@ -566,7 +566,7 @@ function App() {
   };
 
   return (
-    <main className="app-shell">
+    <main className={`app-shell ${isScanning ? 'app-shell-scanning' : ''}`}>
       <header className="topbar">
         <div className="brand-lockup">
           <div className="brand-mark" aria-hidden="true">B</div>
@@ -600,7 +600,7 @@ function App() {
 
       {viewMode === 'customize' && roomSession ? (
         <RoomCustomizer session={roomSession} objects={objects} onExport={exportScan} isExporting={isExporting} />
-      ) : <div className="workspace">
+      ) : <div className={`workspace ${isScanning ? 'workspace-scanning' : ''}`}>
         <section className="camera-column" aria-label="Camera preview">
           <div className="camera-frame">
             <video ref={videoRef} className={`camera-video ${cameraState === 'live' ? 'camera-video-live' : ''}`} autoPlay muted playsInline />
