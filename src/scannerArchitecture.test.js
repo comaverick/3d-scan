@@ -78,7 +78,7 @@ test('scanner starts in INITIAL_MAPPING', () => {
   const state = createInitialScanState();
   expect(state.phase).toBe(SCANNER_PHASES.INITIAL_MAPPING);
   expect(determineNextAction(state).type).toBe('START_SCAN');
-  expect(determineNextAction(state).instruction).toBe('Slowly move around the room while looking around.');
+  expect(determineNextAction(state).instruction).toBe('Slowly look around the room.');
 });
 
 test('scanner does not immediately generate left_ceiling', () => {

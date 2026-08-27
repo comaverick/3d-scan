@@ -25,11 +25,50 @@ export const observedTargetConfig = Object.freeze({
   sufficientParallax: 0.32,
 });
 
+export const coverageOverlayConfig = Object.freeze({
+  maxVisibleRegions: 24,
+  maxBlueOpacity: 0.6,
+  completionThreshold: 0.7,
+});
+
+// Lower numbers are structural priorities. Furniture is intentionally last
+// so heuristic furniture/frame classifications cannot steer the room pass.
+export const scannerTargetPriority = Object.freeze({
+  WALL_CORNER: 1,
+  WALL_CEILING_JUNCTION: 2,
+  WALL_FLOOR_JUNCTION: 3,
+  STRUCTURAL_EDGE: 4,
+  DOOR_FRAME: 5,
+  WINDOW_FRAME: 6,
+  OBSERVED_REGION: 7,
+  FURNITURE_OR_FRAME_EDGE: 8,
+});
+
 const HORIZONTAL_FOV_DEGREES = 70;
 const VERTICAL_FOV_DEGREES = 45;
 
 function clamp(value, minimum, maximum) {
   return Math.max(minimum, Math.min(Number(value) || 0, maximum));
+}
+
+export function blueCoverageOpacity(region, config = coverageOverlayConfig) {
+  if (!region || region.skipped || ['SUFFICIENT', 'INFERABLE'].includes(region.status)) return 0;
+  const settings = { ...coverageOverlayConfig, ...(config || {}) };
+  const coverageValue = Number.isFinite(Number(region.coverage))
+    ? Number(region.coverage)
+    : Number(region.coverageConfidence) || 0;
+  const coverage = clamp(coverageValue, 0, 1);
+  const maxOpacity = clamp(settings.maxBlueOpacity, 0, 1);
+  const completionThreshold = clamp(settings.completionThreshold, 0.01, 1);
+  if (coverage >= completionThreshold) return 0;
+  if (coverage <= 0.15) return maxOpacity;
+  if (coverage <= 0.4) return maxOpacity + ((0.35 - maxOpacity) * ((coverage - 0.15) / 0.25));
+  return 0.35 + ((0.12 - 0.35) * ((coverage - 0.4) / (completionThreshold - 0.4)));
+}
+
+export function targetPriorityForScan(target, furniturePassActive = false) {
+  if (target?.semanticType === 'FURNITURE_OR_FRAME_EDGE') return furniturePassActive ? 0 : Number.POSITIVE_INFINITY;
+  return scannerTargetPriority[target?.semanticType] || scannerTargetPriority.OBSERVED_REGION;
 }
 
 function finite(value, fallback = 0) {
@@ -425,6 +464,20 @@ function displayBoundsForNormalizedBounds(bounds, transform) {
   return { x: Math.min(...xs), y: Math.min(...ys), width: Math.max(...xs) - Math.min(...xs), height: Math.max(...ys) - Math.min(...ys) };
 }
 
+function clipDisplayBounds(bounds) {
+  if (!bounds) return null;
+  const left = Math.max(0, finite(bounds.x));
+  const top = Math.max(0, finite(bounds.y));
+  const right = Math.min(1, finite(bounds.x) + finite(bounds.width));
+  const bottom = Math.min(1, finite(bounds.y) + finite(bounds.height));
+  return {
+    x: left,
+    y: top,
+    width: Math.max(0, right - left),
+    height: Math.max(0, bottom - top),
+  };
+}
+
 function boundsOverlap(bounds) {
   if (!bounds || bounds.width <= 0 || bounds.height <= 0) return 0;
   const width = Math.max(0, Math.min(1, bounds.x + bounds.width) - Math.max(0, bounds.x));
@@ -556,6 +609,26 @@ export function projectObservedTargets(targets = [], orientation, pose, displayT
     ...target,
     ...displayBoundsForTarget(target, orientation, pose, displayTransform),
   }));
+}
+
+/**
+ * Projects measured spatial regions into the current camera display. This is
+ * the only source for the blue scan overlay; it never stores screen pixels.
+ */
+export function projectCoverageOverlayRegions(regions = [], orientation, pose, displayTransform = null, config = coverageOverlayConfig) {
+  const settings = { ...coverageOverlayConfig, ...(config || {}) };
+  return projectObservedTargets(regions, orientation, pose, displayTransform)
+    .filter((region) => region.currentlyVisible && region.screenBounds)
+    .map((region) => ({
+      ...region,
+      screenBounds: clipDisplayBounds(region.screenBounds),
+      blueOpacity: blueCoverageOpacity(region, settings),
+    }))
+    .filter((region) => region.screenBounds?.width > 0 && region.screenBounds?.height > 0
+      && (settings.includeClear || region.blueOpacity > 0))
+    .sort((first, second) => ((second.screenBounds.width * second.screenBounds.height) - (first.screenBounds.width * first.screenBounds.height))
+      || second.blueOpacity - first.blueOpacity)
+    .slice(0, settings.maxVisibleRegions);
 }
 
 export function hasObservedNeighborEvidence(targets = [], target) {

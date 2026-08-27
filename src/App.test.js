@@ -1,5 +1,5 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
-import App, { canManuallyFinishScan, calculateScanProgress, calculateScanReadiness, chooseGuidancePlacement, compactGuidanceFor, countFeaturesInRegion, createCameraDisplayTransform, createGuidanceController, createInitialScanState, determineNextAction, isTargetStalled, normalizedToDisplay, recordFrameEvaluation, stabilizeScanProgress, updateCoverageFromFrame, validateTargetGeometry } from './App';
+import App, { blueCoverageOpacity, canManuallyFinishScan, calculateScanProgress, calculateScanReadiness, chooseGuidancePlacement, compactGuidanceFor, countFeaturesInRegion, coverageOverlayRegionsFor, createCameraDisplayTransform, createGuidanceController, createInitialScanState, determineNextAction, friendlyReconstructionError, isTargetStalled, normalizedToDisplay, ProcessingScreen, reconstructionProgressSteps, reconstructionStatusLabel, recordFrameEvaluation, stabilizeScanProgress, targetPriorityForScan, updateCoverageFromFrame, validateTargetGeometry } from './App';
 
 const goodAnalysis = {
   qualityScore: 0.82,
@@ -26,11 +26,14 @@ test('renders the SmartScan starting state', () => {
 });
 
 test('starts with initial mapping guidance and no target request', async () => {
-  render(<App />);
+  const { container } = render(<App />);
   fireEvent.click(screen.getByRole('button', { name: /start scan/i }));
 
-  await waitFor(() => expect(screen.getByText('Slowly move around the room while looking around.')).toBeInTheDocument());
-  expect(screen.getByRole('region', { name: /measured scan coverage/i })).toBeInTheDocument();
+  await waitFor(() => expect(screen.getByText('Slowly look around the room')).toBeInTheDocument());
+  expect(screen.queryByRole('region', { name: /measured scan coverage/i })).not.toBeInTheDocument();
+  expect(container.querySelector('.scanner-initial-mapping-tint')).toBeInTheDocument();
+  expect(container.querySelector('.scanner-live-hud')).toBeInTheDocument();
+  expect(container.querySelector('.scanner-compact-guidance')).toBeInTheDocument();
   expect(screen.getByRole('button', { name: /pause scan/i })).toBeInTheDocument();
   expect(screen.queryByText(/left ceiling|right ceiling|upper wall/i)).not.toBeInTheDocument();
 });
@@ -38,7 +41,7 @@ test('starts with initial mapping guidance and no target request', async () => {
 test('insufficient live data keeps guidance in initial mapping', () => {
   const action = determineNextAction({ ...createInitialScanState(), framesEvaluated: 4, acceptedFrames: 4 });
   expect(action.type).toBe('INITIAL_MAPPING');
-  expect(action.instruction).toBe('Slowly move around the room while looking around.');
+  expect(action.instruction).toBe('Slowly look around the room.');
 });
 
 test('rejected frames do not add keyframes or spatial observations', () => {
@@ -135,6 +138,70 @@ test('compact guidance stays short and translates technical states into actions'
   expect(guidance.text).toBe('Move sideways');
   expect(guidance.text.split(' ').length).toBeLessThanOrEqual(7);
   expect(guidance.text).not.toMatch(/feature|parallax|track|coverage/i);
+});
+
+test('initial mapping has no projected region overlays', () => {
+  expect(coverageOverlayRegionsFor(createInitialScanState())).toEqual([]);
+});
+
+test('blue coverage opacity follows measured coverage and not elapsed time', () => {
+  const region = { coverage: 0.1, coverageConfidence: 0.7, status: 'PARTIAL' };
+  const initialOpacity = blueCoverageOpacity(region);
+  expect(initialOpacity).toBeCloseTo(0.6, 2);
+  expect(blueCoverageOpacity({ ...region, coverage: 0.3 })).toBeGreaterThan(blueCoverageOpacity({ ...region, coverage: 0.6 }));
+  expect(blueCoverageOpacity({ ...region, coverage: 0.6 })).toBeLessThan(initialOpacity);
+  expect(blueCoverageOpacity({ ...region, coverage: 0.6 }, { elapsedMs: 999999 })).toBe(blueCoverageOpacity({ ...region, coverage: 0.6 }));
+});
+
+test.each([
+  ['SUFFICIENT', 0],
+  ['INFERABLE', 0],
+])('%s coverage is transparent in the camera overlay', (status, expected) => {
+  expect(blueCoverageOpacity({ coverage: 0.1, status })).toBe(expected);
+});
+
+test('adaptive coverage projects only visible observed regions and caps the overlay count', () => {
+  const regions = Array.from({ length: 30 }, (_, index) => ({
+    id: `observed-${index}`,
+    estimatedDirection: { x: 0, y: 0, z: -1 },
+    estimatedWorldCenter: { x: 0, y: 1.4, z: -1.5 },
+    featureDensity: 0.5,
+    coverage: index / 100,
+    coverageConfidence: 0.7,
+    status: 'PARTIAL',
+  }));
+  const overlays = coverageOverlayRegionsFor({
+    phase: 'ADAPTIVE_COVERAGE',
+    coverageRegions: regions,
+    currentOrientation: { heading: 0, pitch: 0 },
+    cameraPose: { x: 0, y: 1.4, z: 0 },
+  });
+  expect(overlays).toHaveLength(24);
+  expect(overlays[0].screenBounds).toEqual(expect.objectContaining({ x: expect.any(Number), y: expect.any(Number) }));
+  expect(overlays[0].blueOpacity).toBeGreaterThan(overlays[overlays.length - 1].blueOpacity);
+});
+
+test('structural target ordering excludes furniture until furniture detail mode', () => {
+  const furniture = { semanticType: 'FURNITURE_OR_FRAME_EDGE' };
+  const corner = { semanticType: 'WALL_CORNER' };
+  expect(targetPriorityForScan(furniture, false)).toBe(Infinity);
+  expect(targetPriorityForScan(furniture, true)).toBeLessThan(targetPriorityForScan(corner, true));
+});
+
+test('reconstruction status copy and failure state stay explicit', () => {
+  expect(reconstructionStatusLabel('feature_matching')).toBe('Matching room views');
+  expect(reconstructionStatusLabel('mesh')).toBe('Building room mesh');
+  expect(reconstructionProgressSteps('complete').every((step) => step.state === 'done')).toBe(true);
+  expect(friendlyReconstructionError({ code: 'RECONSTRUCTION_SERVICE_UNAVAILABLE', message: 'offline' })).toBe('3D reconstruction service is unavailable.');
+  expect(friendlyReconstructionError({ message: 'Not enough dense points for a room mesh.' })).toMatch(/Not enough overlapping room detail/);
+});
+
+test('processing screen offers retry after a real reconstruction error', () => {
+  render(<ProcessingScreen reconstructionState={{ status: 'error', message: 'COLMAP is not installed on the reconstruction worker.' }} isReconstructing={false} onRetry={jest.fn()} onReturnToScan={jest.fn()} />);
+  expect(screen.getByText('Room captured, but 3D reconstruction failed.')).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: /retry reconstruction/i })).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: /return to scan/i })).toBeInTheDocument();
+  expect(screen.queryByText('Mesh required')).not.toBeInTheDocument();
 });
 
 test('furniture targets wait until the optional furniture pass', () => {

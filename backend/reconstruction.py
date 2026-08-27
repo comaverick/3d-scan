@@ -27,14 +27,18 @@ def _run(command: list[str], cwd: Path, log_path: Path) -> None:
         completed = subprocess.run(
             command,
             cwd=cwd,
-            stdout=log,
+            stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             check=False,
             text=True,
         )
+        log.write(completed.stdout or "")
     if completed.returncode != 0:
+        output_lines = [line.strip() for line in (completed.stdout or "").splitlines() if line.strip()]
+        detail = " ".join(output_lines[-4:])[:500]
+        detail_suffix = f" Details: {detail}" if detail else ""
         raise ReconstructionError(
-            f"COLMAP stage failed with exit code {completed.returncode}. See {log_path.name}."
+            f"COLMAP stage '{command[1]}' failed with exit code {completed.returncode}. See {log_path.name}.{detail_suffix}"
         )
 
 
@@ -82,7 +86,9 @@ def _build_mesh(dense_point_cloud: Path, output_path: Path) -> tuple[dict, str]:
 
     point_cloud = o3d.io.read_point_cloud(str(dense_point_cloud))
     if not point_cloud.has_points() or len(point_cloud.points) < 100:
-        raise ReconstructionError("COLMAP did not produce enough dense points for a room mesh.")
+        raise ReconstructionError(
+            "Not enough overlapping room detail was captured. Try scanning again with more sideways movement and overlap."
+        )
 
     point_cloud.estimate_normals()
     mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(

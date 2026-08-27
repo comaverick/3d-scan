@@ -16,10 +16,72 @@ import {
   relativePoseEstimate,
   updateFeatureTracks,
   projectObservedTargets,
+  projectCoverageOverlayRegions,
+  blueCoverageOpacity,
+  coverageOverlayConfig,
+  targetPriorityForScan,
   targetDescription,
 } from './scannerCoverage';
 
 const RECONSTRUCTION_API = process.env.REACT_APP_RECONSTRUCTION_API || '';
+const RECONSTRUCTION_POLL_INTERVAL_MS = 1800;
+const RECONSTRUCTION_STATUS_LABELS = Object.freeze({
+  created: 'Preparing reconstruction',
+  frames_uploaded: 'Uploading views',
+  uploading: 'Uploading views',
+  queued: 'Starting reconstruction',
+  feature_extraction: 'Finding visual details',
+  feature_matching: 'Matching room views',
+  structure_from_motion: 'Recovering room shape',
+  undistortion: 'Calibrating room views',
+  dense_reconstruction: 'Building detailed geometry',
+  mesh: 'Building room mesh',
+  complete: 'Room ready',
+  error: 'Reconstruction failed',
+});
+
+const RECONSTRUCTION_STEP_KEYS = Object.freeze([
+  { key: 'scan', label: 'Scan captured' },
+  { key: 'upload', label: 'Uploading views' },
+  { key: 'reconstruct', label: 'Reconstructing room' },
+  { key: 'mesh', label: 'Building mesh' },
+  { key: 'prepare', label: 'Preparing simulator' },
+]);
+
+const RECONSTRUCTION_STAGE_INDEX = Object.freeze({
+  uploading: 1,
+  frames_uploaded: 2,
+  queued: 2,
+  feature_extraction: 2,
+  feature_matching: 2,
+  structure_from_motion: 2,
+  undistortion: 2,
+  dense_reconstruction: 2,
+  mesh: 3,
+  complete: 5,
+});
+
+export function reconstructionStatusLabel(status) {
+  return RECONSTRUCTION_STATUS_LABELS[status] || 'Preparing reconstruction';
+}
+
+export function reconstructionProgressSteps(status) {
+  const stage = RECONSTRUCTION_STAGE_INDEX[status] ?? 0;
+  return RECONSTRUCTION_STEP_KEYS.map((step, index) => ({
+    ...step,
+    state: index < stage ? 'done' : index === stage && stage < 5 ? 'active' : stage >= 5 ? 'done' : 'pending',
+  }));
+}
+
+export function friendlyReconstructionError(error) {
+  const technicalMessage = error?.technicalMessage || error?.message || 'The reconstruction worker failed.';
+  if (error?.code === 'RECONSTRUCTION_SERVICE_UNAVAILABLE') return '3D reconstruction service is unavailable.';
+  if (/not enough (dense )?points|at least three|insufficient dense|connected camera model/i.test(technicalMessage)) {
+    return 'Not enough overlapping room detail was captured. Try scanning again with more sideways movement and overlap.';
+  }
+  if (/colmap|open3d|trimesh/i.test(technicalMessage)) return technicalMessage;
+  return `3D reconstruction failed: ${technicalMessage}`;
+}
 
 function scannerDebugEnabled() {
   if (process.env.NODE_ENV === 'production') return false;
@@ -455,7 +517,7 @@ export const scannerReadinessConfig = Object.freeze({
   readyReconstructionConfidence: 0.35,
 });
 
-const EMPTY_POSE = { x: '0.00', y: '0.00', z: '0.00', yaw: '—', speed: '0.00', quality: 'Waiting' };
+const EMPTY_POSE = { x: '0.00', y: '0.00', z: '0.00', yaw: '-', speed: '0.00', quality: 'Waiting' };
 
 function createCoverageRegions() {
   // Normal scanning starts with no targets. Regions are created only after
@@ -1168,15 +1230,17 @@ export function determineNextAction(scanState) {
   const readiness = scanState?.scanReadiness || calculateScanReadiness(scanState);
   const furniturePassActive = Boolean(scanState?.furniturePassActive);
   const isFurnitureTarget = (region) => region?.semanticType === 'FURNITURE_OR_FRAME_EDGE';
+  const eligibleTargets = (scanState?.lowCoverageRegions || [])
+    .filter((region) => !region.skipped && !['SUFFICIENT', 'INFERABLE'].includes(region.status))
+    .filter((region) => furniturePassActive || !isFurnitureTarget(region))
+    .sort((first, second) => targetPriorityForScan(first, furniturePassActive) - targetPriorityForScan(second, furniturePassActive)
+      || (Number(second.priority) || 0) - (Number(first.priority) || 0));
   const lockedTarget = scanState?.activeTargetId
-    ? scanState.coverageRegions?.find((region) => region.id === scanState.activeTargetId
-      && !region.skipped
-      && !['SUFFICIENT', 'INFERABLE'].includes(region.status)
-      && (furniturePassActive || !isFurnitureTarget(region)))
+    ? eligibleTargets.find((region) => region.id === scanState.activeTargetId) || null
     : null;
-  const targetRegion = lockedTarget || scanState?.lowCoverageRegions?.find((region) => furniturePassActive || !isFurnitureTarget(region));
+  const targetRegion = lockedTarget || eligibleTargets[0];
   if ((scanState?.framesEvaluated || 0) === 0 && (scanState?.acceptedFrames || 0) === 0) {
-    return { type: 'START_SCAN', direction: 'O', label: 'READY TO SCAN', eyebrow: 'Initial room mapping', title: 'Start with a slow room sweep', instruction: 'Slowly move around the room while looking around.', helper: 'The scanner will build a spatial map before it suggests any area to capture.', target: 'Initial mapping', priority: 1, confidence: 1, adaptiveGuidance: null };
+    return { type: 'START_SCAN', direction: 'O', label: 'READY TO SCAN', eyebrow: 'Initial room mapping', title: 'Start with a slow room sweep', instruction: 'Slowly look around the room.', helper: 'The scanner will build a spatial map before it suggests any area to capture.', target: 'Initial mapping', priority: 1, confidence: 1, adaptiveGuidance: null };
   }
   if (scanState?.trackingStatus === 'LOST' || scanState?.motionState === MOTION_STATES.TRACKING_LOST) {
     return { type: 'TRACKING_LOST', direction: 'O', label: 'STAY WITH THE SCAN', eyebrow: 'Automatic relocalization is still running', title: 'I lost track of the room', instruction: "Slowly point the camera toward an area you've already scanned.", helper: 'Your captured coverage is safe. Once the room comes back into view, keep scanning.', target: 'Finding the room again', priority: 1.2, confidence: 0.95, adaptiveGuidance: null };
@@ -1189,7 +1253,7 @@ export function determineNextAction(scanState) {
       label: 'BUILDING ROOM MAP',
       eyebrow: 'Initial mapping',
       title: 'Look around while moving slowly',
-      instruction: 'Slowly move around the room while looking around.',
+      instruction: 'Slowly look around the room.',
       helper: mappingReadiness.reason,
       target: `${mappingReadiness.acceptedKeyframes || 0} accepted keyframes`,
       priority: 0.7,
@@ -1298,6 +1362,18 @@ export function chooseGuidancePlacement(targetBounds) {
   return preferred.find((placement) => !normalizedRectIntersects(placements[placement], target)) || preferred[0];
 }
 
+export function coverageOverlayRegionsFor(scanState, config = coverageOverlayConfig) {
+  if (scanState?.phase !== SCANNER_PHASES.ADAPTIVE_COVERAGE) return [];
+  const regions = projectCoverageOverlayRegions(
+    Array.isArray(scanState?.coverageRegions) ? scanState.coverageRegions : [],
+    scanState.currentOrientation,
+    scanState.cameraPose,
+    scanState.displayTransform,
+    config,
+  );
+  return regions.filter((region) => region.blueOpacity > 0);
+}
+
 export function compactGuidanceFor(instruction, scanState = {}) {
   const iconForType = {
     INITIAL_MAPPING: '↔',
@@ -1312,7 +1388,7 @@ export function compactGuidanceFor(instruction, scanState = {}) {
     SCAN_COMPLETE: '✓',
   };
   if (scanState.phase === SCANNER_PHASES.INITIAL_MAPPING) {
-    return { mode: 'SCANNING', icon: '↔', text: 'Walk slowly around the room', hint: 'Keep moving' };
+    return { mode: 'SCANNING', icon: '↔', text: 'Slowly look around the room', hint: '' };
   }
   if (instruction?.type === 'TRACKING_LOST') {
     return { mode: 'NEEDS_SMALL_CORRECTION', icon: '↺', text: 'Point to a scanned area', hint: '' };
@@ -1380,10 +1456,10 @@ function createOrientationSnapshot(event) {
 
 // eslint-disable-next-line no-unused-vars
 function directionalProgressMessage(instructionType) {
-  if (instructionType === 'LOOK_UP') return 'Good — keep pointing upward';
-  if (instructionType === 'LOOK_DOWN') return 'Good — keep pointing downward';
-  if (instructionType === 'TURN_LEFT' || instructionType === 'MOVE_LEFT') return 'Good — keep moving left';
-  if (instructionType === 'TURN_RIGHT' || instructionType === 'MOVE_RIGHT') return 'Good — keep moving right';
+  if (instructionType === 'LOOK_UP') return 'Good, keep pointing upward';
+  if (instructionType === 'LOOK_DOWN') return 'Good, keep pointing downward';
+  if (instructionType === 'TURN_LEFT' || instructionType === 'MOVE_LEFT') return 'Good, keep moving left';
+  if (instructionType === 'TURN_RIGHT' || instructionType === 'MOVE_RIGHT') return 'Good, keep moving right';
   return 'Good speed';
 }
 
@@ -2147,8 +2223,9 @@ function App() {
   const targetScreenBounds = activeTarget?.screenBounds;
   const targetViewCount = Math.min(targetViewConfig.requiredUsefulViews, Number(activeTarget?.usefulViews) || 0);
   const compactGuidance = useMemo(() => compactGuidanceFor(scanInstruction, scanState), [scanInstruction, scanState]);
-  const guidancePlacement = chooseGuidancePlacement(targetScreenBounds);
-  const targetDebugReason = activeTarget ? targetReason(activeTarget, scanState) : '—';
+  const coverageOverlayRegions = useMemo(() => coverageOverlayRegionsFor(scanState), [scanState]);
+  const guidancePlacement = chooseGuidancePlacement(coverageOverlayRegions[0]?.screenBounds || targetScreenBounds);
+  const targetDebugReason = activeTarget ? targetReason(activeTarget, scanState) : '-';
 
   useEffect(() => {
     return () => {
@@ -2804,14 +2881,16 @@ function App() {
     setIsFinished(true);
     setIsScanning(false);
     setRoomSession(session);
-    setViewMode('customize');
+    setViewMode('processing');
     setSensorState('idle');
     setIsPaused(false);
-    setLastEvent('Scan saved with measured keyframes, image quality, motion, and coverage metadata.');
+    setReconstructionState({ status: 'queued', message: 'Starting measured room reconstruction.' });
+    setLastEvent('Scan captured. Starting real reconstruction.');
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
     }
+    void reconstructSession(session);
   };
 
   const exportScan = async () => {
@@ -2848,21 +2927,104 @@ function App() {
     }
   };
 
-  const reconstructRoom = async () => {
-    if (!roomSession || isReconstructing || roomSession.meshPLY || roomSession.glbUrl) return;
+  const reconstructSession = async (session) => {
+    if (!session || isReconstructing || session.meshPLY || session.glbUrl) return;
+    let scanId = session.reconstructionScanId || null;
+    let workingSession = session;
     setIsReconstructing(true);
     setImportError('');
     setReconstructionState({ status: 'uploading', message: 'Preparing measured camera frames for reconstruction.' });
+    if (!RECONSTRUCTION_API && process.env.NODE_ENV !== 'production') {
+      // eslint-disable-next-line no-console
+      console.warn('REACT_APP_RECONSTRUCTION_API is not configured. Reconstruction requests will use the current origin.');
+    }
+
+    const responseError = async (response, fallback) => {
+      let detail = '';
+      try {
+        const body = await response.json();
+        detail = body?.detail || body?.message || '';
+      } catch (error) {
+        detail = '';
+      }
+      return detail || `${fallback} (HTTP ${response.status}).`;
+    };
+
+    const attachCompletedSession = (status, completedScanId) => {
+      const glbUrl = `${RECONSTRUCTION_API}/api/scans/${completedScanId}/room.glb`;
+      const metadataUrl = `${RECONSTRUCTION_API}/api/scans/${completedScanId}/metadata.json`;
+      const reconstructedSession = {
+        ...workingSession,
+        reconstructionScanId: completedScanId,
+        reconstruction: status.result,
+        glbUrl,
+        metadataUrl,
+      };
+      setRoomSession(reconstructedSession);
+      setReconstructionState({ ...status, status: 'complete', assetUrl: glbUrl });
+      setLastEvent('Real room mesh reconstructed from the uploaded camera frames.');
+      setViewMode('customize');
+      return reconstructedSession;
+    };
+
     try {
-      const createResponse = await fetch(`${RECONSTRUCTION_API}/api/scans`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ session_id: roomSession.sessionId, device: { userAgent: navigator.userAgent } }),
-      });
-      if (!createResponse.ok) throw new Error('The reconstruction service is not available.');
-      const createdScan = await createResponse.json();
+      let healthResponse;
+      try {
+        healthResponse = await fetch(`${RECONSTRUCTION_API}/api/health`);
+      } catch (error) {
+        const unavailable = new Error('3D reconstruction service is unavailable.');
+        unavailable.code = 'RECONSTRUCTION_SERVICE_UNAVAILABLE';
+        unavailable.technicalMessage = error.message || 'Health check request failed.';
+        throw unavailable;
+      }
+      if (!healthResponse.ok) {
+        const unavailable = new Error('3D reconstruction service is unavailable.');
+        unavailable.code = 'RECONSTRUCTION_SERVICE_UNAVAILABLE';
+        unavailable.technicalMessage = await responseError(healthResponse, 'Reconstruction health check failed');
+        throw unavailable;
+      }
+      const health = typeof healthResponse.json === 'function'
+        ? await healthResponse.json().catch(() => ({}))
+        : {};
+      if (health.ok === false) {
+        const unavailable = new Error('3D reconstruction service is unavailable.');
+        unavailable.code = 'RECONSTRUCTION_SERVICE_UNAVAILABLE';
+        unavailable.technicalMessage = health.message || 'Health check returned ok=false.';
+        throw unavailable;
+      }
+
+      let backendScan = null;
+      if (scanId) {
+        const existingResponse = await fetch(`${RECONSTRUCTION_API}/api/scans/${scanId}`);
+        if (existingResponse.ok) {
+          backendScan = await existingResponse.json();
+        } else if (existingResponse.status !== 404) {
+          throw new Error(await responseError(existingResponse, 'The reconstruction session could not be read'));
+        } else {
+          scanId = null;
+        }
+      }
+      if (!backendScan) {
+        const createResponse = await fetch(`${RECONSTRUCTION_API}/api/scans`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ session_id: session.sessionId, device: { userAgent: navigator.userAgent } }),
+        });
+        if (!createResponse.ok) throw new Error(await responseError(createResponse, 'The reconstruction session could not be created'));
+        backendScan = await createResponse.json();
+        scanId = backendScan.scanId;
+        workingSession = { ...workingSession, reconstructionScanId: scanId };
+        setRoomSession(workingSession);
+      }
+
+      if (!scanId) throw new Error('The reconstruction service did not return a scan id.');
+      if (backendScan.status === 'complete') {
+        attachCompletedSession(backendScan, scanId);
+        return;
+      }
+
       const uploadableFrames = [];
-      for (const frame of roomSession.frames) {
+      for (const frame of session.frames) {
         if (frame.image instanceof Blob) {
           uploadableFrames.push({ frame, blob: frame.image });
         } else if (typeof frame.image === 'string' && frame.image) {
@@ -2871,46 +3033,59 @@ function App() {
         }
       }
       if (uploadableFrames.length < 3) throw new Error('At least three locally stored camera frames are required for reconstruction.');
-      const formData = new FormData();
-      formData.append('metadata', JSON.stringify(uploadableFrames.map(({ frame }) => ({
-        frameId: frame.frameId,
-        capturedAt: frame.capturedAt,
-        orientation: frame.orientation,
-        motion: frame.motion,
-        estimatedPose: frame.estimatedPose || frame.pose,
-        qualityScore: frame.qualityScore,
-        qualityMetrics: frame.qualityMetrics,
-      }))));
-      uploadableFrames.forEach(({ frame, blob }) => formData.append('files', blob, `frame-${frame.frameId}.jpg`));
-      const uploadResponse = await fetch(`${RECONSTRUCTION_API}/api/scans/${createdScan.scanId}/frames`, { method: 'POST', body: formData });
-      if (!uploadResponse.ok) throw new Error('The reconstruction service rejected the camera frames.');
 
-      const startResponse = await fetch(`${RECONSTRUCTION_API}/api/scans/${createdScan.scanId}/reconstruct`, {
+      // A retry reuses the backend scan when its frames are already stored,
+      // while the browser session and captured blobs remain untouched.
+      if (Number(backendScan.frameCount) < 3) {
+        const formData = new FormData();
+        formData.append('metadata', JSON.stringify(uploadableFrames.map(({ frame }) => ({
+          frameId: frame.frameId,
+          capturedAt: frame.capturedAt,
+          orientation: frame.orientation,
+          motion: frame.motion,
+          estimatedPose: frame.estimatedPose || frame.pose,
+          qualityScore: frame.qualityScore,
+          qualityMetrics: frame.qualityMetrics,
+        }))));
+        uploadableFrames.forEach(({ frame, blob }) => formData.append('files', blob, `frame-${frame.frameId}.jpg`));
+        setReconstructionState({ status: 'uploading', message: 'Uploading measured camera views.' });
+        const uploadResponse = await fetch(`${RECONSTRUCTION_API}/api/scans/${scanId}/frames`, { method: 'POST', body: formData });
+        if (!uploadResponse.ok) throw new Error(await responseError(uploadResponse, 'The reconstruction service rejected the camera frames'));
+        backendScan = { ...backendScan, ...(await uploadResponse.json()) };
+      }
+
+      const startResponse = await fetch(`${RECONSTRUCTION_API}/api/scans/${scanId}/reconstruct`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({}),
       });
-      if (!startResponse.ok) throw new Error('The reconstruction worker could not be started.');
+      if (!startResponse.ok) throw new Error(await responseError(startResponse, 'The reconstruction worker could not be started'));
 
-      let status = await (await fetch(`${RECONSTRUCTION_API}/api/scans/${createdScan.scanId}`)).json();
+      const initialStatusResponse = await fetch(`${RECONSTRUCTION_API}/api/scans/${scanId}`);
+      if (!initialStatusResponse.ok) throw new Error(await responseError(initialStatusResponse, 'The reconstruction status could not be read'));
+      let status = await initialStatusResponse.json();
       while (!['complete', 'error'].includes(status.status)) {
         setReconstructionState(status);
-        await new Promise((resolve) => window.setTimeout(resolve, 1800));
-        status = await (await fetch(`${RECONSTRUCTION_API}/api/scans/${createdScan.scanId}`)).json();
+        await new Promise((resolve) => window.setTimeout(resolve, RECONSTRUCTION_POLL_INTERVAL_MS));
+        const statusResponse = await fetch(`${RECONSTRUCTION_API}/api/scans/${scanId}`);
+        if (!statusResponse.ok) throw new Error(await responseError(statusResponse, 'The reconstruction status could not be read'));
+        status = await statusResponse.json();
       }
       if (status.status === 'error') throw new Error(status.message || 'The reconstruction worker failed.');
-      const glbUrl = `${RECONSTRUCTION_API}/api/scans/${createdScan.scanId}/room.glb`;
-      const metadataUrl = `${RECONSTRUCTION_API}/api/scans/${createdScan.scanId}/metadata.json`;
-      setRoomSession((current) => ({ ...current, reconstruction: status.result, glbUrl, metadataUrl }));
-      setReconstructionState({ ...status, assetUrl: glbUrl });
-      setLastEvent('Real room mesh reconstructed from the uploaded camera frames.');
+      attachCompletedSession(status, scanId);
     } catch (error) {
-      setReconstructionState({ status: 'error', message: error.message || 'Reconstruction could not be completed.' });
-      setImportError(error.message || 'The real room reconstruction could not be completed.');
+      const technicalMessage = error.technicalMessage || error.message || 'Reconstruction could not be completed.';
+      const friendlyMessage = friendlyReconstructionError(error);
+      setRoomSession((current) => ({ ...(current || workingSession), reconstructionScanId: scanId || current?.reconstructionScanId || null }));
+      setReconstructionState({ status: 'error', message: friendlyMessage, technicalMessage });
+      setImportError(friendlyMessage);
+      setLastEvent('Room captured, but 3D reconstruction failed.');
     } finally {
       setIsReconstructing(false);
     }
   };
+
+  const reconstructRoom = () => reconstructSession(roomSession);
 
   const importScan = async (event) => {
     const file = event.target.files?.[0];
@@ -3031,12 +3206,12 @@ function App() {
           <span className="context-kicker">Project</span>
           <span className="context-value">Room scan</span>
           <span className="context-divider" aria-hidden="true" />
-          <span className={`status-dot ${isFinished ? 'status-dot-complete' : ''}`} />
-          <span className="context-value">{isFinished ? 'Ready to review' : isScanning ? 'Scanning' : 'Not started'}</span>
+          <span className={`status-dot ${isFinished && viewMode !== 'processing' ? 'status-dot-complete' : ''}`} />
+          <span className="context-value">{viewMode === 'processing' ? 'Processing' : isFinished ? 'Ready to review' : isScanning ? 'Scanning' : 'Not started'}</span>
         </div>
 
         <div className="topbar-actions">
-          {roomSession && (
+          {roomSession && (roomSession.glbUrl || (typeof roomSession.meshPLY === 'string' && roomSession.meshPLY.startsWith('ply'))) && (
             <button className="quiet-button" type="button" onClick={() => setViewMode(viewMode === 'customize' ? 'scan' : 'customize')}>
               {viewMode === 'customize' ? 'Back to scan' : 'Room simulator'}
             </button>
@@ -3049,7 +3224,18 @@ function App() {
         </div>
       </header>
 
-      {viewMode === 'customize' && roomSession ? (
+      {viewMode === 'processing' && roomSession ? (
+        <ProcessingScreen
+          reconstructionState={reconstructionState}
+          isReconstructing={isReconstructing}
+          onRetry={() => reconstructSession(roomSession)}
+          onReturnToScan={() => {
+            setViewMode('scan');
+            setIsFinished(false);
+            setImportError('');
+          }}
+        />
+      ) : viewMode === 'customize' && roomSession ? (
         <RoomCustomizer
           session={roomSession}
           onExport={exportScan}
@@ -3064,6 +3250,7 @@ function App() {
             <video ref={videoRef} className={`camera-video ${cameraState === 'live' ? 'camera-video-live' : ''}`} autoPlay muted playsInline />
             <div className="room-fallback" aria-hidden={cameraState === 'live'}><span>LIVE CAMERA REQUIRED</span></div>
             <div className="camera-shade" />
+            {isScanning && <CoverageOverlay scanState={scanState} />}
             {SCANNER_TARGET_DEBUG && (
               <>
                 <div className="target-debug-quadrants" aria-hidden="true">
@@ -3099,7 +3286,7 @@ function App() {
               <span className="reticle-cross reticle-cross-horizontal" />
               <span className="reticle-cross reticle-cross-vertical" />
             </div>
-            {isScanning && !SCANNER_TARGET_DEBUG && activeTarget && targetScreenBounds && activeTarget.currentlyVisible && (
+            {isScanning && SCANNER_DEBUG && activeTarget && targetScreenBounds && activeTarget.currentlyVisible && (
               <div
                 className="spatial-target-overlay"
                 style={{
@@ -3162,20 +3349,20 @@ function App() {
                       <span>Successful relative poses</span><b>{scanState.mapping?.successfulRelativePoseCount || scanState.successfulRelativePoseCount}</b>
                       <span>Viewpoint diversity</span><b>{Number(scanState.mapping?.viewpointDiversity || scanState.viewpointDiversity || 0).toFixed(2)}</b>
                       <span>Mapping ready</span><b>{scanState.mappingReadiness?.ready ? 'YES' : 'NO'}</b>
-                      <span>Reason</span><b>{scanState.mappingReadiness?.reason || '—'}</b>
+                      <span>Reason</span><b>{scanState.mappingReadiness?.reason || '-'}</b>
                     </div>
                     <div className="scanner-debug-section">Adaptive target</div>
                     <div className="scanner-debug-grid">
-                      <span>Active target ID</span><b>{activeTarget?.id || '—'}</b>
-                      <span>Target source</span><b>{activeTarget?.source || '—'}</b>
-                      <span>Target source keyframes</span><b>{activeTarget?.observedFromKeyframes?.join(', ') || '—'}</b>
-                      <span>Target feature tracks</span><b>{activeTarget?.featureTrackIds?.join(', ') || '—'}</b>
+                      <span>Active target ID</span><b>{activeTarget?.id || '-'}</b>
+                      <span>Target source</span><b>{activeTarget?.source || '-'}</b>
+                      <span>Target source keyframes</span><b>{activeTarget?.observedFromKeyframes?.join(', ') || '-'}</b>
+                      <span>Target feature tracks</span><b>{activeTarget?.featureTrackIds?.join(', ') || '-'}</b>
                       <span>Target visible</span><b>{activeTarget?.currentlyVisible ? 'YES' : 'NO'}</b>
                       <span>Target viewpoint count</span><b>{activeTarget?.viewpointCount || 0}</b>
                       <span>Target parallax</span><b>{Number(activeTarget?.parallaxScore || 0).toFixed(2)}</b>
                       <span>Target feature density</span><b>{Number(activeTarget?.featureDensity || 0).toFixed(2)}</b>
                       <span>Target confidence</span><b>{Number(activeTarget?.coverageConfidence || 0).toFixed(2)}</b>
-                      <span>Target status</span><b>{activeTarget?.status || '—'}</b>
+                      <span>Target status</span><b>{activeTarget?.status || '-'}</b>
                     </div>
                   </>
                 )}
@@ -3185,10 +3372,10 @@ function App() {
                     <div className="scanner-debug-grid">
                       <span>Camera frames received</span><b>{scanState.cameraFramesReceived}</b>
                       <span>FPS evaluated</span><b>{Number(scanState.evaluationFps || 0).toFixed(1)}</b>
-                      <span>Last frame timestamp</span><b>{scanState.lastFrameTimestamp || '—'}</b>
-                      <span>Camera</span><b>{scanState.cameraFrameDimensions.width ? `${scanState.cameraFrameDimensions.width}×${scanState.cameraFrameDimensions.height}` : '—'}</b>
-                      <span>Display</span><b>{scanState.displayDimensions.width ? `${Math.round(scanState.displayDimensions.width)}×${Math.round(scanState.displayDimensions.height)}` : '—'}</b>
-                      <span>Device pixel ratio</span><b>{typeof window !== 'undefined' ? window.devicePixelRatio || 1 : '—'}</b>
+                      <span>Last frame timestamp</span><b>{scanState.lastFrameTimestamp || '-'}</b>
+                      <span>Camera</span><b>{scanState.cameraFrameDimensions.width ? `${scanState.cameraFrameDimensions.width}×${scanState.cameraFrameDimensions.height}` : '-'}</b>
+                      <span>Display</span><b>{scanState.displayDimensions.width ? `${Math.round(scanState.displayDimensions.width)}×${Math.round(scanState.displayDimensions.height)}` : '-'}</b>
+                      <span>Device pixel ratio</span><b>{typeof window !== 'undefined' ? window.devicePixelRatio || 1 : '-'}</b>
                       <span>Mirrored / rotation</span><b>{scanState.previewMirrored ? 'true' : 'false'} / {scanState.previewRotation}°</b>
                       <span>Screen orientation</span><b>{scanState.screenOrientation}</b>
                       <span>Camera facing</span><b>{scanState.cameraFacing}</b>
@@ -3198,9 +3385,9 @@ function App() {
                     </div>
                     <div className="scanner-debug-section">Orientation</div>
                     <div className="scanner-debug-grid">
-                      <span>Pitch</span><b>{scanState.currentOrientation?.pitch === null ? '—' : Number(scanState.currentOrientation?.pitch || 0).toFixed(3)}</b>
-                      <span>Yaw</span><b>{scanState.currentOrientation?.heading === null ? '—' : `${Number(scanState.currentOrientation.heading).toFixed(1)}°`}</b>
-                      <span>Roll</span><b>{scanState.currentOrientation?.gamma === null ? '—' : `${Number(scanState.currentOrientation.gamma).toFixed(1)}°`}</b>
+                      <span>Pitch</span><b>{scanState.currentOrientation?.pitch === null ? '-' : Number(scanState.currentOrientation?.pitch || 0).toFixed(3)}</b>
+                      <span>Yaw</span><b>{scanState.currentOrientation?.heading === null ? '-' : `${Number(scanState.currentOrientation.heading).toFixed(1)}°`}</b>
+                      <span>Roll</span><b>{scanState.currentOrientation?.gamma === null ? '-' : `${Number(scanState.currentOrientation.gamma).toFixed(1)}°`}</b>
                     </div>
                     <div className="scanner-debug-section">Screen target</div>
                     <div className="scanner-debug-grid">
@@ -3215,8 +3402,8 @@ function App() {
                     <div className="scanner-debug-section">LOOK_UP_TEST</div>
                     <div className="scanner-debug-grid">
                       <span>Visible</span><b>{scanState.diagnosticTarget.lookUpTest.visible ? 'YES' : 'NOT VISIBLE'}</b>
-                      <span>Reason</span><b>{scanState.diagnosticTarget.lookUpTest.reason || '—'}</b>
-                      <span>Normalized pitch</span><b>{scanState.diagnosticTarget.lookUpTest.normalizedPitch === null ? '—' : Number(scanState.diagnosticTarget.lookUpTest.normalizedPitch).toFixed(3)}</b>
+                      <span>Reason</span><b>{scanState.diagnosticTarget.lookUpTest.reason || '-'}</b>
+                      <span>Normalized pitch</span><b>{scanState.diagnosticTarget.lookUpTest.normalizedPitch === null ? '-' : Number(scanState.diagnosticTarget.lookUpTest.normalizedPitch).toFixed(3)}</b>
                     </div>
                     {activeTarget && (
                       <>
@@ -3224,10 +3411,10 @@ function App() {
                         <div className="scanner-debug-grid">
                           <span>Target ID</span><b>{activeTarget.id}</b>
                           <span>Type / source</span><b>{activeTarget.semanticType} / {activeTarget.definitionSource || 'CAMERA_RELATIVE'}</b>
-                          <span>Projected center</span><b>{activeTarget.screenPosition ? `${activeTarget.screenPosition.x.toFixed(3)}, ${activeTarget.screenPosition.y.toFixed(3)}` : '—'}</b>
-                          <span>Projected bounds</span><b>{activeTarget.screenBounds ? `${activeTarget.screenBounds.x.toFixed(3)},${activeTarget.screenBounds.y.toFixed(3)} ${activeTarget.screenBounds.width.toFixed(3)}×${activeTarget.screenBounds.height.toFixed(3)}` : '—'}</b>
+                          <span>Projected center</span><b>{activeTarget.screenPosition ? `${activeTarget.screenPosition.x.toFixed(3)}, ${activeTarget.screenPosition.y.toFixed(3)}` : '-'}</b>
+                          <span>Projected bounds</span><b>{activeTarget.screenBounds ? `${activeTarget.screenBounds.x.toFixed(3)},${activeTarget.screenBounds.y.toFixed(3)} ${activeTarget.screenBounds.width.toFixed(3)}×${activeTarget.screenBounds.height.toFixed(3)}` : '-'}</b>
                           <span>Currently visible</span><b>{activeTarget.currentlyVisible ? 'YES' : 'NO'}</b>
-                          <span>Visibility reason</span><b>{activeTarget.visibilityReason || '—'}</b>
+                          <span>Visibility reason</span><b>{activeTarget.visibilityReason || '-'}</b>
                         </div>
                       </>
                     )}
@@ -3248,9 +3435,9 @@ function App() {
                   <span>Smoothed score</span><b>{motionTelemetry.motionScore.toFixed(1)}°/s</b>
                   <span>Warning / critical</span><b>{motionTelemetry.warningThreshold} / {motionTelemetry.criticalThreshold}°/s</b>
                   <span>High-speed timer</span><b>{Math.round(motionTelemetry.highSpeedDurationMs)} ms</b>
-                  <span>Target pitch</span><b>{motionTelemetry.targetPitchDegrees === null ? '—' : `${motionTelemetry.targetPitchDegrees.toFixed(0)}°`}</b>
-                  <span>Current pitch</span><b>{motionTelemetry.currentPitchDegrees === null ? '—' : `${motionTelemetry.currentPitchDegrees.toFixed(0)}°`}</b>
-                  <span>Target error</span><b>{motionTelemetry.targetErrorDegrees === null ? '—' : `${motionTelemetry.targetErrorDegrees.toFixed(0)}°`}</b>
+                  <span>Target pitch</span><b>{motionTelemetry.targetPitchDegrees === null ? '-' : `${motionTelemetry.targetPitchDegrees.toFixed(0)}°`}</b>
+                  <span>Current pitch</span><b>{motionTelemetry.currentPitchDegrees === null ? '-' : `${motionTelemetry.currentPitchDegrees.toFixed(0)}°`}</b>
+                  <span>Target error</span><b>{motionTelemetry.targetErrorDegrees === null ? '-' : `${motionTelemetry.targetErrorDegrees.toFixed(0)}°`}</b>
                   <span>Feature count</span><b>{motionTelemetry.featureCount}</b>
                   <span>Tracking / image</span><b>{Math.round(motionTelemetry.trackingQuality * 100)}% / {Math.round(motionTelemetry.imageQuality * 100)}%</b>
                   <span>Tracking status</span><b>{motionTelemetry.trackingStatus}</b>
@@ -3292,7 +3479,7 @@ function App() {
                     <div className="scanner-debug-grid">
                       <span>Current target</span><b>{activeTarget.id}</b>
                       <span>Visible</span><b>{activeTarget.currentlyVisible ? 'YES' : 'NO'}</b>
-                      <span>Screen coverage</span><b>{targetScreenBounds ? `${Math.round(targetScreenBounds.width * targetScreenBounds.height * 100)}% area` : '—'}</b>
+                      <span>Screen coverage</span><b>{targetScreenBounds ? `${Math.round(targetScreenBounds.width * targetScreenBounds.height * 100)}% area` : '-'}</b>
                       <span>Observations</span><b>{activeTarget.observationCount || activeTarget.observations || 0}</b>
                       <span>Useful views</span><b>{activeTarget.usefulViews || 0}</b>
                       <span>Target state</span><b>{activeTarget.targetCaptureState || 'LOCATING'}</b>
@@ -3303,7 +3490,7 @@ function App() {
                       <span>Coverage</span><b>{Math.round((activeTarget.coverage || 0) * 100)}%</b>
                       <span>Attempts</span><b>{activeTarget.attempts || 0}</b>
                       <span>Reason incomplete</span><b>{targetDebugReason}</b>
-                      <span>Last view result</span><b>{scanState.lastTargetViewDecision?.qualified ? 'YES' : scanState.lastTargetViewDecision?.reason || '—'}</b>
+                      <span>Last view result</span><b>{scanState.lastTargetViewDecision?.qualified ? 'YES' : scanState.lastTargetViewDecision?.reason || '-'}</b>
                       <span>Target view rejects</span><b>{Object.entries(activeTarget.targetViewRejectionReasons || {}).filter(([, count]) => count > 0).map(([reason, count]) => `${reason}:${count}`).join(' ') || 'none'}</b>
                       <span>Next instruction</span><b>{scanInstruction.adaptiveGuidance?.movementInstruction?.type || scanInstruction.adaptiveGuidance?.aimInstruction?.direction || scanInstruction.type}</b>
                     </div>
@@ -3343,6 +3530,7 @@ function App() {
             <span className="phase-chip">{scanState.phase === SCANNER_PHASES.INITIAL_MAPPING ? 'Initial mapping' : 'Adaptive coverage'}</span>
           </div>
 
+          {(!isScanning || SCANNER_DEBUG) && <>
           <section className="progress-panel" aria-label="Room scan capture progress">
             <div className="progress-heading">
               <span>Capture progress</span>
@@ -3387,6 +3575,8 @@ function App() {
             <div className="instruction-meter"><span style={{ width: `${roomCoverage}%` }} /></div>
             <p className="instruction-helper">{scanInstruction.helper} {!canFinish && finishHint}</p>
           </section>
+
+          </>}
 
           <div className="event-line"><span className="event-pulse" />{lastEvent}</div>
 
@@ -3634,7 +3824,7 @@ function RoomScene({ session, surfaceColors }) {
     scene.add(room);
 
     if (!scanMeshGeometry && !hasGlb) {
-      setSceneError('This session has no real room mesh. Use the native iOS LiDAR scanner to build the 3D simulator.');
+      setSceneError('Room reconstruction has not started.');
       return () => renderer.dispose();
     }
 
@@ -3809,7 +3999,7 @@ function RoomScene({ session, surfaceColors }) {
       <canvas className="room-scene-canvas" ref={canvasRef} aria-label="Interactive 3D room mesh captured from the real room" />
       {sceneError && <p className="room-scene-empty">{sceneError}</p>}
       <div className="room-scene-toolbar">
-        <span>{sceneError ? 'A real mesh is required for this viewer.' : arActive ? 'Move your phone to view the room in AR.' : 'Drag to look around. Scroll to zoom.'}</span>
+        <span>{sceneError ? 'Mesh unavailable.' : arActive ? 'Move your phone to view the room in AR.' : 'Drag to look around. Scroll to zoom.'}</span>
         {hasRenderableAsset && arSupport === 'supported' && !arActive && <button type="button" className="scene-ar-button" onClick={enterAR}>Enter AR</button>}
         {arActive && <button type="button" className="scene-ar-button" onClick={exitAR}>Exit AR</button>}
         {arSupport === 'checking' && <span className="scene-capability">Checking AR...</span>}
@@ -3820,12 +4010,42 @@ function RoomScene({ session, surfaceColors }) {
   );
 }
 
+export function ProcessingScreen({ reconstructionState, isReconstructing, onRetry, onReturnToScan }) {
+  const status = reconstructionState?.status || 'queued';
+  const failed = status === 'error';
+  const steps = reconstructionProgressSteps(status);
+  return (
+    <section className="processing-screen" aria-live="polite" aria-label="Room reconstruction progress">
+      <div className="processing-card">
+        <p className="section-label">Room scan</p>
+        <h1>{failed ? 'Room captured, but 3D reconstruction failed.' : 'Processing your room'}</h1>
+        <p className="processing-status">{failed ? reconstructionState.message : reconstructionStatusLabel(status)}</p>
+        <ol className="processing-steps">
+          {steps.map((step) => (
+            <li className={`processing-step processing-step-${step.state}`} key={step.key}>
+              <span className="processing-step-icon" aria-hidden="true">{step.state === 'done' ? '✓' : step.state === 'active' ? '●' : '○'}</span>
+              <span>{step.label}</span>
+            </li>
+          ))}
+        </ol>
+        {failed && SCANNER_DEBUG && reconstructionState.technicalMessage && (
+          <p className="processing-technical">Technical detail: {reconstructionState.technicalMessage}</p>
+        )}
+        <div className="processing-actions">
+          {failed && <button className="primary-button" type="button" onClick={onRetry} disabled={isReconstructing}>Retry reconstruction</button>}
+          <button className="secondary-button" type="button" onClick={onReturnToScan}>Return to scan</button>
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function RoomCustomizer({ session, onExport, isExporting, onReconstruct, isReconstructing, reconstructionState }) {
   const [surfaceColors, setSurfaceColors] = useState({ wall: '#737a71', floor: '#59615a', ceiling: '#9a9c92' });
   const hasLiDARMesh = typeof session.meshPLY === 'string' && session.meshPLY.startsWith('ply');
   const hasRealMesh = hasLiDARMesh || Boolean(session.glbUrl);
   const canEditSurfaces = hasLiDARMesh;
-  const meshLabel = hasLiDARMesh ? 'LiDAR mesh' : session.glbUrl ? 'Photogrammetry GLB' : 'Mesh required';
+  const meshLabel = hasLiDARMesh ? 'LiDAR mesh' : session.glbUrl ? 'Photogrammetry GLB' : 'Mesh unavailable';
 
   const updateSurfaceColor = (surface, color) => {
     setSurfaceColors((current) => ({ ...current, [surface]: color }));
@@ -3871,8 +4091,8 @@ function RoomCustomizer({ session, onExport, isExporting, onReconstruct, isRecon
             <RoomScene session={session} surfaceColors={surfaceColors} />
             <div className="customizer-stage-shade" />
             <div className="customizer-stage-meta">
-              <span>{hasRealMesh ? 'REAL ROOM MESH' : 'MESH REQUIRED'}</span>
-              <span>{hasLiDARMesh ? 'ARKit geometry' : session.glbUrl ? 'COLMAP geometry' : 'No synthetic room'}</span>
+              <span>{hasRealMesh ? 'REAL ROOM MESH' : 'MESH UNAVAILABLE'}</span>
+              <span>{hasLiDARMesh ? 'ARKit geometry' : session.glbUrl ? 'COLMAP geometry' : 'No measured mesh'}</span>
             </div>
           </div>
         </section>
@@ -3917,9 +4137,57 @@ function RoomCustomizer({ session, onExport, isExporting, onReconstruct, isRecon
               {reconstructionState && <p className={`action-note ${reconstructionState.status === 'error' ? 'action-note-error' : 'action-note-guidance'}`}>{reconstructionState.message}</p>}
             </div>
           )}
-          <p className="customizer-disclaimer">Only a native iOS LiDAR session supplies real room geometry here. Browser camera sessions do not become a 3D room, and this simulator will not invent walls, furniture, or image panels.</p>
+          <p className="customizer-disclaimer">This simulator shows measured LiDAR geometry or the reconstructed GLB. It never invents walls, furniture, or image panels.</p>
         </aside>
       </div>
+    </div>
+  );
+}
+
+function CoverageOverlay({ scanState }) {
+  if (scanState?.phase === SCANNER_PHASES.INITIAL_MAPPING) {
+    return <div className="scanner-initial-mapping-tint" aria-label="Initial room mapping" />;
+  }
+  const regions = coverageOverlayRegionsFor(scanState);
+  const debugRegions = SCANNER_DEBUG
+    ? projectCoverageOverlayRegions(
+      Array.isArray(scanState?.coverageRegions) ? scanState.coverageRegions : [],
+      scanState.currentOrientation,
+      scanState.cameraPose,
+      scanState.displayTransform,
+      { ...coverageOverlayConfig, includeClear: true },
+    )
+    : [];
+  return (
+    <div className="scan-coverage-overlay" aria-label="Blue coverage overlay">
+      {regions.map((region) => {
+        const bounds = region.screenBounds;
+        const debugLabel = `region: ${region.id}, coverage: ${(Number(region.coverage || 0)).toFixed(2)}, confidence: ${(Number(region.coverageConfidence || 0)).toFixed(2)}, status: ${region.status || 'UNSEEN'}, opacity: ${region.blueOpacity.toFixed(2)}`;
+        return (
+          <div
+            className="coverage-blue-region"
+            key={region.id}
+            style={{
+              left: `${bounds.x * 100}%`,
+              top: `${bounds.y * 100}%`,
+              width: `${bounds.width * 100}%`,
+              height: `${bounds.height * 100}%`,
+              opacity: region.blueOpacity,
+            }}
+            aria-label={SCANNER_DEBUG ? debugLabel : undefined}
+            title={SCANNER_DEBUG ? debugLabel : undefined}
+          />
+        );
+      })}
+      {SCANNER_DEBUG && (
+        <div className="coverage-overlay-debug" aria-label="Projected coverage debug">
+          {debugRegions.map((region) => (
+            <span key={`${region.id}-debug`}>
+              region: {region.id} | coverage: {Number(region.coverage || 0).toFixed(2)} | confidence: {Number(region.coverageConfidence || 0).toFixed(2)} | status: {region.status || 'UNSEEN'} | opacity: {region.blueOpacity.toFixed(2)} | bounds: {region.screenBounds.x.toFixed(2)},{region.screenBounds.y.toFixed(2)} {region.screenBounds.width.toFixed(2)}x{region.screenBounds.height.toFixed(2)}
+            </span>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -3971,5 +4239,9 @@ export {
   updateFeatureTracks,
   mappingReadinessConfig,
   observedTargetConfig,
+  coverageOverlayConfig,
+  projectCoverageOverlayRegions,
+  blueCoverageOpacity,
+  targetPriorityForScan,
 };
 export default App;

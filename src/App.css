@@ -125,6 +125,11 @@ button { font: inherit; }
 .spatial-target-overlay::before { top: -1px; left: -1px; border-top: 2px solid; border-left: 2px solid; border-radius: 7px 0 0; }
 .spatial-target-overlay::after { right: -1px; bottom: -1px; border-right: 2px solid; border-bottom: 2px solid; border-radius: 0 0 7px; }
 .spatial-target-overlay span { position: absolute; top: 7px; left: 8px; padding: 4px 6px; background: rgba(15, 16, 14, 0.7); color: var(--green); font-family: 'SFMono-Regular', Consolas, monospace; font-size: 8px; letter-spacing: .08em; white-space: nowrap; }
+.scan-coverage-overlay, .scanner-initial-mapping-tint { position: absolute; z-index: 1; inset: 0; pointer-events: none; }
+.scanner-initial-mapping-tint { background: rgba(30, 110, 255, .18); }
+.coverage-blue-region { position: absolute; box-sizing: border-box; border: 1px solid rgba(124, 197, 255, .34); background: rgb(30, 110, 255); transition: opacity 240ms ease; }
+.coverage-overlay-debug { position: absolute; z-index: 2; top: 58px; right: 18px; display: grid; gap: 3px; width: min(360px, calc(100% - 36px)); max-height: calc(100% - 120px); overflow: auto; padding: 8px 10px; border: 1px solid rgba(124, 197, 255, .5); border-radius: 8px; background: rgba(15, 16, 14, .84); color: var(--paper-muted); font: 9px/1.35 'SFMono-Regular', Consolas, monospace; }
+.coverage-overlay-debug span { display: block; }
 .camera-frame-target-debug .scanner-debug-overlay { left: auto; right: 18px; }
 .target-debug-quadrants { position: absolute; z-index: 1; inset: 0; display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; pointer-events: none; }
 .target-debug-quadrants span { display: flex; align-items: flex-start; justify-content: flex-start; padding: 7px; border: 1px solid rgba(151, 216, 177, 0.28); color: rgba(241, 238, 230, 0.72); font: 8px/1 'SFMono-Regular', Consolas, monospace; letter-spacing: .08em; }
@@ -279,6 +284,21 @@ button:focus-visible { outline: 2px solid var(--accent-hot); outline-offset: 3px
 .reconstruction-action .primary-button { width: 100%; }
 .customizer-disclaimer { margin: 12px 0 0; color: var(--ink-muted); font-size: 10px; line-height: 1.45; }
 
+.processing-screen { max-width: 760px; min-height: calc(100dvh - 118px); margin: 34px auto 0; display: grid; place-items: center; }
+.processing-card { width: min(100%, 570px); padding: 30px; border: 1px solid rgba(151, 216, 177, .28); border-radius: var(--radius); background: rgba(151, 216, 177, .045); }
+.processing-card h1 { max-width: 460px; margin: 9px 0 0; color: var(--paper); font-size: clamp(32px, 5vw, 52px); line-height: .98; letter-spacing: -.065em; }
+.processing-status { margin: 15px 0 0; color: var(--green); font-size: 13px; }
+.processing-steps { display: grid; gap: 13px; margin: 28px 0 0; padding: 0; list-style: none; }
+.processing-step { display: flex; align-items: center; gap: 11px; color: var(--ink-muted); font-size: 13px; }
+.processing-step-icon { width: 17px; color: var(--ink-muted); font-family: 'SFMono-Regular', Consolas, monospace; text-align: center; }
+.processing-step-done { color: var(--paper-muted); }
+.processing-step-done .processing-step-icon { color: var(--green); }
+.processing-step-active { color: var(--paper); }
+.processing-step-active .processing-step-icon { color: var(--accent-hot); }
+.processing-technical { margin: 22px 0 0; padding-top: 14px; border-top: 1px solid var(--line); color: var(--ink-muted); font: 10px/1.45 'SFMono-Regular', Consolas, monospace; overflow-wrap: anywhere; }
+.processing-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 30px; }
+.processing-actions .primary-button, .processing-actions .secondary-button { min-width: 165px; }
+
 /* Camera-first live scan surface. The detailed panels stay available to
    debug mode, while normal scanning keeps the room visible and the guidance
    small enough to yield to the target. */
@@ -386,6 +406,12 @@ button:focus-visible { outline: 2px solid var(--accent-hot); outline-offset: 3px
 }
 
 @media (max-width: 640px) {
+  .processing-screen { min-height: calc(100dvh - 92px); margin: 12px auto 0; padding: 12px 0 28px; }
+  .processing-card { padding: 24px 20px; }
+  .processing-card h1 { font-size: 36px; }
+  .processing-steps { margin-top: 24px; }
+  .processing-actions { display: grid; grid-template-columns: 1fr; margin-top: 26px; }
+  .processing-actions .primary-button, .processing-actions .secondary-button { width: 100%; }
   .app-shell { padding: 0 14px 22px; }
   .topbar { min-height: 72px; grid-template-columns: 1fr auto; }
   .topbar-context { display: none; }
