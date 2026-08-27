@@ -274,19 +274,29 @@ button:focus-visible { outline: 2px solid var(--accent-hot); outline-offset: 3px
   .topbar-actions { gap: 10px; }
   .import-control { font-size: 11px; }
   .quiet-button { font-size: 11px; }
-  .workspace { margin-top: 18px; gap: 25px; }
-  .camera-frame { aspect-ratio: 0.92 / 1; }
+  .workspace { margin-top: 12px; gap: 12px; }
+  .camera-frame { aspect-ratio: auto; height: clamp(160px, 28svh, 220px); }
   .camera-meta { left: 14px; right: 14px; }
   .camera-mode { display: none; }
   .object-tag-window { left: 42%; }
+  .camera-footer { display: none; }
+  .control-column { display: flex; flex-direction: column; gap: 0; }
+  .control-header { display: none; }
+  .progress-panel { order: 1; margin-top: 0; padding-bottom: 11px; }
+  .instruction-panel { order: 2; margin-top: 11px; padding: 14px; }
+  .instruction-content { margin: 16px 0 15px; gap: 12px; }
+  .direction-glyph { width: 38px; height: 38px; font-size: 22px; }
+  .instruction-content h2 { margin-top: 5px; font-size: 20px; }
+  .instruction-copy { margin-top: 7px; font-size: 12px; }
+  .instruction-helper { margin-top: 9px; font-size: 10px; }
+  .control-actions { order: 3; grid-template-columns: minmax(0, 1fr) auto; margin-top: 11px; }
+  .event-line { order: 4; min-height: 32px; font-size: 10px; }
+  .objects-panel { order: 5; display: none; }
+  .action-note { order: 6; display: none; }
   .telemetry-grid { grid-template-columns: repeat(3, 1fr); }
   .telemetry-value:nth-child(3) { border-right: 0; }
   .telemetry-value:nth-child(-n + 3) { border-bottom: 1px solid var(--line); }
-  .control-header h1 { font-size: 36px; }
   .phase-chip { display: none; }
-  .instruction-content { margin: 23px 0 22px; }
-  .instruction-content h2 { font-size: 21px; }
-  .object-row { grid-template-columns: 28px minmax(0, 1fr) 100px; }
   .customizer-workspace { margin-top: 18px; }
   .customizer-header { display: block; }
   .customizer-header h1 { font-size: 36px; }
