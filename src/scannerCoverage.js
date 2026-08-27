@@ -1,7 +1,27 @@
 export const SCANNER_PHASES = Object.freeze({
-  INITIAL_MAPPING: 'INITIAL_MAPPING',
-  ADAPTIVE_COVERAGE: 'ADAPTIVE_COVERAGE',
+  INITIAL_TRACKING: 'INITIAL_TRACKING',
+  CONTINUOUS_MAPPING: 'CONTINUOUS_MAPPING',
+  READY: 'READY',
+  // Backward-compatible names for exported scan sessions and existing tests.
+  INITIAL_MAPPING: 'INITIAL_TRACKING',
+  ADAPTIVE_COVERAGE: 'CONTINUOUS_MAPPING',
 });
+
+export function normalizeScannerPhase(phase) {
+  if (phase === SCANNER_PHASES.INITIAL_TRACKING || phase === 'INITIAL_MAPPING') return SCANNER_PHASES.INITIAL_TRACKING;
+  if (phase === SCANNER_PHASES.CONTINUOUS_MAPPING || phase === 'ADAPTIVE_COVERAGE') return SCANNER_PHASES.CONTINUOUS_MAPPING;
+  if (phase === SCANNER_PHASES.READY) return SCANNER_PHASES.READY;
+  return phase;
+}
+
+export function isInitialTrackingPhase(phase) {
+  return normalizeScannerPhase(phase) === SCANNER_PHASES.INITIAL_TRACKING;
+}
+
+export function isContinuousMappingPhase(phase) {
+  const normalized = normalizeScannerPhase(phase);
+  return normalized === SCANNER_PHASES.CONTINUOUS_MAPPING || normalized === SCANNER_PHASES.READY;
+}
 
 export const mappingReadinessConfig = Object.freeze({
   minimumAcceptedKeyframes: 6,
@@ -51,6 +71,16 @@ export const directionalCoverageConfig = Object.freeze({
   clearConfidence: 0.86,
 });
 
+export const sparseMapConfig = Object.freeze({
+  maxPoints: 500,
+  minimumBaselineMeters: 0.12,
+  maximumReprojectionErrorDegrees: 12,
+  minimumTrackObservations: 2,
+  planeToleranceMeters: 0.08,
+  minimumPlaneInliers: 6,
+  minimumPlaneConfidence: 0.42,
+});
+
 // Lower numbers are structural priorities. Furniture is intentionally last
 // so heuristic furniture/frame classifications cannot steer the room pass.
 export const scannerTargetPriority = Object.freeze({
@@ -93,7 +123,11 @@ export function blueCoverageOpacity(region, config = coverageOverlayConfig) {
   const confidence = Number(region.coverageConfidence ?? region.confidence) || 0;
   const clearConfidence = Number(settings.clearConfidence) || directionalCoverageConfig.clearConfidence;
   const geometryCanClear = !hasDistinctViewEvidence
-    || (distinctViews >= 2 && (physicalViews >= 1 || confidence >= clearConfidence));
+    || (distinctViews >= 2 && physicalViews >= 1)
+    || (!Number.isFinite(Number(region.physicalViewCount))
+      && !Number.isFinite(Number(region.translationViewCount))
+      && distinctViews >= 2
+      && confidence >= clearConfidence);
   if (coverage >= completionThreshold && geometryCanClear) return 0;
   if (coverage <= 0.15) return maxOpacity;
   if (coverage <= 0.4) return maxOpacity + ((0.35 - maxOpacity) * ((coverage - 0.15) / 0.25));
@@ -119,7 +153,7 @@ function featureSignature(featureTrackIds = []) {
   return [...new Set((Array.isArray(featureTrackIds) ? featureTrackIds : []).filter(Boolean))].slice(0, 16);
 }
 
-function viewRecordFrom({ keyframeId, pose, orientation, featureTrackIds, translationDelta = 0, angleDelta = 0, parallax = 0 }) {
+function viewRecordFrom({ keyframeId, pose, orientation, featureTrackIds, translationDelta = 0, angleDelta = 0, parallax = 0, visualParallax = 0 }) {
   return {
     keyframeId: keyframeId ?? null,
     position: pose ? { x: finite(pose.x), y: finite(pose.y), z: finite(pose.z) } : null,
@@ -131,6 +165,7 @@ function viewRecordFrom({ keyframeId, pose, orientation, featureTrackIds, transl
     translationDelta,
     angleDelta,
     parallax,
+    visualParallax,
   };
 }
 
@@ -160,8 +195,10 @@ export function viewpointNovelty(previousViewpoints = [], nextView, config = dir
       angleDistance(view.heading, nextHeading),
       Math.abs(finite(view.pitch) - nextPitch) * 90,
     );
-    const parallax = clamp(translationDelta / 0.45, 0, 1);
-    return { translationDelta, angleDelta, parallax };
+    const poseParallax = clamp(translationDelta / 0.45, 0, 1);
+    const visualParallax = clamp(nextView.visualParallax, 0, 1);
+    const parallax = Math.max(poseParallax, visualParallax);
+    return { translationDelta, angleDelta, parallax, visualParallax };
   });
   const closest = comparisons.reduce((best, current) => (!best || current.translationDelta + (current.angleDelta / 180) < best.translationDelta + (best.angleDelta / 180) ? current : best), null);
   const last = comparisons[comparisons.length - 1] || closest;
@@ -171,12 +208,14 @@ export function viewpointNovelty(previousViewpoints = [], nextView, config = dir
   const duplicate = closest.translationDelta < config.duplicateTranslationMeters
     && closest.angleDelta < config.duplicateAngleDegrees
     && closest.parallax < config.duplicateParallax;
+  const physicalMovement = comparisons.some((comparison) => comparison.translationDelta >= config.minimumTranslationMeters);
   return {
     isNovel: meaningful && !duplicate,
-    translationDelta: last.translationDelta,
+    translationDelta: physicalMovement ? Math.max(...comparisons.map((comparison) => comparison.translationDelta)) : last.translationDelta,
     angleDelta: last.angleDelta,
     parallax: last.parallax,
-    physicalMovement: last.translationDelta >= config.minimumTranslationMeters || last.parallax >= config.minimumParallax,
+    visualParallax: last.visualParallax,
+    physicalMovement,
     reason: duplicate ? 'DUPLICATE_VIEW' : meaningful ? null : 'LOW_NOVELTY',
   };
 }
@@ -334,6 +373,28 @@ function latestObservationForTrack(track) {
   return Array.isArray(track?.observations) ? track.observations[track.observations.length - 1] : null;
 }
 
+function patchDifference(first, second) {
+  if (!Array.isArray(first) || !Array.isArray(second) || first.length === 0 || second.length === 0) return 0.5;
+  const length = Math.min(first.length, second.length);
+  let total = 0;
+  for (let index = 0; index < length; index += 1) total += Math.abs(finite(first[index]) - finite(second[index]));
+  return clamp(total / length, 0, 1);
+}
+
+function blendPatchSignature(previous, current, weight = 0.22) {
+  if (!Array.isArray(current) || current.length === 0) return previous || null;
+  if (!Array.isArray(previous) || previous.length === 0) return current.slice(0, 16);
+  const length = Math.min(previous.length, current.length, 16);
+  return Array.from({ length }, (_, index) => (finite(previous[index]) * (1 - weight)) + (finite(current[index]) * weight));
+}
+
+function median(values) {
+  const sorted = values.filter((value) => Number.isFinite(Number(value))).map(Number).sort((first, second) => first - second);
+  if (sorted.length === 0) return 0;
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0 ? (sorted[middle - 1] + sorted[middle]) / 2 : sorted[middle];
+}
+
 /**
  * Maintains stable IDs for the lightweight browser feature detector. This is
  * deliberately independent of target geometry: features are tracked first,
@@ -348,50 +409,104 @@ export function updateFeatureTracks(previousTracks = [], featurePoints = [], con
     .filter((track) => frameIndex - finite(track.lastFrameIndex, frameIndex) <= 3)
     .map((track) => ({ track, used: false }));
   const currentTrackIds = [];
-  const nextTracks = previous.map((track) => ({ ...track, observations: [...(track.observations || [])] }));
+  const nextTracks = previous.map((track) => ({
+    ...track,
+    observations: [...(track.observations || [])],
+    velocityEstimate: track.velocityEstimate || { x: 0, y: 0 },
+    quality: Number.isFinite(Number(track.quality)) ? Number(track.quality) : 0.5,
+    confidence: Number.isFinite(Number(track.confidence)) ? Number(track.confidence) : 0.5,
+  }));
   const matchedDistance = finite(context.matchDistance, 0.14);
+  const appearanceThreshold = finite(context.appearanceThreshold, 0.52);
+  const displacementSamples = [];
+
+  const associationFor = (candidate, point) => {
+    const latest = latestObservationForTrack(candidate.track);
+    if (!latest) return null;
+    const frameDelta = Math.max(1, frameIndex - finite(latest.frameIndex, frameIndex));
+    const velocity = candidate.track.velocityEstimate || { x: 0, y: 0 };
+    const predicted = {
+      x: finite(latest.x) + (finite(velocity.x) * frameDelta),
+      y: finite(latest.y) + (finite(velocity.y) * frameDelta),
+    };
+    const current = { x: finite(point?.x, 0.5), y: finite(point?.y, 0.5) };
+    const predictedDistance = Math.hypot(predicted.x - current.x, predicted.y - current.y);
+    const lastDistance = Math.hypot(finite(latest.x) - current.x, finite(latest.y) - current.y);
+    const appearance = patchDifference(candidate.track.averagePatchSignature, point?.patchSignature);
+    const movement = Math.hypot(current.x - finite(latest.x), current.y - finite(latest.y));
+    const expectedMovement = Math.hypot(finite(velocity.x), finite(velocity.y)) * frameDelta;
+    const motionError = Math.abs(movement - expectedMovement);
+    const score = (predictedDistance * 0.62) + (lastDistance * 0.18) + (appearance * 0.15) + (motionError * 0.05);
+    const distanceLimit = matchedDistance + Math.min(0.08, expectedMovement * 0.5);
+    if (predictedDistance > distanceLimit && lastDistance > matchedDistance) return null;
+    if (appearance > appearanceThreshold
+      && (predictedDistance > (matchedDistance * 0.35) || appearance > 0.72)) return null;
+    return { candidate, predictedDistance, lastDistance, appearance, motionError, score };
+  };
 
   points.forEach((point) => {
     let match = null;
     if (point?.trackId) {
-      match = available.find((candidate) => !candidate.used && candidate.track.id === point.trackId) || null;
+      const direct = available.find((candidate) => !candidate.used && candidate.track.id === point.trackId) || null;
+      const directAssociation = direct ? associationFor(direct, point) : null;
+      match = directAssociation;
     }
     if (!match) {
       match = available.reduce((closest, candidate) => {
         if (candidate.used) return closest;
-        const latest = latestObservationForTrack(candidate.track);
-        if (!latest) return closest;
-        const distance = Math.hypot(finite(latest.x) - finite(point?.x), finite(latest.y) - finite(point?.y));
-        return distance <= matchedDistance && (!closest || distance < closest.distance)
-          ? { ...candidate, distance }
+        const association = associationFor(candidate, point);
+        return association && (!closest || association.score < closest.score)
+          ? association
           : closest;
       }, null);
     }
 
     let track;
     if (match) {
-      match.used = true;
-      track = nextTracks.find((candidate) => candidate.id === match.track.id);
+      match.candidate.used = true;
+      track = nextTracks.find((candidate) => candidate.id === match.candidate.track.id);
     } else {
       track = {
         id: `ft-${nextTrackId}`,
         observations: [],
         firstFrameIndex: frameIndex,
         lastFrameIndex: frameIndex,
+        velocityEstimate: { x: 0, y: 0 },
+        averagePatchSignature: Array.isArray(point?.patchSignature) ? point.patchSignature.slice(0, 16) : null,
+        quality: 0.45,
+        confidence: 0.4,
       };
       nextTrackId += 1;
       nextTracks.push(track);
     }
+    const latest = latestObservationForTrack(track);
+    const frameDelta = latest ? Math.max(1, frameIndex - finite(latest.frameIndex, frameIndex)) : 1;
     const observation = {
       frameIndex,
       keyframeId: context.acceptedKeyframeId ?? null,
       x: finite(point?.x, 0.5),
       y: finite(point?.y, 0.5),
+      patchSignature: Array.isArray(point?.patchSignature) ? point.patchSignature.slice(0, 16) : null,
     };
+    if (latest && match) {
+      const displacement = Math.hypot(observation.x - finite(latest.x), observation.y - finite(latest.y));
+      displacementSamples.push(displacement);
+      const observedVelocity = {
+        x: (observation.x - finite(latest.x)) / frameDelta,
+        y: (observation.y - finite(latest.y)) / frameDelta,
+      };
+      track.velocityEstimate = {
+        x: (finite(track.velocityEstimate?.x) * 0.65) + (observedVelocity.x * 0.35),
+        y: (finite(track.velocityEstimate?.y) * 0.65) + (observedVelocity.y * 0.35),
+      };
+      track.quality = clamp((finite(track.quality) * 0.76) + ((1 - finite(match.appearance, 0.5)) * 0.24), 0, 1);
+      track.confidence = clamp((finite(track.confidence) * 0.7) + (track.quality * 0.3), 0, 1);
+    }
     track.observations = [...track.observations, observation].slice(-8);
     track.firstFrameIndex = Math.min(finite(track.firstFrameIndex, frameIndex), frameIndex);
     track.lastFrameIndex = frameIndex;
     track.lastPoint = { x: observation.x, y: observation.y };
+    track.averagePatchSignature = blendPatchSignature(track.averagePatchSignature, observation.patchSignature);
     currentTrackIds.push(track.id);
   });
 
@@ -402,7 +517,207 @@ export function updateFeatureTracks(previousTracks = [], featurePoints = [], con
     currentTrackIds,
     trackedFeatureCount: currentTrackIds.length,
     multiFrameFeatureTrackCount: multiFrameTracks.length,
+    medianFeatureDisplacement: median(displacementSamples),
+    visualParallax: clamp(median(displacementSamples) / 0.14, 0, 1),
   };
+}
+
+function dot(first, second) {
+  return (finite(first?.x) * finite(second?.x))
+    + (finite(first?.y) * finite(second?.y))
+    + (finite(first?.z) * finite(second?.z));
+}
+
+function cross(first, second) {
+  return {
+    x: (finite(first?.y) * finite(second?.z)) - (finite(first?.z) * finite(second?.y)),
+    y: (finite(first?.z) * finite(second?.x)) - (finite(first?.x) * finite(second?.z)),
+    z: (finite(first?.x) * finite(second?.y)) - (finite(first?.y) * finite(second?.x)),
+  };
+}
+
+function scaleVector(vector, scale) {
+  return { x: finite(vector?.x) * scale, y: finite(vector?.y) * scale, z: finite(vector?.z) * scale };
+}
+
+function addVectors(first, second) {
+  return { x: finite(first?.x) + finite(second?.x), y: finite(first?.y) + finite(second?.y), z: finite(first?.z) + finite(second?.z) };
+}
+
+function cameraRayForObservation(observation, keyframe) {
+  const origin = keyframe?.pose || keyframe?.estimatedPose;
+  if (!origin) return null;
+  return {
+    origin: { x: finite(origin.x), y: finite(origin.y), z: finite(origin.z) },
+    direction: directionForImagePoint(observation, keyframe.orientation, origin),
+  };
+}
+
+function triangulateRays(first, second) {
+  if (!first || !second) return null;
+  const baseline = poseDistance(first.origin, second.origin);
+  if (baseline < sparseMapConfig.minimumBaselineMeters) return null;
+  const w0 = {
+    x: first.origin.x - second.origin.x,
+    y: first.origin.y - second.origin.y,
+    z: first.origin.z - second.origin.z,
+  };
+  const a = dot(first.direction, first.direction);
+  const b = dot(first.direction, second.direction);
+  const c = dot(second.direction, second.direction);
+  const d = dot(first.direction, w0);
+  const e = dot(second.direction, w0);
+  const denominator = (a * c) - (b * b);
+  if (Math.abs(denominator) < 0.015) return null;
+  const firstDistance = ((b * e) - (c * d)) / denominator;
+  const secondDistance = ((a * e) - (b * d)) / denominator;
+  if (firstDistance <= 0 || secondDistance <= 0) return null;
+  const firstPoint = addVectors(first.origin, scaleVector(first.direction, firstDistance));
+  const secondPoint = addVectors(second.origin, scaleVector(second.direction, secondDistance));
+  const position = scaleVector(addVectors(firstPoint, secondPoint), 0.5);
+  const rayError = poseDistance(firstPoint, secondPoint);
+  const reprojectionError = Math.atan2(rayError, Math.max(0.05, (firstDistance + secondDistance) / 2)) * (180 / Math.PI);
+  return { position, baseline, reprojectionError };
+}
+
+export function triangulateSparsePoints(keyframes = [], config = sparseMapConfig) {
+  const settings = { ...sparseMapConfig, ...(config || {}) };
+  const tracks = new Map();
+  (Array.isArray(keyframes) ? keyframes : []).forEach((keyframe) => {
+    const observations = Array.isArray(keyframe?.featureObservations) ? keyframe.featureObservations : [];
+    observations.forEach((observation) => {
+      if (!observation?.trackId || !Number.isFinite(Number(observation.x)) || !Number.isFinite(Number(observation.y))) return;
+      if (!tracks.has(observation.trackId)) tracks.set(observation.trackId, []);
+      tracks.get(observation.trackId).push({ observation, keyframe });
+    });
+  });
+  const points = [];
+  tracks.forEach((observations, trackId) => {
+    if (observations.length < settings.minimumTrackObservations) return;
+    let bestPair = null;
+    for (let firstIndex = 0; firstIndex < observations.length; firstIndex += 1) {
+      for (let secondIndex = firstIndex + 1; secondIndex < observations.length; secondIndex += 1) {
+        const firstRay = cameraRayForObservation(observations[firstIndex].observation, observations[firstIndex].keyframe);
+        const secondRay = cameraRayForObservation(observations[secondIndex].observation, observations[secondIndex].keyframe);
+        const candidate = triangulateRays(firstRay, secondRay);
+        if (candidate && (!bestPair || candidate.baseline > bestPair.baseline)) bestPair = candidate;
+      }
+    }
+    if (!bestPair || bestPair.reprojectionError > settings.maximumReprojectionErrorDegrees) return;
+    const trackConfidence = clamp(
+      (clamp((observations.length - 1) / 4, 0, 1) * 0.4)
+        + (clamp(bestPair.baseline / 0.6, 0, 1) * 0.35)
+        + (clamp(1 - (bestPair.reprojectionError / settings.maximumReprojectionErrorDegrees), 0, 1) * 0.25),
+      0,
+      1,
+    );
+    points.push({
+      id: `sparse-${trackId}`,
+      sourceTrackIds: [trackId],
+      estimatedPosition: bestPair.position,
+      confidence: trackConfidence,
+      observationCount: observations.length,
+      baseline: bestPair.baseline,
+      reprojectionError: bestPair.reprojectionError,
+    });
+  });
+  return points
+    .sort((first, second) => second.confidence - first.confidence || second.observationCount - first.observationCount)
+    .slice(0, settings.maxPoints);
+}
+
+function planeFromPoints(first, second, third) {
+  const firstEdge = {
+    x: finite(second.x) - finite(first.x),
+    y: finite(second.y) - finite(first.y),
+    z: finite(second.z) - finite(first.z),
+  };
+  const secondEdge = {
+    x: finite(third.x) - finite(first.x),
+    y: finite(third.y) - finite(first.y),
+    z: finite(third.z) - finite(first.z),
+  };
+  const rawNormal = cross(firstEdge, secondEdge);
+  if (vectorLength(rawNormal) < 0.01) return null;
+  const normal = normalize(rawNormal);
+  return { normal, distance: dot(normal, first) };
+}
+
+export function estimateSupportedPlanes(sparsePoints = [], config = sparseMapConfig) {
+  const settings = { ...sparseMapConfig, ...(config || {}) };
+  const points = (Array.isArray(sparsePoints) ? sparsePoints : [])
+    .filter((point) => point?.estimatedPosition && Number(point.confidence) >= 0.4)
+    .slice(0, 500);
+  if (points.length < settings.minimumPlaneInliers) return [];
+  const planes = [];
+  const candidateCount = Math.min(120, points.length * 2);
+  for (let index = 0; index < candidateCount; index += 1) {
+    const first = points[index % points.length];
+    const second = points[(index + 3) % points.length];
+    const third = points[(index + 7) % points.length];
+    const candidate = planeFromPoints(first.estimatedPosition, second.estimatedPosition, third.estimatedPosition);
+    if (!candidate) continue;
+    const inliers = points.filter((point) => Math.abs(dot(candidate.normal, point.estimatedPosition) - candidate.distance) <= settings.planeToleranceMeters);
+    if (inliers.length < settings.minimumPlaneInliers) continue;
+    const meanConfidence = inliers.reduce((sum, point) => sum + (Number(point.confidence) || 0), 0) / inliers.length;
+    const confidence = clamp(
+      (clamp(inliers.length / 24, 0, 1) * 0.5)
+        + (meanConfidence * 0.35)
+        + (clamp(1 - (settings.planeToleranceMeters / 0.16), 0, 1) * 0.15),
+      0,
+      1,
+    );
+    if (confidence < settings.minimumPlaneConfidence) continue;
+    const duplicate = planes.some((plane) => Math.abs(dot(plane.normal, candidate.normal)) > 0.94
+      && Math.abs(Math.abs(plane.distance) - Math.abs(candidate.distance)) < (settings.planeToleranceMeters * 1.5));
+    if (duplicate) continue;
+    planes.push({
+      id: `plane-${planes.length + 1}`,
+      normal: candidate.normal,
+      distance: candidate.distance,
+      inlierCount: inliers.length,
+      confidence,
+      sourcePointIds: inliers.map((point) => point.id),
+      orientation: Math.abs(candidate.normal.y) >= 0.75 ? 'HORIZONTAL' : 'VERTICAL',
+    });
+  }
+  return planes.sort((first, second) => second.confidence - first.confidence).slice(0, 8);
+}
+
+export function intersectSupportedPlanes(first, second) {
+  if (!first || !second) return null;
+  const direction = cross(first.normal, second.normal);
+  const directionLength = vectorLength(direction);
+  if (directionLength < 0.08) return null;
+  const normalizedDirection = scaleVector(direction, 1 / directionLength);
+  const firstCross = cross(second.normal, normalizedDirection);
+  const secondCross = cross(normalizedDirection, first.normal);
+  const denominator = directionLength ** 2;
+  const point = scaleVector(addVectors(scaleVector(firstCross, first.distance), scaleVector(secondCross, second.distance)), 1 / denominator);
+  return {
+    point,
+    direction: normalizedDirection,
+    confidence: Math.min(Number(first.confidence) || 0, Number(second.confidence) || 0),
+    sourcePlaneIds: [first.id, second.id],
+    sourcePointIds: [...new Set([...(first.sourcePointIds || []), ...(second.sourcePointIds || [])])],
+  };
+}
+
+export function structuralEdgesFromPlanes(planes = [], config = {}) {
+  const minimumConfidence = Number(config.minimumConfidence) || 0.7;
+  const strongPlanes = (Array.isArray(planes) ? planes : []).filter((plane) => (Number(plane.confidence) || 0) >= minimumConfidence);
+  const edges = [];
+  for (let firstIndex = 0; firstIndex < strongPlanes.length; firstIndex += 1) {
+    for (let secondIndex = firstIndex + 1; secondIndex < strongPlanes.length; secondIndex += 1) {
+      const intersection = intersectSupportedPlanes(strongPlanes[firstIndex], strongPlanes[secondIndex]);
+      if (!intersection) continue;
+      edges.push({
+        id: `plane-edge-${edges.length + 1}`,
+        ...intersection,
+      });
+    }
+  }
+  return edges.slice(0, 24);
 }
 
 export function distinctViewpointsFromFrames(keyframes = [], config = directionalCoverageConfig) {
@@ -413,6 +728,7 @@ export function distinctViewpointsFromFrames(keyframes = [], config = directiona
       pose: frame.pose || frame.estimatedPose,
       orientation: frame.orientation,
       featureTrackIds: frame.featureTrackIds,
+      visualParallax: frame.visualParallax,
     });
     const novelty = viewpointNovelty(viewpoints, view, config);
     return novelty.isNovel ? [...viewpoints, {
@@ -420,6 +736,8 @@ export function distinctViewpointsFromFrames(keyframes = [], config = directiona
       translationDelta: novelty.translationDelta,
       angleDelta: novelty.angleDelta,
       parallax: novelty.parallax,
+      visualParallax: novelty.visualParallax,
+      physicalMovement: novelty.physicalMovement,
     }] : viewpoints;
   }, []);
 }
@@ -590,6 +908,7 @@ function mergeObservation(observations, incoming) {
     pose: incoming.lastPose,
     orientation: incoming.lastOrientation,
     featureTrackIds: incoming.featureTrackIds,
+    visualParallax: incoming.visualParallax,
   });
   const novelty = viewpointNovelty(existingViewpoints, incomingView);
   const nextViewCount = (Number(existing.distinctViewCount ?? existing.viewpointCount) || 0) + (novelty.isNovel ? 1 : 0);
@@ -909,7 +1228,7 @@ function directionalCellStatus(cell, config) {
   const distinctViews = Number(cell.distinctViewCount ?? cell.viewpointCount) || 0;
   const physicalViews = Number(cell.physicalViewCount ?? cell.translationViewCount) || 0;
   if (distinctViews >= 2
-    && (physicalViews >= 1 || Number(cell.coverageConfidence) >= config.clearConfidence)
+    && physicalViews >= 1
     && Number(cell.coverage) >= config.clearCoverage) return 'SUFFICIENT';
   return distinctViews > 0 ? 'PARTIAL' : 'UNSEEN';
 }
@@ -967,6 +1286,7 @@ export function updateDirectionalCoverageGrid(previousCells = [], {
       pose,
       orientation,
       featureTrackIds,
+      visualParallax: analysis?.visualParallax,
       translationDelta: 0,
       angleDelta: 0,
       parallax: 0,
@@ -988,6 +1308,7 @@ export function updateDirectionalCoverageGrid(previousCells = [], {
       translationDelta: viewNovelty.translationDelta,
       angleDelta: viewNovelty.angleDelta,
       parallax: viewNovelty.parallax,
+      visualParallax: viewNovelty.visualParallax,
       timestamp: observedAt,
     };
     const viewpoints = [...previousViewpoints, nextViewRecord].slice(-settings.maxViewpointsPerCell);

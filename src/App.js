@@ -4,6 +4,9 @@ import './App.css';
 import { createMotionTracker, MOTION_STATES, scannerMotionConfig } from './scannerMotion';
 import {
   SCANNER_PHASES,
+  normalizeScannerPhase,
+  isInitialTrackingPhase,
+  isContinuousMappingPhase,
   addSpatialObservations,
   calculateInitialMappingReadiness,
   calculateOrientationCoverage,
@@ -20,6 +23,9 @@ import {
   blueCoverageOpacity,
   coverageOverlayConfig,
   directionalCoverageConfig,
+  triangulateSparsePoints,
+  estimateSupportedPlanes,
+  structuralEdgesFromPlanes,
   createDirectionalCoverageGrid,
   projectDirectionalCoverageCells,
   updateDirectionalCoverageGrid,
@@ -50,22 +56,25 @@ const RECONSTRUCTION_STATUS_LABELS = Object.freeze({
 const RECONSTRUCTION_STEP_KEYS = Object.freeze([
   { key: 'scan', label: 'Scan captured' },
   { key: 'upload', label: 'Uploading views' },
-  { key: 'reconstruct', label: 'Reconstructing room' },
+  { key: 'matching', label: 'Matching room views' },
+  { key: 'poses', label: 'Recovering room shape' },
+  { key: 'geometry', label: 'Building detailed geometry' },
   { key: 'mesh', label: 'Building mesh' },
+  { key: 'appearance', label: 'Applying appearance' },
   { key: 'prepare', label: 'Preparing simulator' },
 ]);
 
 const RECONSTRUCTION_STAGE_INDEX = Object.freeze({
   uploading: 1,
-  frames_uploaded: 2,
+  frames_uploaded: 1,
   queued: 2,
   feature_extraction: 2,
   feature_matching: 2,
-  structure_from_motion: 2,
-  undistortion: 2,
-  dense_reconstruction: 2,
-  mesh: 3,
-  complete: 5,
+  structure_from_motion: 3,
+  undistortion: 3,
+  dense_reconstruction: 4,
+  mesh: 5,
+  complete: 8,
 });
 
 export function reconstructionStatusLabel(status) {
@@ -83,7 +92,8 @@ export function reconstructionProgressSteps(status) {
 export function friendlyReconstructionError(error) {
   const technicalMessage = error?.technicalMessage || error?.message || 'The reconstruction worker failed.';
   if (error?.code === 'RECONSTRUCTION_SERVICE_UNAVAILABLE') return '3D reconstruction service is unavailable.';
-  if (/not enough (dense )?points|at least three|insufficient dense|connected camera model/i.test(technicalMessage)) {
+  if (/too few camera positions/i.test(technicalMessage)) return 'Too few camera positions were recovered. Scan again with more sideways movement and overlap.';
+  if (/not enough (dense )?points|at least three|insufficient dense|connected camera model|too few camera positions|too few sparse points/i.test(technicalMessage)) {
     return 'Not enough overlapping room detail was captured. Try scanning again with more sideways movement and overlap.';
   }
   if (/colmap|open3d|trimesh/i.test(technicalMessage)) return technicalMessage;
@@ -523,6 +533,8 @@ export const scannerReadinessConfig = Object.freeze({
   manualFinishViewpointDiversity: 0.12,
   readyDistinctViewpoints: 8,
   manualFinishDistinctViewpoints: 4,
+  readyPhysicalViewpoints: 3,
+  manualFinishPhysicalViewpoints: 2,
   readyReconstructionConfidence: 0.35,
 });
 
@@ -537,7 +549,7 @@ function createCoverageRegions() {
 function createInitialScanState() {
   const regions = createCoverageRegions();
   return {
-    phase: SCANNER_PHASES.INITIAL_MAPPING,
+    phase: SCANNER_PHASES.INITIAL_TRACKING,
     mapping: {
       referenceCameraPose: null,
       acceptedKeyframes: 0,
@@ -548,10 +560,12 @@ function createInitialScanState() {
       orientationCoverage: 0,
       viewpointDiversity: 0,
       distinctViewCount: 0,
+      physicalViewCount: 0,
       distinctViewpoints: [],
       successfulRelativePoseCount: 0,
       relativePoses: [],
       sparseObservations: [],
+      sparsePoints: [],
       mappingReady: false,
       readinessReason: 'Waiting for accepted keyframes, tracks, viewpoint diversity, and relative poses.',
     },
@@ -592,10 +606,14 @@ function createInitialScanState() {
     coverageRegions: regions,
     directionalCells: [],
     distinctViewCount: 0,
+    physicalViewCount: 0,
     liveMap: {
+      cameraKeyframes: [],
       featureTracks: [],
       sparseObservations: [],
+      sparsePoints: [],
       directionalCells: [],
+      directionalCoverage: null,
       structuralEdges: [],
       cameraPath: [],
     },
@@ -1003,7 +1021,7 @@ function determineNextActionLegacy(scanState) {
   */
 }
 export function calculateScanReadiness(scanState) {
-  if (scanState?.phase === SCANNER_PHASES.INITIAL_MAPPING) {
+  if (isInitialTrackingPhase(scanState?.phase)) {
     const mapping = calculateInitialMappingReadiness(scanState);
     const blockingRequirements = [
       { key: 'acceptedKeyframes', label: 'accepted keyframes', pass: mapping.acceptedKeyframes >= mappingReadinessConfig.minimumAcceptedKeyframes, value: mapping.acceptedKeyframes, required: mappingReadinessConfig.minimumAcceptedKeyframes },
@@ -1041,6 +1059,11 @@ export function calculateScanReadiness(scanState) {
   const distinctViewCount = Number.isFinite(Number(scanState?.distinctViewCount))
     ? Number(scanState.distinctViewCount)
     : Number(scanState?.mapping?.distinctViewCount ?? acceptedKeyframes) || 0;
+  const hasPhysicalViewEvidence = Number.isFinite(Number(scanState?.physicalViewCount))
+    || Number.isFinite(Number(scanState?.mapping?.physicalViewCount));
+  const physicalViewCount = hasPhysicalViewEvidence
+    ? Number(scanState?.physicalViewCount ?? scanState?.mapping?.physicalViewCount) || 0
+    : 0;
   const imageQuality = Number(scanState?.imageQuality) || 0;
   const featureTrackingQuality = Number(scanState?.featureTrackingQuality) || 0;
   const reconstructionConfidence = clamp(
@@ -1058,6 +1081,7 @@ export function calculateScanReadiness(scanState) {
     { key: 'viewpointDiversity', label: 'viewpoint diversity', pass: viewpointDiversity >= scannerReadinessConfig.readyViewpointDiversity, value: viewpointDiversity, required: scannerReadinessConfig.readyViewpointDiversity },
     { key: 'acceptedKeyframes', label: 'accepted keyframes', pass: acceptedKeyframes >= scannerReadinessConfig.readyAcceptedKeyframes, value: acceptedKeyframes, required: scannerReadinessConfig.readyAcceptedKeyframes },
     { key: 'distinctViewpoints', label: 'distinct viewpoints', pass: distinctViewCount >= scannerReadinessConfig.readyDistinctViewpoints, value: distinctViewCount, required: scannerReadinessConfig.readyDistinctViewpoints },
+    ...(hasPhysicalViewEvidence ? [{ key: 'physicalViewpoints', label: 'moved camera positions', pass: physicalViewCount >= scannerReadinessConfig.readyPhysicalViewpoints, value: physicalViewCount, required: scannerReadinessConfig.readyPhysicalViewpoints }] : []),
     { key: 'reconstructionConfidence', label: 'reconstruction confidence', pass: reconstructionConfidence >= scannerReadinessConfig.readyReconstructionConfidence, value: reconstructionConfidence, required: scannerReadinessConfig.readyReconstructionConfidence },
     { key: 'remainingStructuralRegion', label: 'remaining structural region', pass: coverage >= scannerReadinessConfig.readyStructuralCoverage, value: coverage, required: scannerReadinessConfig.readyStructuralCoverage },
     { key: 'optionalFurniture', label: 'optional furniture', pass: true, value: 'NOT REQUIRED', required: null, optional: true },
@@ -1069,6 +1093,7 @@ export function calculateScanReadiness(scanState) {
     viewpointDiversity,
     acceptedKeyframes,
     distinctViewCount,
+    physicalViewCount,
     structuralCoverage: coverage,
     reconstructionConfidence,
     ready,
@@ -1077,19 +1102,25 @@ export function calculateScanReadiness(scanState) {
 }
 
 export function canManuallyFinishScan(scanState) {
-  if (scanState?.phase === SCANNER_PHASES.INITIAL_MAPPING) return false;
+  if (isInitialTrackingPhase(scanState?.phase)) return false;
   const distinctViewCount = Number.isFinite(Number(scanState?.distinctViewCount))
     ? Number(scanState.distinctViewCount)
     : Number(scanState?.mapping?.distinctViewCount ?? scanState?.acceptedFrames) || 0;
+  const hasPhysicalViewEvidence = Number.isFinite(Number(scanState?.physicalViewCount))
+    || Number.isFinite(Number(scanState?.mapping?.physicalViewCount));
+  const physicalViewCount = hasPhysicalViewEvidence
+    ? Number(scanState?.physicalViewCount ?? scanState?.mapping?.physicalViewCount) || 0
+    : distinctViewCount;
   return (Number(scanState?.acceptedFrames) || 0) >= scannerReadinessConfig.manualFinishAcceptedKeyframes
     && distinctViewCount >= scannerReadinessConfig.manualFinishDistinctViewpoints
+    && physicalViewCount >= (hasPhysicalViewEvidence ? scannerReadinessConfig.manualFinishPhysicalViewpoints : 0)
     && (Number(scanState?.totalCoverage) || 0) >= scannerReadinessConfig.manualFinishStructuralCoverage
     && (Number(scanState?.wallCoverage) || 0) >= scannerReadinessConfig.manualFinishWallCoverage
     && (Number(scanState?.viewpointDiversity) || 0) >= scannerReadinessConfig.manualFinishViewpointDiversity;
 }
 
 export function calculateScanProgress(scanState) {
-  if (scanState?.phase === SCANNER_PHASES.INITIAL_MAPPING) {
+  if (isInitialTrackingPhase(scanState?.phase)) {
     const mapping = scanState.mappingReadiness || calculateInitialMappingReadiness(scanState);
     const progress = [
       mapping.acceptedKeyframes / mappingReadinessConfig.minimumAcceptedKeyframes,
@@ -1102,20 +1133,61 @@ export function calculateScanProgress(scanState) {
     const computed = clamp(progress.reduce((sum, value) => sum + Math.min(1, value), 0) / progress.length, 0, 1);
     return scanState?.scanReady === true || mapping.ready ? 1 : Math.min(0.99, computed);
   }
-  const structuralCoverage = clamp(Number(scanState?.structuralCoverage ?? scanState?.totalCoverage) || 0, 0, 1);
-  const viewpointCoverage = clamp(Number(scanState?.viewpointDiversity) || 0, 0, 1);
   const hasDistinctViewEvidence = Number.isFinite(Number(scanState?.distinctViewCount))
     || Number.isFinite(Number(scanState?.mapping?.distinctViewCount));
   const viewCount = hasDistinctViewEvidence
     ? Number(scanState?.distinctViewCount ?? scanState?.mapping?.distinctViewCount) || 0
     : Number(scanState?.acceptedFrames) || 0;
-  const usefulKeyframeProgress = clamp(viewCount / (hasDistinctViewEvidence ? 18 : 36), 0, 1);
-  const reconstructionConfidence = clamp(Number(scanState?.reconstructionConfidence) || 0, 0, 1);
+  if (!hasDistinctViewEvidence) {
+    const structuralCoverage = clamp(Number(scanState?.structuralCoverage ?? scanState?.totalCoverage) || 0, 0, 1);
+    const viewpointCoverage = clamp(Number(scanState?.viewpointDiversity) || 0, 0, 1);
+    const usefulKeyframeProgress = clamp(viewCount / 36, 0, 1);
+    const reconstructionConfidence = clamp(Number(scanState?.reconstructionConfidence) || 0, 0, 1);
+    const legacyComputed = clamp(
+      (structuralCoverage * 0.45)
+      + (viewpointCoverage * 0.25)
+      + (usefulKeyframeProgress * 0.15)
+      + (reconstructionConfidence * 0.15),
+      0,
+      1,
+    );
+    const hasReadinessState = typeof scanState?.scanReady === 'boolean' || Boolean(scanState?.scanReadiness);
+    return scanState?.scanReady === true ? 1 : hasReadinessState ? Math.min(0.99, legacyComputed) : legacyComputed;
+  }
+  const directionalCoverage = clamp(Number(scanState?.directionalCoverage ?? scanState?.structuralCoverage ?? scanState?.totalCoverage) || 0, 0, 1);
+  const distinctViewCoverage = clamp(viewCount / 18, 0, 1);
+  const physicalViewCount = Number(scanState?.physicalViewCount ?? scanState?.mapping?.physicalViewCount) || 0;
+  const positionalCoverage = clamp(physicalViewCount / 8, 0, 1);
+  const structuralConfidence = clamp(
+    Math.max(
+      Number(scanState?.structuralCoverage) || 0,
+      Number(scanState?.wallCoverage) || 0,
+      Number(scanState?.supportedPlanes?.length || 0) / 3,
+    ),
+    0,
+    1,
+  );
+  const featureTrackQuality = clamp(
+    Number(scanState?.featureTrackingQuality) || (Number(scanState?.trackedFeatureCount) || 0) / 850,
+    0,
+    1,
+  );
+  const parallaxBaseline = clamp(
+    Math.max(
+      Number(scanState?.lastViewpointNovelty?.parallax) || 0,
+      Number(scanState?.visualParallax) || 0,
+      positionalCoverage,
+      Number(scanState?.directionalCoverageConfidence) || 0,
+    ),
+    0,
+    1,
+  );
   const computed = clamp(
-    (structuralCoverage * 0.45)
-    + (viewpointCoverage * 0.25)
-    + (usefulKeyframeProgress * 0.15)
-    + (reconstructionConfidence * 0.15),
+    (directionalCoverage * 0.25)
+    + (distinctViewCoverage * 0.25)
+    + (structuralConfidence * 0.2)
+    + (featureTrackQuality * 0.15)
+    + (parallaxBaseline * 0.15),
     0,
     1,
   );
@@ -1128,7 +1200,7 @@ export function stabilizeScanProgress(previousState, nextState) {
   const previousDisplayProgress = Number(previousState?.displayProgress ?? previousState?.scanProgress) || 0;
   const displayProgress = nextState?.scanReady === true
     ? 1
-    : nextState?.phase === SCANNER_PHASES.INITIAL_MAPPING
+    : isInitialTrackingPhase(nextState?.phase)
     ? computedProgress
     : Math.max(previousDisplayProgress, computedProgress);
   const blockingRequirements = nextState?.scanReadiness?.blockingRequirements || [];
@@ -1275,7 +1347,7 @@ function movementForTarget(targetRegion, currentOrientation, scanState) {
 
 export function determineNextAction(scanState) {
   const currentOrientation = scanState?.currentOrientation || {};
-  const phase = scanState?.phase || SCANNER_PHASES.INITIAL_MAPPING;
+  const phase = normalizeScannerPhase(scanState?.phase || SCANNER_PHASES.INITIAL_TRACKING);
   const readiness = scanState?.scanReadiness || calculateScanReadiness(scanState);
   const furniturePassActive = Boolean(scanState?.furniturePassActive);
   const isFurnitureTarget = (region) => region?.semanticType === 'FURNITURE_OR_FRAME_EDGE';
@@ -1294,7 +1366,7 @@ export function determineNextAction(scanState) {
   if (scanState?.trackingStatus === 'LOST' || scanState?.motionState === MOTION_STATES.TRACKING_LOST) {
     return { type: 'TRACKING_LOST', direction: 'O', label: 'STAY WITH THE SCAN', eyebrow: 'Automatic relocalization is still running', title: 'I lost track of the room', instruction: "Slowly point the camera toward an area you've already scanned.", helper: 'Your captured coverage is safe. Once the room comes back into view, keep scanning.', target: 'Finding the room again', priority: 1.2, confidence: 0.95, adaptiveGuidance: null };
   }
-  if (phase === SCANNER_PHASES.INITIAL_MAPPING) {
+  if (isInitialTrackingPhase(phase)) {
     const mappingReadiness = scanState?.mappingReadiness || calculateInitialMappingReadiness(scanState);
     return {
       type: 'INITIAL_MAPPING',
@@ -1381,7 +1453,7 @@ export function determineNextAction(scanState) {
 // normal scanning should not expose its chosen region as the user's workflow.
 // This adapter keeps only the few corrections that protect scan quality.
 export function continuousScanInstructionFor(scanState, diagnosticInstruction = {}) {
-  if (scanState?.phase === SCANNER_PHASES.INITIAL_MAPPING) return {
+  if (isInitialTrackingPhase(scanState?.phase)) return {
     ...diagnosticInstruction,
     type: 'INITIAL_MAPPING',
     targetRegion: undefined,
@@ -1454,7 +1526,7 @@ export function chooseGuidancePlacement(targetBounds) {
 }
 
 export function coverageOverlayRegionsFor(scanState, config = coverageOverlayConfig) {
-  if (scanState?.phase !== SCANNER_PHASES.ADAPTIVE_COVERAGE) return [];
+  if (!isContinuousMappingPhase(scanState?.phase)) return [];
   const regions = projectCoverageOverlayRegions(
     Array.isArray(scanState?.coverageRegions) ? scanState.coverageRegions : [],
     scanState.currentOrientation,
@@ -1485,7 +1557,7 @@ export function compactGuidanceFor(instruction, scanState = {}) {
     SKIP_AREA: '↗',
     SCAN_COMPLETE: '✓',
   };
-  if (scanState.phase === SCANNER_PHASES.INITIAL_MAPPING) {
+  if (isInitialTrackingPhase(scanState.phase)) {
     return { mode: 'SCANNING', icon: '↔', text: 'Move slowly around the room', hint: '' };
   }
   if (instruction?.type === 'TRACKING_LOST' || scanState.trackingStatus === 'LOST') {
@@ -1583,6 +1655,18 @@ function motionMagnitude(event) {
   return Math.sqrt((x * x) + (y * y) + (z * z));
 }
 
+function normalizedPatchSignature(gray, x, y, width, height) {
+  const offsets = [-3, 0, 3];
+  const samples = [];
+  offsets.forEach((offsetY) => offsets.forEach((offsetX) => {
+    const sampleX = Math.max(0, Math.min(width - 1, x + offsetX));
+    const sampleY = Math.max(0, Math.min(height - 1, y + offsetY));
+    samples.push(Number(gray[(sampleY * width) + sampleX]) || 0);
+  }));
+  const mean = samples.reduce((sum, value) => sum + value, 0) / Math.max(1, samples.length);
+  return samples.map((value) => clamp((value - mean) / 96, -1, 1));
+}
+
 function clamp(value, minimum, maximum) {
   return Math.max(minimum, Math.min(value, maximum));
 }
@@ -1602,6 +1686,75 @@ function blobToDataUrl(blob) {
   });
 }
 
+function reconstructionViewForFrame(frame) {
+  return {
+    pose: frame?.pose || frame?.estimatedPose,
+    position: frame?.pose || frame?.estimatedPose,
+    heading: frame?.orientation?.heading ?? frame?.pose?.yaw,
+    pitch: frame?.orientation?.pitch,
+    visualParallax: frame?.visualParallax ?? frame?.qualityMetrics?.visualParallax,
+  };
+}
+
+function reconstructionFrameScore(frame) {
+  const metrics = frame?.qualityMetrics || {};
+  const quality = Number(frame?.qualityScore) || 0;
+  const sharpness = Number(metrics.sharpness) || 0;
+  const brightness = Number(metrics.brightness) || 0;
+  const exposure = clamp(1 - (Math.abs(brightness - 0.48) / 0.48), 0, 1);
+  const features = clamp((Number(metrics.featureCount) || 0) / 850, 0, 1);
+  const parallax = Number(frame?.visualParallax ?? metrics.visualParallax) || 0;
+  return clamp((quality * 0.42) + (sharpness * 0.2) + (features * 0.2) + (exposure * 0.1) + (parallax * 0.08), 0, 1);
+}
+
+export function selectReconstructionKeyframes(frames = [], options = {}) {
+  const ordered = (Array.isArray(frames) ? frames : [])
+    .filter(Boolean)
+    .map((frame, index) => ({ frame, index, score: reconstructionFrameScore(frame) }))
+    .sort((first, second) => (Number(first.frame.capturedAt) || first.index) - (Number(second.frame.capturedAt) || second.index));
+  if (ordered.length <= 3) return ordered.map(({ frame }) => frame);
+  const maxFrames = Math.max(3, Number(options.maxFrames) || 80);
+  const minimumFrames = Math.min(maxFrames, Math.max(3, Number(options.minimumFrames) || 8));
+  const selected = [];
+  const selectedViews = [];
+  ordered.forEach(({ frame, score }) => {
+    if (selected.length >= maxFrames) return;
+    const view = reconstructionViewForFrame(frame);
+    const novelty = viewpointNovelty(selectedViews, view, directionalCoverageConfig);
+    const highQuality = score >= 0.3;
+    if (novelty.isNovel && (highQuality || selected.length < 3)) {
+      selected.push(frame);
+      selectedViews.push(view);
+    }
+  });
+  if (selected.length < minimumFrames) {
+    [...ordered].sort((first, second) => second.score - first.score).forEach(({ frame }) => {
+      if (selected.length >= minimumFrames || selected.length >= maxFrames || selected.includes(frame)) return;
+      const view = reconstructionViewForFrame(frame);
+      const novelty = viewpointNovelty(selectedViews, view, directionalCoverageConfig);
+      if (novelty.isNovel) {
+        selected.push(frame);
+        selectedViews.push(view);
+      }
+    });
+  }
+  if (selected.length < 3) {
+    const bestFrames = [];
+    const bestViews = [];
+    [...ordered].sort((first, second) => second.score - first.score).forEach(({ frame }) => {
+      if (bestFrames.length >= 3) return;
+      const view = reconstructionViewForFrame(frame);
+      const novelty = viewpointNovelty(bestViews, view, directionalCoverageConfig);
+      if (bestFrames.length === 0 || novelty.isNovel) {
+        bestFrames.push(frame);
+        bestViews.push(view);
+      }
+    });
+    return bestFrames.sort((first, second) => (Number(first.capturedAt) || 0) - (Number(second.capturedAt) || 0));
+  }
+  return selected.sort((first, second) => (Number(first.capturedAt) || 0) - (Number(second.capturedAt) || 0));
+}
+
 function matchLocalFeatures(currentGray, previousGray, width, height) {
   let detected = 0;
   let tracked = 0;
@@ -1613,7 +1766,7 @@ function matchLocalFeatures(currentGray, previousGray, width, height) {
       const vertical = Math.abs(currentGray[index + (2 * width)] - currentGray[index - (2 * width)]);
       if (horizontal + vertical < 46) continue;
       detected += 1;
-      points.push({ x: x / width, y: y / height });
+      points.push({ x: x / width, y: y / height, patchSignature: normalizedPatchSignature(currentGray, x, y, width, height) });
       if (!previousGray) continue;
       let currentPatchTotal = 0;
       for (let patchY = -2; patchY <= 2; patchY += 2) {
@@ -2010,9 +2163,19 @@ function featureTrackIdsForBounds(analysis, bounds) {
     : result, []);
 }
 
+function featureObservationsForAnalysis(analysis) {
+  const points = Array.isArray(analysis?.featurePointsDisplay) ? analysis.featurePointsDisplay : [];
+  const trackIds = Array.isArray(analysis?.featureTrackIds) ? analysis.featureTrackIds : [];
+  return points.reduce((observations, point, index) => {
+    const trackId = trackIds[index];
+    if (!trackId || !Number.isFinite(Number(point?.x)) || !Number.isFinite(Number(point?.y))) return observations;
+    return [...observations, { trackId, x: Number(point.x), y: Number(point.y) }];
+  }, []).slice(0, 650);
+}
+
 function updateInitialMapping(previousState, frameOrientation, pose, analysis, usableObservation, options) {
   const previousMapping = previousState.mapping || {};
-  const featureTracks = Array.isArray(options.featureTracks)
+    const featureTracks = Array.isArray(options.featureTracks)
     ? options.featureTracks
     : (previousMapping.featureTracks || previousState.featureTracks || []);
   const trackedFeatureCount = Number.isFinite(Number(options.trackedFeatureCount))
@@ -2024,6 +2187,7 @@ function updateInitialMapping(previousState, frameOrientation, pose, analysis, u
   let keyframes = Array.isArray(previousMapping.keyframes) ? previousMapping.keyframes : [];
   let relativePoses = Array.isArray(previousMapping.relativePoses) ? previousMapping.relativePoses : [];
   let sparseObservations = Array.isArray(previousMapping.sparseObservations) ? previousMapping.sparseObservations : [];
+  let sparsePoints = Array.isArray(previousMapping.sparsePoints) ? previousMapping.sparsePoints : [];
   let distinctViewpoints = Array.isArray(previousMapping.distinctViewpoints)
     ? previousMapping.distinctViewpoints
     : distinctViewpointsFromFrames(keyframes);
@@ -2033,7 +2197,9 @@ function updateInitialMapping(previousState, frameOrientation, pose, analysis, u
     pose: pose ? { ...pose } : null,
     orientation: { ...frameOrientation },
     featureTrackIds: [...new Set(options.featureTrackIds || analysis.featureTrackIds || [])],
+    featureObservations: featureObservationsForAnalysis(analysis),
     trackedFeatureCount,
+    visualParallax: Number(analysis.visualParallax) || 0,
     capturedAt: Number(options.observedAt) || Date.now(),
   } : null;
   if (acceptedKeyframe) {
@@ -2054,6 +2220,7 @@ function updateInitialMapping(previousState, frameOrientation, pose, analysis, u
       keyframeId: acceptedKeyframe.id,
     });
     sparseObservations = addSpatialObservations(sparseObservations, frameObservations).slice(-120);
+    sparsePoints = triangulateSparsePoints(keyframes);
   }
   const orientationCoverage = calculateOrientationCoverage(keyframes);
   const mapping = {
@@ -2068,9 +2235,11 @@ function updateInitialMapping(previousState, frameOrientation, pose, analysis, u
     viewpointDiversity: calculateViewpointDiversity(keyframes),
     distinctViewpoints,
     distinctViewCount: distinctViewpoints.length,
+    physicalViewCount: distinctViewpoints.filter((view) => view.physicalMovement).length,
     successfulRelativePoseCount: relativePoses.length,
     relativePoses,
     sparseObservations,
+    sparsePoints,
   };
   const mappingReadiness = calculateInitialMappingReadiness({ mapping });
   mapping.mappingReady = mappingReadiness.ready;
@@ -2146,39 +2315,74 @@ function updateObservedTargetFromFrame(target, analysis, pose, frameOrientation,
   return next;
 }
 
-function structuralEdgesFromRegions(regions, observedAt) {
-  return (Array.isArray(regions) ? regions : [])
-    .filter((region) => region.currentlyVisible
-      && (Number(region.structuralImportance) || 0) >= 0.62
-      && (Number(region.coverageConfidence) || 0) >= 0.18)
-    .flatMap((region) => {
-      const bounds = region.screenBounds;
-      if (!bounds) return [];
-      const points = [
-        { x: bounds.x, y: bounds.y },
-        { x: bounds.x + bounds.width, y: bounds.y },
-        { x: bounds.x + bounds.width, y: bounds.y + bounds.height },
-        { x: bounds.x, y: bounds.y + bounds.height },
-      ];
-      const confidence = clamp(
-        ((Number(region.structuralImportance) || 0) * 0.45)
-          + ((Number(region.coverageConfidence) || 0) * 0.35)
-          + ((Number(region.featureDensity) || 0) * 0.2),
-        0,
-        1,
-      );
-      return points.map((start, index) => ({
-        id: `edge-${region.id}-${index}`,
-        regionId: region.id,
-        sourceFeatureIds: [...(region.featureTrackIds || [])].slice(0, 12),
-        confidence,
-        observations: Number(region.observationCount ?? region.observations) || 0,
-        projectedEndpoints: [start, points[(index + 1) % points.length]],
-        lastSeenAt: observedAt,
-      }));
-    })
-    .filter((edge) => edge.confidence >= 0.42)
-    .slice(0, 150);
+function projectWorldPointToDisplay(point, pose, orientation, displayTransform) {
+  if (!point || !pose) return null;
+  const heading = ((Number(orientation?.heading ?? pose?.yaw) || 0) * Math.PI) / 180;
+  const pitch = (Number(orientation?.pitch) || 0) * (Math.PI / 2);
+  const forward = {
+    x: Math.sin(heading) * Math.cos(pitch),
+    y: Math.sin(pitch),
+    z: -Math.cos(heading) * Math.cos(pitch),
+  };
+  const right = { x: Math.cos(heading), y: 0, z: Math.sin(heading) };
+  const up = {
+    x: right.y * forward.z - (right.z * forward.y),
+    y: right.z * forward.x - (right.x * forward.z),
+    z: right.x * forward.y - (right.y * forward.x),
+  };
+  const relative = {
+    x: Number(point.x) - (Number(pose.x) || 0),
+    y: Number(point.y) - (Number(pose.y) || 0),
+    z: Number(point.z) - (Number(pose.z) || 0),
+  };
+  const depth = (relative.x * forward.x) + (relative.y * forward.y) + (relative.z * forward.z);
+  if (depth <= 0.05) return null;
+  const horizontal = ((relative.x * right.x) + (relative.y * right.y) + (relative.z * right.z)) / depth;
+  const vertical = ((relative.x * up.x) + (relative.y * up.y) + (relative.z * up.z)) / depth;
+  return normalizedToDisplay({
+    x: 0.5 + (horizontal / (2 * Math.tan((70 * Math.PI) / 360))),
+    y: 0.5 - (vertical / (2 * Math.tan((45 * Math.PI) / 360))),
+  }, displayTransform);
+}
+
+function projectedSparsePoints(points, pose, orientation, displayTransform) {
+  return (Array.isArray(points) ? points : [])
+    .filter((point) => (Number(point.confidence) || 0) >= 0.4)
+    .map((point) => ({
+      ...point,
+      projectedPosition: projectWorldPointToDisplay(point.estimatedPosition, pose, orientation, displayTransform),
+    }))
+    .filter((point) => point.projectedPosition
+      && point.projectedPosition.x >= 0 && point.projectedPosition.x <= 1
+      && point.projectedPosition.y >= 0 && point.projectedPosition.y <= 1)
+    .slice(0, 500);
+}
+
+function structuralEdgesFromSparseGeometry(sparsePoints, planes, pose, orientation, displayTransform, observedAt) {
+  const projected = structuralEdgesFromPlanes(planes, { minimumConfidence: 0.7 });
+  return projected.map((edge) => {
+    const span = 1.3;
+    const first = {
+      x: edge.point.x - (edge.direction.x * span),
+      y: edge.point.y - (edge.direction.y * span),
+      z: edge.point.z - (edge.direction.z * span),
+    };
+    const second = {
+      x: edge.point.x + (edge.direction.x * span),
+      y: edge.point.y + (edge.direction.y * span),
+      z: edge.point.z + (edge.direction.z * span),
+    };
+    const firstProjected = projectWorldPointToDisplay(first, pose, orientation, displayTransform);
+    const secondProjected = projectWorldPointToDisplay(second, pose, orientation, displayTransform);
+    if (!firstProjected || !secondProjected) return null;
+    return {
+      ...edge,
+      confidence: Number(edge.confidence) || 0,
+      observations: sparsePoints.filter((point) => (edge.sourcePointIds || []).includes(point.id)).reduce((sum, point) => sum + (Number(point.observationCount) || 0), 0),
+      projectedEndpoints: [firstProjected, secondProjected],
+      lastSeenAt: observedAt,
+    };
+  }).filter(Boolean).slice(0, 150);
 }
 
 export function updateCoverageFromFrame(previousState, orientation, pose, analysis, parallaxDistance, options = {}) {
@@ -2206,17 +2410,18 @@ export function updateCoverageFromFrame(previousState, orientation, pose, analys
   });
   const directionalCells = directionalResult.cells;
   const directionalSummary = summarizeDirectionalCoverage(directionalCells);
-  const mappingJustInitialized = previousState.phase === SCANNER_PHASES.INITIAL_MAPPING && mappingResult.mappingReadiness.ready;
-  let phase = previousState.phase || SCANNER_PHASES.INITIAL_MAPPING;
+  const previousPhase = normalizeScannerPhase(previousState.phase || SCANNER_PHASES.INITIAL_TRACKING);
+  const mappingJustInitialized = isInitialTrackingPhase(previousPhase) && mappingResult.mappingReadiness.ready;
+  let phase = previousPhase;
   let regions = Array.isArray(previousState.coverageRegions) ? previousState.coverageRegions : [];
-  if (phase === SCANNER_PHASES.INITIAL_MAPPING && mappingJustInitialized) {
-    phase = SCANNER_PHASES.ADAPTIVE_COVERAGE;
+  if (isInitialTrackingPhase(phase) && mappingJustInitialized) {
+    phase = SCANNER_PHASES.CONTINUOUS_MAPPING;
     regions = generateObservedTargets(mappingResult.mapping.sparseObservations, regions);
-  } else if (phase === SCANNER_PHASES.ADAPTIVE_COVERAGE && regions.length === 0) {
+  } else if (isContinuousMappingPhase(phase) && regions.length === 0) {
     regions = generateObservedTargets(mappingResult.mapping.sparseObservations, regions);
   }
 
-  const projectedRegions = phase === SCANNER_PHASES.ADAPTIVE_COVERAGE
+  const projectedRegions = isContinuousMappingPhase(phase)
     ? projectCoverageRegions(regions, frameOrientation, analysis.displayTransform, pose)
     : [];
   const activeTargetId = options.activeTargetId || previousState.activeTargetId || null;
@@ -2261,17 +2466,19 @@ export function updateCoverageFromFrame(previousState, orientation, pose, analys
   // Accepted frames enrich every observed target that is actually in the
   // current frustum. The active target still owns useful-view qualification;
   // this loop only keeps the spatial evidence map alive.
-  if (phase === SCANNER_PHASES.ADAPTIVE_COVERAGE && usableObservation) {
+  if (isContinuousMappingPhase(phase) && usableObservation) {
     nextRegions = nextRegions.map((region) => {
       if (region.id === activeTargetId || !region.currentlyVisible || region.source !== 'OBSERVED' || region.skipped) return region;
       return updateObservedTargetFromFrame(region, analysis, pose, frameOrientation, options.keyframeId, null, usableObservation);
     });
   }
   nextRegions = updateRegionStatuses(nextRegions);
-  const projectedStructuralRegions = phase === SCANNER_PHASES.ADAPTIVE_COVERAGE
-    ? projectCoverageRegions(nextRegions, frameOrientation, analysis.displayTransform, pose)
-    : [];
   const summary = summarizeCoverage(nextRegions);
+  const sparsePoints = mappingResult.mapping.sparsePoints || [];
+  const supportedPlanes = estimateSupportedPlanes(sparsePoints);
+  const planeEdges = isContinuousMappingPhase(phase)
+    ? structuralEdgesFromSparseGeometry(sparsePoints, supportedPlanes, pose, frameOrientation, analysis.displayTransform, observedAt)
+    : [];
   const diagnosticTarget = diagnosticTargetForFrame(analysis, frameOrientation, usableObservation, previousState.diagnosticTarget);
   const featureQuality = clamp((Number(analysis.featureCount) || 0) / 850 * 0.3, 0, 0.3);
   const trackingQuality = clamp((Number(analysis.featureTrackingQuality) * 0.55) + (Number(analysis.qualityScore) * 0.45) + featureQuality, 0, 1);
@@ -2289,8 +2496,11 @@ export function updateCoverageFromFrame(previousState, orientation, pose, analys
     directionalCoverage: directionalSummary.coverage,
     directionalCoverageConfidence: directionalSummary.confidence,
     directionalActiveCellCount: directionalSummary.activeCellCount,
+    sparsePoints,
+    supportedPlanes,
     lastViewpointNovelty: directionalResult.novelty[0] || previousState.lastViewpointNovelty || null,
     distinctViewCount: Math.max(mappingResult.mapping.distinctViewCount || 0, directionalSummary.distinctViewCount || 0),
+    physicalViewCount: mappingResult.mapping.physicalViewCount || 0,
     acceptedFrames: previousState.acceptedFrames + (usableObservation ? 1 : 0),
     cameraPose: pose,
     currentOrientation: frameOrientation,
@@ -2311,7 +2521,7 @@ export function updateCoverageFromFrame(previousState, orientation, pose, analys
     cameraFrameDimensions: analysis.frameDimensions || previousState.cameraFrameDimensions,
     displayDimensions: analysis.displayDimensions || previousState.displayDimensions,
     displayTransform: analysis.displayTransform || previousState.displayTransform,
-    activeTargetId: phase === SCANNER_PHASES.ADAPTIVE_COVERAGE ? activeTargetId : null,
+    activeTargetId: isContinuousMappingPhase(phase) ? activeTargetId : null,
     lastTargetViewDecision: targetViewDecision,
     visibleRegionIds: nextRegions.filter((region) => region.currentlyVisible).map((region) => region.id),
     lowCoverageRegions: summary.lowCoverageRegions,
@@ -2319,24 +2529,34 @@ export function updateCoverageFromFrame(previousState, orientation, pose, analys
     wallCoverage: summary.wallCoverage,
     ceilingCoverage: summary.ceilingCoverage,
     totalCoverage: summary.totalCoverage,
-    viewpointDiversity: phase === SCANNER_PHASES.INITIAL_MAPPING ? mappingResult.mapping.viewpointDiversity : summary.viewpointDiversity,
+    viewpointDiversity: isInitialTrackingPhase(phase) ? mappingResult.mapping.viewpointDiversity : summary.viewpointDiversity,
     mappingJustInitialized,
     lastObservedAt: observedAt,
     liveMap: {
+      cameraKeyframes: mappingResult.mapping.keyframes,
       featureTracks: mappingResult.mapping.featureTracks,
       sparseObservations: mappingResult.mapping.sparseObservations,
+      sparsePoints,
       directionalCells,
-      structuralEdges: structuralEdgesFromRegions(projectedStructuralRegions, observedAt),
+      directionalCoverage: directionalSummary,
+      // The browser's region centers use a deliberately approximate depth for
+      // coverage bookkeeping. They are never promoted to live geometry. Only
+      // multi-view sparse points and supported plane intersections can draw
+      // the white structure overlay.
+      structuralEdges: planeEdges,
       cameraPath: (mappingResult.mapping.keyframes || []).map((keyframe) => keyframe.pose).filter(Boolean).slice(-120),
     },
   };
   const scanReadiness = calculateScanReadiness(nextState);
+  const scanReady = previousState.scanReady || (isContinuousMappingPhase(phase) && scanReadiness.ready);
+  const readyPhase = scanReady && !isInitialTrackingPhase(phase) ? SCANNER_PHASES.READY : phase;
   const readinessState = {
     ...nextState,
+    phase: readyPhase,
     structuralCoverage: scanReadiness.structuralCoverage,
     reconstructionConfidence: scanReadiness.reconstructionConfidence,
     scanReadiness,
-    scanReady: previousState.scanReady || (phase === SCANNER_PHASES.ADAPTIVE_COVERAGE && scanReadiness.ready),
+    scanReady,
   };
   return stabilizeScanProgress(previousState, {
     ...readinessState,
@@ -2641,8 +2861,10 @@ function App() {
           brightness: analysis.brightness,
           featureCount: analysis.featureCount,
           sceneChange: analysis.sceneChange,
+          visualParallax: Number(analysis.visualParallax) || 0,
         },
         featureTrackIds: analysis.featureTrackIds || [],
+        visualParallax: Number(analysis.visualParallax) || 0,
         image: blob,
         previewUrl,
       });
@@ -2908,6 +3130,8 @@ function App() {
             ...analysis,
             featureTrackIds: trackResult.currentTrackIds,
             multiFrameFeatureTrackCount: trackResult.multiFrameFeatureTrackCount,
+            medianFeatureDisplacement: trackResult.medianFeatureDisplacement,
+            visualParallax: trackResult.visualParallax,
           };
           const pose = { ...lastTelemetryRef.current };
            const now = Date.now();
@@ -3053,6 +3277,7 @@ function App() {
       ...frame,
       pose: { ...frame.pose },
     }));
+    const reconstructionKeyframes = selectReconstructionKeyframes(frames);
     const session = {
       schemaVersion: 3,
       sessionId: scanSessionIdRef.current || createSessionId(),
@@ -3082,10 +3307,13 @@ function App() {
         progressBlocker: scanState.progressBlocker,
         viewpointDiversity: scanState.viewpointDiversity,
         distinctViewCount: scanState.distinctViewCount,
+        physicalViewCount: scanState.physicalViewCount,
         directionalCells: scanState.directionalCells,
         directionalCoverage: scanState.directionalCoverage,
         directionalCoverageConfidence: scanState.directionalCoverageConfidence,
         directionalActiveCellCount: scanState.directionalActiveCellCount,
+        sparsePoints: scanState.sparsePoints,
+        supportedPlanes: scanState.supportedPlanes,
         liveMap: scanState.liveMap,
         coverageRegions: scanState.coverageRegions,
         visibleRegionIds: scanState.visibleRegionIds,
@@ -3103,6 +3331,7 @@ function App() {
         furniturePassActive: scanState.furniturePassActive,
       },
       frames,
+      reconstructionFrameIds: reconstructionKeyframes.map((frame) => frame.frameId),
       objects: objects.map((object) => ({ ...object })),
     };
     setIsFinished(true);
@@ -3134,6 +3363,8 @@ function App() {
         motion: frame.motion,
         qualityScore: frame.qualityScore,
         qualityMetrics: frame.qualityMetrics,
+        featureTrackIds: frame.featureTrackIds,
+        visualParallax: frame.visualParallax,
         image: await blobToDataUrl(frame.image),
       })));
       const payload = JSON.stringify({ ...roomSession, frames }, null, 2);
@@ -3256,8 +3487,12 @@ function App() {
         return;
       }
 
+      const selectedFrameIds = new Set(Array.isArray(session.reconstructionFrameIds) ? session.reconstructionFrameIds : []);
+      const reconstructionFrames = selectedFrameIds.size > 0
+        ? session.frames.filter((frame) => selectedFrameIds.has(frame.frameId))
+        : selectReconstructionKeyframes(session.frames);
       const uploadableFrames = [];
-      for (const frame of session.frames) {
+      for (const frame of reconstructionFrames) {
         if (frame.image instanceof Blob) {
           uploadableFrames.push({ frame, blob: frame.image });
         } else if (typeof frame.image === 'string' && frame.image) {
@@ -3265,7 +3500,7 @@ function App() {
           if (imageResponse.ok) uploadableFrames.push({ frame, blob: await imageResponse.blob() });
         }
       }
-      if (uploadableFrames.length < 3) throw new Error('At least three locally stored camera frames are required for reconstruction.');
+      if (uploadableFrames.length < 3) throw new Error('At least three distinct camera viewpoints are required for reconstruction.');
 
       // A retry reuses the backend scan when its frames are already stored,
       // while the browser session and captured blobs remain untouched.
@@ -3346,6 +3581,8 @@ function App() {
         motion: frame.motion,
         qualityScore: Number(frame.qualityScore) || 0,
         qualityMetrics: frame.qualityMetrics,
+        featureTrackIds: frame.featureTrackIds || [],
+        visualParallax: Number(frame.visualParallax ?? frame.qualityMetrics?.visualParallax) || 0,
         image: frame.image || '',
         previewUrl: frame.image || '',
       }));
@@ -3760,7 +3997,7 @@ function App() {
               <p className="section-label">AI-assisted guided spatial scanning</p>
               <h1>{isFinished ? 'Ready to review your room.' : 'Scan the room with your phone.'}</h1>
             </div>
-            <span className="phase-chip">{scanState.phase === SCANNER_PHASES.INITIAL_MAPPING ? 'Initial mapping' : 'Adaptive coverage'}</span>
+            <span className="phase-chip">{isInitialTrackingPhase(scanState.phase) ? 'Initial tracking' : scanState.phase === SCANNER_PHASES.READY ? 'Ready' : 'Continuous mapping'}</span>
           </div>
 
           {(!isScanning || SCANNER_DEBUG) && <>
@@ -4377,11 +4614,11 @@ function RoomCustomizer({ session, onExport, isExporting, onReconstruct, isRecon
   );
 }
 
-function SpatialOverlayCanvas({ initialMapping, projectedCells, structuralEdges }) {
+function SpatialOverlayCanvas({ initialMapping, projectedCells, sparsePoints, structuralEdges }) {
   const canvasRef = useRef(null);
-  const sourceRef = useRef({ initialMapping, projectedCells, structuralEdges });
+  const sourceRef = useRef({ initialMapping, projectedCells, sparsePoints, structuralEdges });
   const smoothedOpacityRef = useRef(new Map());
-  sourceRef.current = { initialMapping, projectedCells, structuralEdges };
+  sourceRef.current = { initialMapping, projectedCells, sparsePoints, structuralEdges };
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -4442,6 +4679,15 @@ function SpatialOverlayCanvas({ initialMapping, projectedCells, structuralEdges 
             context.lineWidth = 0.9;
             context.stroke();
           });
+          source.sparsePoints.forEach((point) => {
+            const projected = point.projectedPosition;
+            if (!projected || (Number(point.confidence) || 0) < 0.4) return;
+            const radius = (Number(point.confidence) || 0) >= 0.7 ? 2 : 1.25;
+            context.beginPath();
+            context.arc(projected.x * width, projected.y * height, radius, 0, Math.PI * 2);
+            context.fillStyle = `rgba(255, 255, 255, ${Math.min(0.64, 0.18 + ((Number(point.confidence) || 0) * 0.5)).toFixed(3)})`;
+            context.fill();
+          });
         }
       }
       animationFrame = window.requestAnimationFrame(draw);
@@ -4464,11 +4710,18 @@ function CoverageOverlay({ scanState }) {
   const structuralEdges = Array.isArray(scanState?.liveMap?.structuralEdges)
     ? scanState.liveMap.structuralEdges
     : [];
+  const sparsePoints = useMemo(() => projectedSparsePoints(
+    Array.isArray(scanState?.sparsePoints) ? scanState.sparsePoints : scanState?.liveMap?.sparsePoints,
+    scanState?.cameraPose,
+    scanState?.currentOrientation,
+    scanState?.displayTransform,
+  ), [scanState]);
   return (
     <>
       <SpatialOverlayCanvas
-        initialMapping={scanState?.phase === SCANNER_PHASES.INITIAL_MAPPING}
+        initialMapping={isInitialTrackingPhase(scanState?.phase)}
         projectedCells={projectedCells}
+        sparsePoints={sparsePoints}
         structuralEdges={structuralEdges}
       />
       {SCANNER_DEBUG && (
@@ -4477,7 +4730,8 @@ function CoverageOverlay({ scanState }) {
           <span>visible cells: {projectedCells.length}</span>
           <span>active cells: {scanState?.directionalActiveCellCount || 0}</span>
           <span>distinct views: {scanState?.distinctViewCount || 0}</span>
-          <span>sparse points: {scanState?.liveMap?.sparseObservations?.length || 0}</span>
+          <span>moved viewpoints: {scanState?.physicalViewCount || 0}</span>
+          <span>sparse points: {sparsePoints.length}</span>
           <span>structural edges: {structuralEdges.length}</span>
           <span>novelty: {scanState?.lastViewpointNovelty?.reason || 'NEW_VIEW'} | translation: {Number(scanState?.lastViewpointNovelty?.translationDelta || 0).toFixed(2)}m | angle: {Number(scanState?.lastViewpointNovelty?.angleDelta || 0).toFixed(1)}° | parallax: {Number(scanState?.lastViewpointNovelty?.parallax || 0).toFixed(2)}</span>
           {projectedCells.map((cell) => (
@@ -4502,7 +4756,7 @@ function CoverageMap({ scanState, targetRegion }) {
         <span className="tracking-badge" title="Weighted useful scan progress">{Math.round(((scanState.scanProgress ?? scanState.totalCoverage) || 0) * 100)}%</span>
       </div>
       <div className="coverage-map" role="img" aria-label="Coverage from observed spatial regions">
-        {scanState.phase === SCANNER_PHASES.INITIAL_MAPPING ? (
+        {isInitialTrackingPhase(scanState.phase) ? (
           <div className="coverage-map-row"><span className="coverage-map-label">Spatial map</span><span className="coverage-map-empty">Collecting accepted views and feature tracks…</span></div>
         ) : (
           <div className="coverage-map-row">
@@ -4532,6 +4786,9 @@ export {
   scannerMotionConfig,
   MOTION_STATES,
   SCANNER_PHASES,
+  normalizeScannerPhase,
+  isInitialTrackingPhase,
+  isContinuousMappingPhase,
   calculateInitialMappingReadiness,
   deriveTargetStatuses,
   generateObservedTargets,
@@ -4546,6 +4803,9 @@ export {
   summarizeDirectionalCoverage,
   distinctViewpointsFromFrames,
   viewpointNovelty,
+  triangulateSparsePoints,
+  estimateSupportedPlanes,
+  structuralEdgesFromPlanes,
   projectCoverageOverlayRegions,
   blueCoverageOpacity,
   targetPriorityForScan,

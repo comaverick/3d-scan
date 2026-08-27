@@ -1,5 +1,5 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
-import App, { blueCoverageOpacity, canManuallyFinishScan, calculateScanProgress, calculateScanReadiness, chooseGuidancePlacement, compactGuidanceFor, continuousScanInstructionFor, countFeaturesInRegion, coverageOverlayRegionsFor, createCameraDisplayTransform, createDirectionalCoverageGrid, createGuidanceController, createInitialScanState, determineNextAction, distinctViewpointsFromFrames, friendlyReconstructionError, isTargetStalled, normalizedToDisplay, ProcessingScreen, projectDirectionalCoverageCells, reconstructionProgressSteps, reconstructionStatusLabel, recordFrameEvaluation, stabilizeScanProgress, summarizeDirectionalCoverage, targetPriorityForScan, updateCoverageFromFrame, updateDirectionalCoverageGrid, validateTargetGeometry, viewpointNovelty } from './App';
+import App, { blueCoverageOpacity, canManuallyFinishScan, calculateScanProgress, calculateScanReadiness, chooseGuidancePlacement, compactGuidanceFor, continuousScanInstructionFor, countFeaturesInRegion, coverageOverlayRegionsFor, createCameraDisplayTransform, createDirectionalCoverageGrid, createGuidanceController, createInitialScanState, determineNextAction, distinctViewpointsFromFrames, estimateSupportedPlanes, friendlyReconstructionError, isTargetStalled, normalizedToDisplay, ProcessingScreen, projectDirectionalCoverageCells, reconstructionProgressSteps, reconstructionStatusLabel, recordFrameEvaluation, selectReconstructionKeyframes, stabilizeScanProgress, structuralEdgesFromPlanes, summarizeDirectionalCoverage, targetPriorityForScan, triangulateSparsePoints, updateCoverageFromFrame, updateDirectionalCoverageGrid, updateFeatureTracks, validateTargetGeometry, viewpointNovelty } from './App';
 
 const goodAnalysis = {
   qualityScore: 0.82,
@@ -438,4 +438,74 @@ test('tracking loss preserves directional coverage', () => {
   const before = cells.map((cell) => cell.coverage);
   const next = updateCoverageFromFrame(state, { heading: 0, pitch: 0 }, { x: 0.2, y: 1.4, z: 0 }, goodAnalysis, 0, { accepted: false });
   expect(next.directionalCells.map((cell) => cell.coverage)).toEqual(before);
+});
+
+test('reconstruction keyframe selection removes same-pose duplicates', () => {
+  const frames = Array.from({ length: 20 }, (_, index) => ({
+    frameId: `duplicate-${index}`,
+    capturedAt: index,
+    pose: { x: 0, y: 1.4, z: 0 },
+    orientation: { heading: 0, pitch: 0 },
+    qualityScore: 0.9,
+    qualityMetrics: { sharpness: 0.9, brightness: 0.48, featureCount: 400 },
+  }));
+  expect(selectReconstructionKeyframes(frames)).toHaveLength(1);
+});
+
+test('sparse points require a meaningful multi-view baseline', () => {
+  const keyframes = [
+    {
+      id: 'k1',
+      pose: { x: 0, y: 1.4, z: 0 },
+      orientation: { heading: 0, pitch: 0 },
+      featureObservations: [{ trackId: 'track-1', x: 0.5, y: 0.5 }],
+    },
+    {
+      id: 'k2',
+      pose: { x: 0.3, y: 1.4, z: 0 },
+      orientation: { heading: 0, pitch: 0 },
+      featureObservations: [{ trackId: 'track-1', x: 0.393, y: 0.5 }],
+    },
+  ];
+  expect(triangulateSparsePoints(keyframes)).toEqual(expect.arrayContaining([
+    expect.objectContaining({ sourceTrackIds: ['track-1'], observationCount: 2 }),
+  ]));
+  expect(triangulateSparsePoints([
+    { ...keyframes[0], id: 'same-1' },
+    { ...keyframes[0], id: 'same-2' },
+  ])).toHaveLength(0);
+});
+
+test('feature association rejects an obvious appearance mismatch at the same pixel', () => {
+  const first = updateFeatureTracks([], [{ x: 0.5, y: 0.5, patchSignature: Array(9).fill(1) }], { frameIndex: 1 });
+  const second = updateFeatureTracks(first.tracks, [{ x: 0.5, y: 0.5, patchSignature: Array(9).fill(-1) }], { frameIndex: 2 });
+  expect(second.trackedFeatureCount).toBe(1);
+  expect(second.tracks.filter((track) => track.observations.length === 1)).toHaveLength(2);
+});
+
+test('weak planes do not create live structural lines but supported planes do', () => {
+  expect(estimateSupportedPlanes([])).toEqual([]);
+  const planes = [
+    { id: 'floor', normal: { x: 0, y: 1, z: 0 }, distance: 0, confidence: 0.82, sourcePointIds: ['p1'] },
+    { id: 'wall', normal: { x: 1, y: 0, z: 0 }, distance: 1.4, confidence: 0.8, sourcePointIds: ['p2'] },
+  ];
+  expect(structuralEdgesFromPlanes(planes)).toHaveLength(1);
+  expect(structuralEdgesFromPlanes(planes.map((plane) => ({ ...plane, confidence: 0.35 })))).toHaveLength(0);
+});
+
+test('physical movement is required for real scan readiness when pose evidence exists', () => {
+  const base = {
+    phase: 'CONTINUOUS_MAPPING',
+    acceptedFrames: 24,
+    totalCoverage: 0.7,
+    wallCoverage: 0.62,
+    floorCoverage: 0.34,
+    viewpointDiversity: 0.45,
+    distinctViewCount: 10,
+    physicalViewCount: 0,
+    imageQuality: 0.78,
+    featureTrackingQuality: 0.8,
+  };
+  expect(calculateScanReadiness(base).ready).toBe(false);
+  expect(calculateScanReadiness({ ...base, physicalViewCount: 3 }).ready).toBe(true);
 });
