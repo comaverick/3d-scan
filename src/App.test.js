@@ -4,7 +4,7 @@ import App from './App';
 test('renders the SmartScan starting state', () => {
   render(<App />);
 
-  expect(screen.getByText('Room coverage')).toBeInTheDocument();
+  expect(screen.getByText('Capture progress')).toBeInTheDocument();
   expect(screen.getByText('Position tracking')).toBeInTheDocument();
   expect(screen.getByRole('button', { name: /start scan/i })).toBeInTheDocument();
 });

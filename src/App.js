@@ -1,80 +1,111 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import * as THREE from 'three';
 import './App.css';
 
 const GUIDANCE_STEPS = [
   {
-    label: 'READY',
-    eyebrow: 'Set your origin',
-    title: 'Find the center of the room',
-    instruction: 'Hold your phone chest-high and face a clear wall.',
-    helper: 'This position becomes the scan origin.',
-    target: 'Start point',
+    kind: 'origin',
+    direction: '↑',
+    label: 'STARTING VIEW',
+    eyebrow: 'Set your starting view',
+    title: 'Face the open side of the room',
+    instruction: 'Hold your phone chest-high and aim at a clear wall or corner.',
+    helper: 'Choose a well-lit view with fixed edges. This is the reference for the room loop.',
+    target: 'Reference view',
     coverage: 0,
   },
   {
-    label: 'MOVE FORWARD',
-    eyebrow: 'Step 01 / Movement',
+    kind: 'movement',
+    direction: '↑',
+    label: 'DEPTH PASS',
+    eyebrow: 'Move through the room',
     title: 'Move forward slowly',
-    instruction: 'Move forward 1 metre',
-    helper: 'Keep the crosshair on a clear wall as you walk.',
-    target: '1.0 m',
+    instruction: 'Walk a few steady steps into the open space.',
+    helper: 'Keep the phone level and leave the walls, floor, and ceiling edges in view.',
+    target: 'Movement cues',
+    progressUnit: 'movement cues',
+    requiredPulses: 4,
     coverage: 16,
   },
   {
-    label: 'TURN RIGHT',
-    eyebrow: 'Step 02 / Heading',
-    title: 'Turn right slowly',
-    instruction: 'Turn right 90 degrees',
-    helper: 'Keep your feet planted and rotate the phone steadily.',
-    target: '90°',
+    kind: 'turn',
+    direction: '↻',
+    label: 'NEXT WALL',
+    eyebrow: 'Change direction',
+    title: 'Turn toward the next wall',
+    instruction: 'Keep your feet planted and rotate until the next wall is centered.',
+    helper: 'Turn slowly so neighboring views overlap.',
+    target: 'Turn',
+    progressUnit: 'deg',
+    turnDegrees: 75,
     coverage: 28,
   },
   {
-    label: 'SCAN WALL',
-    eyebrow: 'Step 03 / Surface',
-    title: 'Scan this wall',
-    instruction: 'Pan across the wall from left to right',
-    helper: 'Useful frames are captured when you move 15 cm or more.',
-    target: '3 frames',
+    kind: 'surface',
+    direction: '→',
+    label: 'WALL PASS',
+    eyebrow: 'Capture this side',
+    title: 'Sweep across the wall',
+    instruction: 'Pan from one side to the other at a steady pace.',
+    helper: 'Keep part of the previous view visible as you sweep.',
+    target: 'Surface cues',
+    progressUnit: 'surface cues',
+    requiredPulses: 3,
     coverage: 47,
   },
   {
-    label: 'MOVE LEFT',
-    eyebrow: 'Step 04 / Movement',
-    title: 'Move left along the room',
-    instruction: 'Move left 0.8 metres',
-    helper: 'Keep the bed and its far edge in view.',
-    target: '0.8 m',
+    kind: 'movement',
+    direction: '←',
+    label: 'ROOM PASS',
+    eyebrow: 'Follow the room edge',
+    title: 'Move along the open side',
+    instruction: 'Take a few slow steps along the room perimeter.',
+    helper: 'Aim for the next corner and keep the floor line visible.',
+    target: 'Movement cues',
+    progressUnit: 'movement cues',
+    requiredPulses: 4,
     coverage: 61,
   },
   {
-    label: 'SCAN OPPOSITE',
-    eyebrow: 'Step 05 / Surface',
-    title: 'Scan the opposite side',
-    instruction: 'Sweep across the opposite wall',
-    helper: 'Slow down if the tracking marker turns amber.',
-    target: '4 frames',
+    kind: 'surface',
+    direction: '←',
+    label: 'OPPOSITE PASS',
+    eyebrow: 'Capture the far side',
+    title: 'Sweep across the opposite wall',
+    instruction: 'Pan across the far side of the room.',
+    helper: 'Include corners and the floor line before moving on.',
+    target: 'Surface cues',
+    progressUnit: 'surface cues',
+    requiredPulses: 3,
     coverage: 78,
   },
   {
-    label: 'RETURN TO START',
-    eyebrow: 'Step 06 / Alignment',
-    title: 'Return to your starting point',
-    instruction: 'Walk back to the origin',
-    helper: 'Closing the loop improves room alignment.',
-    target: '0.5 m',
+    kind: 'return',
+    direction: '↺',
+    label: 'CLOSE LOOP',
+    eyebrow: 'Align the scan',
+    title: 'Return to the starting view',
+    instruction: 'Walk back to your starting point and face the original direction.',
+    helper: 'Closing the loop helps the simulator connect the captured views.',
+    target: 'Movement cues',
+    progressUnit: 'movement cues',
+    requiredPulses: 4,
     coverage: 91,
   },
   {
-    label: 'READY TO REVIEW',
-    eyebrow: 'Scan complete',
-    title: 'Room scan is ready',
-    instruction: 'Review the captured coverage before generating the room.',
-    helper: 'Walls, floor, and the camera loop meet the minimum requirement.',
-    target: '94%',
-    coverage: 94,
+    kind: 'complete',
+    direction: '✓',
+    label: 'SCAN READY',
+    eyebrow: 'Review your room',
+    title: 'Your room scan is ready',
+    instruction: 'Open the simulator to review the captured views and place furniture.',
+    helper: 'If a wall or corner is missing, return to scanning and capture that area before customizing.',
+    target: 'Ready',
+    coverage: 100,
   },
 ];
+
+const FINAL_SCAN_STEP_INDEX = GUIDANCE_STEPS.length - 1;
 
 const TELEMETRY = [
   { x: '0.00', y: '1.42', z: '0.00', yaw: '0', speed: '0.00', quality: 'Ready' },
@@ -179,20 +210,42 @@ function App() {
 
   const step = GUIDANCE_STEPS[stepIndex];
   const telemetry = sensorState === 'live' || isFinished ? liveTelemetry : TELEMETRY[stepIndex];
-  const roomCoverage = step.coverage;
-  const canFinish = isFinished || (roomCoverage >= 91 && framesCaptured >= 3);
+  const nextStep = GUIDANCE_STEPS[Math.min(stepIndex + 1, FINAL_SCAN_STEP_INDEX)];
+  const stepCoverage = step.coverage || 0;
+  const nextStepCoverage = nextStep.coverage ?? 100;
+  const roomCoverage = isFinished
+    ? 100
+    : Math.round(stepCoverage + ((isScanning ? stepProgress : 0) * (nextStepCoverage - stepCoverage)));
+  const canFinish = isFinished || (stepIndex === FINAL_SCAN_STEP_INDEX && framesCaptured >= 3);
+
+  const finishHint = useMemo(() => {
+    if (isFinished) return 'Scan complete. Review the captured room in the simulator.';
+    if (stepIndex < FINAL_SCAN_STEP_INDEX) return 'Follow the direction card to close the room loop.';
+    if (framesCaptured < 3) return 'Capture at least 3 useful views before finishing.';
+    return 'The scan is ready. Finish it to open the room simulator.';
+  }, [framesCaptured, isFinished, stepIndex]);
+
+  const instructionText = useMemo(() => {
+    if (!isScanning || sensorState === 'live' || stepIndex === FINAL_SCAN_STEP_INDEX) {
+      return step.instruction;
+    }
+    return `${step.instruction} When ready, tap Mark checkpoint.`;
+  }, [isScanning, sensorState, step, stepIndex]);
 
   const liveMetric = useMemo(() => {
-    if (!isScanning || stepIndex === 0 || stepIndex === GUIDANCE_STEPS.length - 1) {
+    if (!isScanning || stepIndex === 0 || stepIndex === FINAL_SCAN_STEP_INDEX) {
       return step.target;
     }
 
-    const numericTarget = Number.parseFloat(step.target);
-    if (Number.isNaN(numericTarget)) return step.target;
+    if (step.kind === 'turn') {
+      return `${Math.round((step.turnDegrees || 90) * stepProgress)} deg`;
+    }
 
-    if (step.target.includes('°')) return `${Math.round(numericTarget * stepProgress)}°`;
-    if (step.target.includes('m')) return `${(numericTarget * stepProgress).toFixed(1)} m`;
-    return `${Math.max(1, Math.round(numericTarget * stepProgress))} frames`;
+    if (step.requiredPulses) {
+      return `${Math.round(step.requiredPulses * stepProgress)} / ${step.requiredPulses} ${step.progressUnit || 'cues'}`;
+    }
+
+    return step.target;
   }, [isScanning, step, stepIndex, stepProgress]);
 
   useEffect(() => {
@@ -352,7 +405,7 @@ function App() {
   };
 
   const advanceGuidance = (source = 'Checkpoint marked') => {
-    if (!isScanning || stepIndex >= GUIDANCE_STEPS.length - 1 || transitionLockRef.current) return;
+    if (!isScanning || stepIndex >= FINAL_SCAN_STEP_INDEX || transitionLockRef.current) return;
     transitionLockRef.current = true;
     const nextIndex = stepIndex + 1;
     setStepIndex(nextIndex);
@@ -360,12 +413,12 @@ function App() {
     captureUsefulFrame();
     motionRef.current.pulses = 0;
     stepStartHeadingRef.current = orientationRef.current.heading;
-    setLastEvent(`${source}. ${GUIDANCE_STEPS[nextIndex].label.toLowerCase()} is next.`);
+    setLastEvent(`${source}. Next, ${GUIDANCE_STEPS[nextIndex].instruction}`);
   };
   advanceGuidanceRef.current = advanceGuidance;
 
   useEffect(() => {
-    if (!isScanning || sensorState !== 'live') return undefined;
+    if (!isScanning || sensorState !== 'live' || stepIndex === FINAL_SCAN_STEP_INDEX) return undefined;
 
     const handleOrientation = (event) => {
       const heading = readHeading(event);
@@ -383,11 +436,12 @@ function App() {
         lastCapturedHeadingRef.current = heading;
       }
 
-      if (stepIndex === 2) {
+      if (step.kind === 'turn') {
         const turnAmount = Math.abs(headingDelta(stepStartHeadingRef.current ?? heading, heading));
-        setStepProgress(Math.min(1, turnAmount / 90));
-        if (turnAmount >= 75) {
-          advanceGuidanceRef.current?.('Right turn detected');
+        const requiredTurn = step.turnDegrees || 75;
+        setStepProgress(Math.min(1, turnAmount / requiredTurn));
+        if (turnAmount >= requiredTurn) {
+          advanceGuidanceRef.current?.('Turn detected');
         }
       }
     };
@@ -418,9 +472,9 @@ function App() {
       motionRef.current.pulses += 1;
       captureFrameRef.current?.();
 
-      const requiredPulses = stepIndex === 3 || stepIndex === 5 ? 3 : 4;
+      const requiredPulses = step.requiredPulses || 4;
       setStepProgress(Math.min(1, motionRef.current.pulses / requiredPulses));
-      if (stepIndex !== 2 && motionRef.current.pulses >= requiredPulses) {
+      if (step.kind !== 'turn' && motionRef.current.pulses >= requiredPulses) {
         advanceGuidanceRef.current?.('Movement detected');
       }
     };
@@ -431,7 +485,7 @@ function App() {
       window.removeEventListener('deviceorientation', handleOrientation, true);
       window.removeEventListener('devicemotion', handleMotion, true);
     };
-  }, [isScanning, sensorState, stepIndex]);
+  }, [isScanning, sensorState, stepIndex, step.kind, step.requiredPulses, step.turnDegrees]);
 
   const finishScan = () => {
     if (!canFinish) return;
@@ -452,8 +506,9 @@ function App() {
     setIsFinished(true);
     setIsScanning(false);
     setRoomSession(session);
+    setViewMode('customize');
     setSensorState('idle');
-    setStepIndex(GUIDANCE_STEPS.length - 1);
+    setStepIndex(FINAL_SCAN_STEP_INDEX);
     setStepProgress(1);
     setLastEvent('Scan saved in this browser. Export it to use it on desktop.');
     if (streamRef.current) {
@@ -523,7 +578,7 @@ function App() {
       setViewMode('customize');
       setCameraState('idle');
       setSensorState('idle');
-      setStepIndex(GUIDANCE_STEPS.length - 1);
+      setStepIndex(FINAL_SCAN_STEP_INDEX);
       setStepProgress(1);
       const lastFrame = frames[frames.length - 1];
       lastTelemetryRef.current = lastFrame.pose;
@@ -578,7 +633,7 @@ function App() {
 
         <div className="topbar-context">
           <span className="context-kicker">Project</span>
-          <span className="context-value">Primary bedroom</span>
+          <span className="context-value">Room scan</span>
           <span className="context-divider" aria-hidden="true" />
           <span className={`status-dot ${isFinished ? 'status-dot-complete' : ''}`} />
           <span className="context-value">{isFinished ? 'Ready to review' : isScanning ? 'Scanning' : 'Not started'}</span>
@@ -587,7 +642,7 @@ function App() {
         <div className="topbar-actions">
           {roomSession && (
             <button className="quiet-button" type="button" onClick={() => setViewMode(viewMode === 'customize' ? 'scan' : 'customize')}>
-              {viewMode === 'customize' ? 'Back to scan' : 'Room customizer'}
+              {viewMode === 'customize' ? 'Back to scan' : 'Room simulator'}
             </button>
           )}
           <label className="import-control">
@@ -660,19 +715,19 @@ function App() {
           <div className="control-header">
             <div>
               <p className="section-label">AI-assisted guided spatial scanning</p>
-              <h1>{isFinished ? 'Ready to generate your room.' : 'Scan the room with your phone.'}</h1>
+              <h1>{isFinished ? 'Ready to review your room.' : 'Scan the room with your phone.'}</h1>
             </div>
             <span className="phase-chip">Phase 01</span>
           </div>
 
-          <section className="progress-panel" aria-label="Room scan progress">
+          <section className="progress-panel" aria-label="Room scan capture progress">
             <div className="progress-heading">
-              <span>Room coverage</span>
+              <span>Capture progress</span>
               <strong>{roomCoverage}%</strong>
             </div>
             <div className="progress-track" aria-hidden="true"><span style={{ width: `${roomCoverage}%` }} /></div>
             <div className="progress-footing">
-              <span>{isFinished ? 'Minimum requirements met' : roomCoverage >= 91 ? 'Loop closed' : 'Building spatial map'}</span>
+              <span>{isFinished ? 'Ready to review' : stepIndex === FINAL_SCAN_STEP_INDEX ? 'Loop closed' : 'Following the room path'}</span>
               <span>{framesCaptured} useful frames</span>
             </div>
           </section>
@@ -680,22 +735,22 @@ function App() {
           <section className={`instruction-panel ${isFinished ? 'instruction-panel-complete' : ''}`} aria-live="polite">
             <div className="instruction-topline">
               <span className="instruction-label">{step.label}</span>
-              <span className="instruction-step">{stepIndex === 0 ? 'Ready' : `${Math.min(stepIndex, 6)} / 06`}</span>
+              <span className="instruction-step">{stepIndex === 0 ? 'Ready' : isFinished ? 'Done' : `${Math.min(stepIndex, FINAL_SCAN_STEP_INDEX - 1)} / ${FINAL_SCAN_STEP_INDEX - 1}`}</span>
             </div>
             <div className="instruction-content">
-              <div className="direction-glyph" aria-hidden="true">{isFinished ? '✓' : stepIndex === 2 ? '↻' : stepIndex === 4 ? '←' : '↑'}</div>
+              <div className="direction-glyph" aria-hidden="true">{step.direction}</div>
               <div>
                 <p className="section-label">{step.eyebrow}</p>
                 <h2>{step.title}</h2>
-                <p className="instruction-copy">{step.instruction}</p>
+                <p className="instruction-copy">{instructionText}</p>
               </div>
             </div>
             <div className="instruction-meter-row">
               <span>{isFinished ? 'Scan quality' : 'Current target'}</span>
               <strong>{isFinished ? 'Ready' : liveMetric}</strong>
             </div>
-            <div className="instruction-meter"><span style={{ width: `${isFinished ? 100 : stepIndex === 0 ? 0 : stepProgress * 100}%` }} /></div>
-            <p className="instruction-helper">{step.helper}</p>
+            <div className="instruction-meter"><span style={{ width: `${isFinished ? 100 : stepProgress * 100}%` }} /></div>
+            <p className="instruction-helper">{step.helper}{stepIndex === FINAL_SCAN_STEP_INDEX && !canFinish ? ` ${finishHint}` : ''}</p>
           </section>
 
           <div className="event-line"><span className="event-pulse" />{lastEvent}</div>
@@ -723,18 +778,23 @@ function App() {
             {!isScanning && !isFinished && (
               <button className="primary-button" type="button" onClick={startScan}>Start scan <span aria-hidden="true">↗</span></button>
             )}
-            {isScanning && (
+            {isScanning && stepIndex < FINAL_SCAN_STEP_INDEX && (
               <button className="primary-button" type="button" onClick={advanceGuidance}>
                 Mark checkpoint <span className="checkpoint-arrow" aria-hidden="true">-&gt;</span>
               </button>
             )}
-            {isFinished && roomSession && (
-              <button className="primary-button" type="button" onClick={() => setViewMode('customize')}>
-                Open room customizer <span aria-hidden="true">-&gt;</span>
+            {isScanning && stepIndex === FINAL_SCAN_STEP_INDEX && (
+              <button className="primary-button" type="button" onClick={finishScan} disabled={!canFinish} title={finishHint}>
+                Finish scan <span aria-hidden="true">-&gt;</span>
               </button>
             )}
-            {!isFinished && (
-              <button className="secondary-button" type="button" onClick={finishScan} disabled={!canFinish}>
+            {isFinished && roomSession && (
+              <button className="primary-button" type="button" onClick={() => setViewMode('customize')}>
+                Open room simulator <span aria-hidden="true">-&gt;</span>
+              </button>
+            )}
+            {!isFinished && stepIndex < FINAL_SCAN_STEP_INDEX && (
+              <button className="secondary-button" type="button" onClick={finishScan} disabled={!canFinish} title={finishHint}>
                 Finish scan
               </button>
             )}
@@ -747,10 +807,359 @@ function App() {
           {importError && <p className="action-note action-note-error">{importError}</p>}
           {!isScanning && !isFinished && <p className="action-note">Camera and movement tracking begin after you start.</p>}
           {isScanning && <p className="action-note">{sensorState === 'live' ? 'Move as instructed. Turn and movement signals can advance the checkpoint automatically.' : 'Motion sensors are unavailable. Complete each instruction, then mark the checkpoint manually.'}</p>}
-          {isFinished && <p className="action-note action-note-success">Your scan is now available to the room customizer and can be loaded on desktop.</p>}
+          {isScanning && <p className="action-note action-note-guidance">{finishHint}</p>}
+          {isFinished && <p className="action-note action-note-success">Your scan is now available in the 3D room viewer and can be loaded on desktop.</p>}
         </aside>
       </div>}
     </main>
+  );
+}
+
+function roomDimensions(session) {
+  const pathPoints = (session?.frames || []).map((frame) => ({
+    x: Number(frame.pose?.x) || 0,
+    z: Number(frame.pose?.z) || 0,
+  }));
+  const minX = Math.min(...pathPoints.map((point) => point.x), 0);
+  const maxX = Math.max(...pathPoints.map((point) => point.x), 1);
+  const minZ = Math.min(...pathPoints.map((point) => point.z), 0);
+  const maxZ = Math.max(...pathPoints.map((point) => point.z), 1);
+  return {
+    pathPoints,
+    minX,
+    maxX,
+    minZ,
+    maxZ,
+    width: clamp((maxX - minX) + 3.2, 4.8, 9.5),
+    depth: clamp((maxZ - minZ) + 3.2, 4.8, 9.5),
+    height: 2.8,
+  };
+}
+
+function disposeRoomScene(scene) {
+  scene.traverse((child) => {
+    if (child.geometry) child.geometry.dispose();
+    if (!child.material) return;
+    const materials = Array.isArray(child.material) ? child.material : [child.material];
+    materials.forEach((material) => {
+      if (material.map) material.map.dispose();
+      material.dispose();
+    });
+  });
+}
+
+function RoomScene({ session, objects, selectedAssetName, assetScale, assetColor, assetPosition, activeFrameIndex }) {
+  const viewportRef = useRef(null);
+  const canvasRef = useRef(null);
+  const arSessionRef = useRef(null);
+  const enterARRef = useRef(null);
+  const [arSupport, setArSupport] = useState('checking');
+  const [arActive, setArActive] = useState(false);
+  const [arError, setArError] = useState('');
+  const [sceneError, setSceneError] = useState('');
+
+  useEffect(() => {
+    let mounted = true;
+    if (!navigator.xr?.isSessionSupported) {
+      setArSupport('unavailable');
+      return undefined;
+    }
+    navigator.xr.isSessionSupported('immersive-ar')
+      .then((supported) => {
+        if (mounted) setArSupport(supported ? 'supported' : 'unavailable');
+      })
+      .catch(() => {
+        if (mounted) setArSupport('unavailable');
+      });
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    const viewport = viewportRef.current;
+    const canvas = canvasRef.current;
+    if (!viewport || !canvas) return undefined;
+
+    let disposed = false;
+    const scene = new THREE.Scene();
+    const backgroundColor = new THREE.Color('#1a1c19');
+    scene.background = backgroundColor;
+    scene.fog = new THREE.Fog(backgroundColor, 8, 18);
+
+    const camera = new THREE.PerspectiveCamera(52, 1, 0.1, 40);
+    let renderer;
+    try {
+      renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true, powerPreference: 'high-performance' });
+    } catch (error) {
+      setSceneError('This browser cannot render the 3D room. Your captured views are still available below.');
+      return undefined;
+    }
+    setSceneError('');
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+    const { pathPoints, minX, maxX, minZ, maxZ, width, depth, height } = roomDimensions(session);
+    const room = new THREE.Group();
+    scene.add(room);
+
+    const addBox = (parent, size, position, material, castShadow = true, receiveShadow = true) => {
+      const mesh = new THREE.Mesh(new THREE.BoxGeometry(...size), material);
+      mesh.position.set(...position);
+      mesh.castShadow = castShadow;
+      mesh.receiveShadow = receiveShadow;
+      parent.add(mesh);
+      return mesh;
+    };
+
+    scene.add(new THREE.HemisphereLight('#f4e9d5', '#2b302d', 2.1));
+    const keyLight = new THREE.DirectionalLight('#ffe9c4', 2.8);
+    keyLight.position.set(3, 5, 4);
+    keyLight.castShadow = true;
+    keyLight.shadow.mapSize.set(1024, 1024);
+    scene.add(keyLight);
+    const fillLight = new THREE.PointLight('#a7c1bd', 1.2, 10);
+    fillLight.position.set(-2, 2.2, 1.5);
+    scene.add(fillLight);
+
+    const floorMaterial = new THREE.MeshStandardMaterial({ color: '#59615a', roughness: 0.88, metalness: 0.02 });
+    addBox(room, [width, 0.12, depth], [0, -0.06, 0], floorMaterial, false, true);
+    const wallMaterial = new THREE.MeshStandardMaterial({ color: '#737a71', roughness: 0.92, metalness: 0 });
+    addBox(room, [width, height, 0.12], [0, height / 2, -depth / 2], wallMaterial, false, true);
+    addBox(room, [0.12, height, depth], [-width / 2, height / 2, 0], wallMaterial, false, true);
+    addBox(room, [0.12, height, depth], [width / 2, height / 2, 0], wallMaterial, false, true);
+
+    const gridSize = Math.max(width, depth);
+    const grid = new THREE.GridHelper(gridSize, Math.round(gridSize * 2), '#b9b29e', '#7c8379');
+    grid.position.y = 0.012;
+    grid.scale.set(width / gridSize, 1, depth / gridSize);
+    grid.material.transparent = true;
+    grid.material.opacity = 0.22;
+    room.add(grid);
+
+    const pathRangeX = Math.max(maxX - minX, 0.5);
+    const pathRangeZ = Math.max(maxZ - minZ, 0.5);
+    const toRoomPoint = (point) => new THREE.Vector3(
+      (((point.x - minX) / pathRangeX) - 0.5) * (width - 0.7),
+      0.08,
+      (((point.z - minZ) / pathRangeZ) - 0.5) * (depth - 0.7),
+    );
+    const roomPath = pathPoints.map(toRoomPoint);
+    if (roomPath.length > 1) {
+      const pathLine = new THREE.Line(
+        new THREE.BufferGeometry().setFromPoints(roomPath),
+        new THREE.LineBasicMaterial({ color: '#ffc27c', transparent: true, opacity: 0.88 }),
+      );
+      room.add(pathLine);
+    }
+    const pathNodeMaterial = new THREE.MeshBasicMaterial({ color: '#9bd8b1' });
+    roomPath.forEach((point) => {
+      const node = new THREE.Mesh(new THREE.SphereGeometry(0.055, 12, 8), pathNodeMaterial);
+      node.position.copy(point);
+      room.add(node);
+    });
+
+    const captureSlots = [
+      { x: 0, y: 1.55, z: -depth / 2 + 0.08, rotationY: 0, width: Math.min(width * 0.68, 4.2) },
+      { x: -width / 2 + 0.08, y: 1.5, z: 0, rotationY: Math.PI / 2, width: Math.min(depth * 0.62, 3.6) },
+      { x: width / 2 - 0.08, y: 1.5, z: 0, rotationY: -Math.PI / 2, width: Math.min(depth * 0.62, 3.6) },
+      { x: 0, y: 1.55, z: depth / 2 - 0.08, rotationY: Math.PI, width: Math.min(width * 0.68, 4.2) },
+    ];
+    const textureLoader = new THREE.TextureLoader();
+    const capturedFrames = (session.frames || []).filter((frame) => frameSource(frame)).slice(0, captureSlots.length);
+    capturedFrames.forEach((frame, index) => {
+      const slot = captureSlots[index];
+      const texture = textureLoader.load(frameSource(frame), (loadedTexture) => {
+        if (disposed) {
+          loadedTexture.dispose();
+          return;
+        }
+        loadedTexture.colorSpace = THREE.SRGBColorSpace;
+        const imageAspect = loadedTexture.image?.width && loadedTexture.image?.height
+          ? loadedTexture.image.width / loadedTexture.image.height
+          : 1.5;
+        const panelHeight = Math.min(slot.width / imageAspect, 1.75);
+        const panelMaterial = new THREE.MeshBasicMaterial({ map: loadedTexture, transparent: true, opacity: 0.9, side: THREE.DoubleSide });
+        const panel = new THREE.Mesh(new THREE.PlaneGeometry(slot.width, panelHeight), panelMaterial);
+        panel.position.set(slot.x, slot.y, slot.z);
+        panel.rotation.y = slot.rotationY;
+        room.add(panel);
+
+        const borderMaterial = new THREE.LineBasicMaterial({ color: index === activeFrameIndex ? '#ffc27c' : '#e3ddce', transparent: true, opacity: index === activeFrameIndex ? 0.95 : 0.42 });
+        const border = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.PlaneGeometry(slot.width + 0.05, panelHeight + 0.05)), borderMaterial);
+        border.position.copy(panel.position);
+        border.rotation.copy(panel.rotation);
+        room.add(border);
+      });
+      texture.colorSpace = THREE.SRGBColorSpace;
+    });
+
+    const roomObjects = objects?.length ? objects : INITIAL_OBJECTS;
+    const defaultSlots = [
+      { x: -width * 0.24, z: -depth * 0.22 },
+      { x: width * 0.2, z: -depth * 0.22 },
+      { x: width * 0.2, z: depth * 0.2 },
+      { x: -width * 0.22, z: depth * 0.2 },
+    ];
+    const selectedX = clamp(((assetPosition.x / 100) - 0.5) * (width - 1), -width / 2 + 0.5, width / 2 - 0.5);
+    const selectedZ = clamp(((assetPosition.y / 100) - 0.5) * (depth - 1), -depth / 2 + 0.5, depth / 2 - 0.5);
+    const furnitureColors = ['#b39a80', '#7d8d88', '#a7a08c', '#78929a'];
+    roomObjects.forEach((object, index) => {
+      const isSelected = object.name === selectedAssetName;
+      const slot = defaultSlots[index % defaultSlots.length];
+      const furniture = new THREE.Group();
+      const material = new THREE.MeshStandardMaterial({ color: isSelected ? assetColor : furnitureColors[index % furnitureColors.length], roughness: 0.72, metalness: 0.04, emissive: isSelected ? assetColor : '#000000', emissiveIntensity: isSelected ? 0.14 : 0 });
+      const addPart = (size, position, partMaterial = material, castShadow = true, receiveShadow = true) => addBox(furniture, size, position, partMaterial, castShadow, receiveShadow);
+
+      if (object.kind === 'bed') {
+        addPart([2.15, 0.28, 1.18], [0, 0.28, 0]);
+        addPart([2.04, 0.22, 1.08], [0, 0.53, 0], new THREE.MeshStandardMaterial({ color: isSelected ? assetColor : '#c7c0ad', roughness: 0.96 }));
+        addPart([0.42, 0.12, 0.74], [-0.65, 0.73, -0.08], new THREE.MeshStandardMaterial({ color: '#e3ddce', roughness: 0.98 }));
+      } else if (object.kind === 'desk') {
+        addPart([1.55, 0.14, 0.68], [0, 0.94, 0]);
+        [-0.62, 0.62].forEach((x) => addPart([0.1, 0.92, 0.1], [x, 0.46, -0.24]));
+        [-0.62, 0.62].forEach((x) => addPart([0.1, 0.92, 0.1], [x, 0.46, 0.24]));
+      } else if (object.kind === 'chair') {
+        addPart([0.72, 0.14, 0.72], [0, 0.68, 0]);
+        addPart([0.72, 0.9, 0.12], [0, 1.08, -0.3]);
+        [-0.26, 0.26].forEach((x) => addPart([0.09, 0.66, 0.09], [x, 0.33, -0.24]));
+        [-0.26, 0.26].forEach((x) => addPart([0.09, 0.66, 0.09], [x, 0.33, 0.24]));
+      } else {
+        const glassMaterial = new THREE.MeshStandardMaterial({ color: '#a6ccd0', roughness: 0.18, metalness: 0.12, transparent: true, opacity: 0.78 });
+        addPart([1.55, 1.15, 0.08], [0, 1.65, 0], glassMaterial, false, false);
+        addPart([1.7, 0.1, 0.12], [0, 2.25, 0]);
+        addPart([1.7, 0.1, 0.12], [0, 1.05, 0]);
+        addPart([0.1, 1.2, 0.12], [-0.8, 1.65, 0]);
+        addPart([0.1, 1.2, 0.12], [0.8, 1.65, 0]);
+      }
+
+      furniture.position.set(isSelected ? selectedX : slot.x, 0, isSelected ? selectedZ : slot.z);
+      furniture.scale.setScalar(isSelected ? assetScale : 0.92);
+      if (object.kind === 'window') furniture.position.z = isSelected ? selectedZ : -depth / 2 + 0.16;
+      if (isSelected) {
+        const selectionRing = new THREE.Mesh(new THREE.RingGeometry(0.46, 0.5, 32), new THREE.MeshBasicMaterial({ color: '#ffc27c', transparent: true, opacity: 0.75, side: THREE.DoubleSide }));
+        selectionRing.rotation.x = -Math.PI / 2;
+        selectionRing.position.y = 0.015;
+        furniture.add(selectionRing);
+      }
+      room.add(furniture);
+    });
+
+    const orbit = { azimuth: 0, elevation: 0.2, distance: Math.max(width, depth) * 0.92 };
+    const target = new THREE.Vector3(0, 1.05, 0);
+    const updateCamera = () => {
+      const horizontalDistance = Math.cos(orbit.elevation) * orbit.distance;
+      camera.position.set(Math.sin(orbit.azimuth) * horizontalDistance, target.y + Math.sin(orbit.elevation) * orbit.distance, Math.cos(orbit.azimuth) * horizontalDistance);
+      camera.lookAt(target);
+    };
+    updateCamera();
+
+    const pointer = { active: false, x: 0, y: 0 };
+    const handlePointerDown = (event) => {
+      pointer.active = true;
+      pointer.x = event.clientX;
+      pointer.y = event.clientY;
+      canvas.setPointerCapture?.(event.pointerId);
+    };
+    const handlePointerMove = (event) => {
+      if (!pointer.active || renderer.xr.isPresenting) return;
+      orbit.azimuth -= (event.clientX - pointer.x) * 0.008;
+      orbit.elevation = clamp(orbit.elevation + (event.clientY - pointer.y) * 0.006, -0.05, 0.82);
+      pointer.x = event.clientX;
+      pointer.y = event.clientY;
+      updateCamera();
+    };
+    const handlePointerUp = () => {
+      pointer.active = false;
+    };
+    const handleWheel = (event) => {
+      if (renderer.xr.isPresenting) return;
+      event.preventDefault();
+      orbit.distance = clamp(orbit.distance + event.deltaY * 0.006, 3.5, 12);
+      updateCamera();
+    };
+    canvas.addEventListener('pointerdown', handlePointerDown);
+    canvas.addEventListener('pointermove', handlePointerMove);
+    canvas.addEventListener('pointerup', handlePointerUp);
+    canvas.addEventListener('pointercancel', handlePointerUp);
+    canvas.addEventListener('wheel', handleWheel, { passive: false });
+
+    const resize = () => {
+      const bounds = viewport.getBoundingClientRect();
+      const sceneWidth = Math.max(bounds.width, 1);
+      const sceneHeight = Math.max(bounds.height, 1);
+      renderer.setSize(sceneWidth, sceneHeight, false);
+      camera.aspect = sceneWidth / sceneHeight;
+      camera.updateProjectionMatrix();
+    };
+    resize();
+    window.addEventListener('resize', resize);
+    renderer.setAnimationLoop(() => renderer.render(scene, camera));
+
+    const enterAR = async () => {
+      if (!navigator.xr || arSupport !== 'supported' || arSessionRef.current) return;
+      try {
+        setArError('');
+        const xrSession = await navigator.xr.requestSession('immersive-ar', { optionalFeatures: ['local-floor', 'dom-overlay'], domOverlay: { root: viewport } });
+        if (disposed) {
+          xrSession.end();
+          return;
+        }
+        renderer.xr.enabled = true;
+        renderer.xr.setReferenceSpaceType('local-floor');
+        await renderer.xr.setSession(xrSession);
+        scene.background = null;
+        scene.fog = null;
+        arSessionRef.current = xrSession;
+        setArActive(true);
+        const handleSessionEnd = () => {
+          arSessionRef.current = null;
+          renderer.xr.enabled = false;
+          scene.background = backgroundColor;
+          scene.fog = new THREE.Fog(backgroundColor, 8, 18);
+          if (!disposed) setArActive(false);
+        };
+        xrSession.addEventListener('end', handleSessionEnd, { once: true });
+      } catch (error) {
+        setArError('AR could not start. The 3D room is still available here.');
+      }
+    };
+    enterARRef.current = enterAR;
+
+    return () => {
+      disposed = true;
+      enterARRef.current = null;
+      if (arSessionRef.current) arSessionRef.current.end().catch(() => {});
+      renderer.setAnimationLoop(null);
+      canvas.removeEventListener('pointerdown', handlePointerDown);
+      canvas.removeEventListener('pointermove', handlePointerMove);
+      canvas.removeEventListener('pointerup', handlePointerUp);
+      canvas.removeEventListener('pointercancel', handlePointerUp);
+      canvas.removeEventListener('wheel', handleWheel);
+      window.removeEventListener('resize', resize);
+      disposeRoomScene(scene);
+      renderer.dispose();
+    };
+  }, [session, objects, selectedAssetName, assetScale, assetColor, assetPosition, activeFrameIndex, arSupport]);
+
+  const enterAR = () => enterARRef.current?.();
+  const exitAR = () => arSessionRef.current?.end();
+
+  return (
+    <div className={`room-scene-viewport ${arActive ? 'room-scene-viewport-ar' : ''}`} ref={viewportRef}>
+      <canvas className="room-scene-canvas" ref={canvasRef} aria-label="Interactive 3D room built from the scan path and captured views" />
+      {sceneError && <p className="room-scene-empty">{sceneError}</p>}
+      <div className="room-scene-toolbar">
+        <span>{arActive ? 'Move your phone to view the room in AR.' : 'Drag to look around. Scroll to zoom.'}</span>
+        {arSupport === 'supported' && !arActive && <button type="button" className="scene-ar-button" onClick={enterAR}>Enter AR</button>}
+        {arActive && <button type="button" className="scene-ar-button" onClick={exitAR}>Exit AR</button>}
+        {arSupport === 'checking' && <span className="scene-capability">Checking AR...</span>}
+        {arSupport === 'unavailable' && <span className="scene-capability">3D room</span>}
+      </div>
+      {arError && <p className="room-scene-error">{arError}</p>}
+    </div>
   );
 }
 
@@ -761,6 +1170,7 @@ function RoomCustomizer({ session, objects, onExport, isExporting }) {
   const [selectedAssetName, setSelectedAssetName] = useState(objects[0]?.name || 'Bed');
   const [assetColor, setAssetColor] = useState('#d8b08a');
   const [assetScale, setAssetScale] = useState(1);
+  const [assetPosition, setAssetPosition] = useState({ x: 53, y: 57 });
   const [isCameraPreview, setIsCameraPreview] = useState(false);
   const [previewError, setPreviewError] = useState('');
 
@@ -772,8 +1182,11 @@ function RoomCustomizer({ session, objects, onExport, isExporting }) {
     };
   }, []);
 
-  const activeFrame = session.frames[activeFrameIndex] || session.frames[0];
   const selectedAsset = objects.find((object) => object.name === selectedAssetName) || objects[0];
+
+  const updateAssetPosition = (axis, value) => {
+    setAssetPosition((current) => ({ ...current, [axis]: Number(value) }));
+  };
 
   const toggleCameraPreview = async () => {
     if (isCameraPreview) {
@@ -821,9 +1234,9 @@ function RoomCustomizer({ session, objects, onExport, isExporting }) {
     <div className="customizer-workspace">
       <div className="customizer-header">
         <div>
-          <p className="section-label">Scan to room customization</p>
-          <h1>Place furniture in your scanned room.</h1>
-          <p className="customizer-intro">Your captured keyframes and estimated movement path are now available on the website.</p>
+          <p className="section-label">Scanned room simulator</p>
+          <h1>Walk through your scanned room.</h1>
+          <p className="customizer-intro">Explore the estimated room in 3D, review captured views, or place furniture.</p>
         </div>
         <div className="customizer-header-actions">
           <span className="session-chip">{session.frames.length} keyframes</span>
@@ -834,25 +1247,26 @@ function RoomCustomizer({ session, objects, onExport, isExporting }) {
       </div>
 
       <div className="customizer-grid">
-        <section className="customizer-stage-panel" aria-label="Room customization preview">
+        <section className="customizer-stage-panel" aria-label="Scanned room simulator">
           <div className={`customizer-stage ${isCameraPreview ? 'customizer-stage-camera' : ''}`}>
             {isCameraPreview ? (
               <video ref={previewVideoRef} className="customizer-camera" autoPlay muted playsInline />
-            ) : frameSource(activeFrame) ? (
-              <img className="customizer-keyframe" src={frameSource(activeFrame)} alt={`Captured room frame ${activeFrameIndex + 1}`} />
             ) : (
-              <div className="customizer-empty-stage">No room image in this session.</div>
+              <RoomScene
+                session={session}
+                objects={objects}
+                selectedAssetName={selectedAssetName}
+                assetScale={assetScale}
+                assetColor={assetColor}
+                assetPosition={assetPosition}
+                activeFrameIndex={activeFrameIndex}
+              />
             )}
             <div className="customizer-stage-shade" />
             <div className="customizer-stage-meta">
-              <span>{isCameraPreview ? 'CAMERA OVERLAY' : 'CAPTURED ROOM VIEW'}</span>
+              <span>{isCameraPreview ? 'CAMERA OVERLAY' : 'ROOM SIMULATOR'}</span>
               <span>{selectedAsset?.name || 'Room asset'} / PLACED</span>
             </div>
-            <div className="customizer-crosshair" aria-hidden="true" />
-            <div className={`placed-asset placed-asset-${selectedAsset?.kind || 'bed'}`} style={{ '--asset-color': assetColor, '--asset-scale': assetScale }}>
-              <span>{selectedAsset?.name || 'Bed'}</span>
-            </div>
-            <div className="customizer-placement-note">Drag placement is ready for the next WebXR pass.</div>
           </div>
 
           <div className="frame-strip" aria-label="Captured room frames">
@@ -873,7 +1287,7 @@ function RoomCustomizer({ session, objects, onExport, isExporting }) {
         <aside className="customizer-controls">
           <div className="customizer-control-heading">
             <div>
-              <p className="section-label">AR customization</p>
+              <p className="section-label">Simulator controls</p>
               <h2>Room assets</h2>
             </div>
             <span className="tracking-badge tracking-badge-live">Local session</span>
@@ -905,6 +1319,16 @@ function RoomCustomizer({ session, objects, onExport, isExporting }) {
             ))}
           </div>
 
+          <label className="customizer-slider-label" htmlFor="asset-position-x">
+            <span>Horizontal placement</span><strong>{Math.round(assetPosition.x)}%</strong>
+          </label>
+          <input id="asset-position-x" className="customizer-slider" type="range" min="15" max="85" step="1" value={assetPosition.x} onChange={(event) => updateAssetPosition('x', event.target.value)} />
+
+          <label className="customizer-slider-label" htmlFor="asset-position-y">
+            <span>Depth placement</span><strong>{Math.round(assetPosition.y)}%</strong>
+          </label>
+          <input id="asset-position-y" className="customizer-slider" type="range" min="18" max="82" step="1" value={assetPosition.y} onChange={(event) => updateAssetPosition('y', event.target.value)} />
+
           <div className="room-map-panel">
             <div className="panel-heading-row"><div><p className="section-label">Captured path</p><h2>Room footprint</h2></div><span className="object-count">Estimated</span></div>
             <svg className="room-map" viewBox="0 0 100 100" role="img" aria-label="Estimated room scan path">
@@ -915,10 +1339,10 @@ function RoomCustomizer({ session, objects, onExport, isExporting }) {
           </div>
 
           <button className="primary-button customizer-camera-button" type="button" onClick={toggleCameraPreview}>
-            {isCameraPreview ? 'Close camera preview' : 'Preview with camera'} <span aria-hidden="true">-&gt;</span>
+            {isCameraPreview ? 'Close camera overlay' : 'Preview with camera'} <span aria-hidden="true">-&gt;</span>
           </button>
           {previewError && <p className="action-note action-note-error">{previewError}</p>}
-          <p className="customizer-disclaimer">The portable session is real camera data. Exact wall geometry and world-locked placement require a WebXR-capable browser or a reconstruction service.</p>
+          <p className="customizer-disclaimer">This room is built from your movement path and captured views. Precise wall geometry needs depth capture or a reconstruction service; AR needs a WebXR-capable browser.</p>
         </aside>
       </div>
     </div>
