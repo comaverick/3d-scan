@@ -31,6 +31,26 @@ export const coverageOverlayConfig = Object.freeze({
   completionThreshold: 0.7,
 });
 
+export const directionalCoverageConfig = Object.freeze({
+  yawBins: 18,
+  yawBinDegrees: 20,
+  pitchBands: Object.freeze([
+    Object.freeze({ id: 'upper', pitch: 0.48, height: 0.3 }),
+    Object.freeze({ id: 'middle', pitch: 0, height: 0.34 }),
+    Object.freeze({ id: 'lower', pitch: -0.48, height: 0.3 }),
+  ]),
+  minimumTranslationMeters: 0.18,
+  minimumAngleDegrees: 12,
+  minimumParallax: 0.18,
+  duplicateTranslationMeters: 0.08,
+  duplicateAngleDegrees: 5,
+  duplicateParallax: 0.06,
+  maxViewpointsPerCell: 12,
+  maxVisibleCells: 54,
+  clearCoverage: 0.78,
+  clearConfidence: 0.86,
+});
+
 // Lower numbers are structural priorities. Furniture is intentionally last
 // so heuristic furniture/frame classifications cannot steer the room pass.
 export const scannerTargetPriority = Object.freeze({
@@ -59,11 +79,163 @@ export function blueCoverageOpacity(region, config = coverageOverlayConfig) {
     : Number(region.coverageConfidence) || 0;
   const coverage = clamp(coverageValue, 0, 1);
   const maxOpacity = clamp(settings.maxBlueOpacity, 0, 1);
-  const completionThreshold = clamp(settings.completionThreshold, 0.01, 1);
-  if (coverage >= completionThreshold) return 0;
+  const hasDistinctViewEvidence = Number.isFinite(Number(region.distinctViewCount))
+    || Number.isFinite(Number(region.physicalViewCount));
+  const completionThreshold = clamp(
+    hasDistinctViewEvidence && Number.isFinite(Number(settings.clearCoverage))
+      ? settings.clearCoverage
+      : settings.completionThreshold,
+    0.01,
+    1,
+  );
+  const distinctViews = Number(region.distinctViewCount ?? region.viewpointCount) || 0;
+  const physicalViews = Number(region.physicalViewCount ?? region.translationViewCount) || 0;
+  const confidence = Number(region.coverageConfidence ?? region.confidence) || 0;
+  const clearConfidence = Number(settings.clearConfidence) || directionalCoverageConfig.clearConfidence;
+  const geometryCanClear = !hasDistinctViewEvidence
+    || (distinctViews >= 2 && (physicalViews >= 1 || confidence >= clearConfidence));
+  if (coverage >= completionThreshold && geometryCanClear) return 0;
   if (coverage <= 0.15) return maxOpacity;
   if (coverage <= 0.4) return maxOpacity + ((0.35 - maxOpacity) * ((coverage - 0.15) / 0.25));
-  return 0.35 + ((0.12 - 0.35) * ((coverage - 0.4) / (completionThreshold - 0.4)));
+  const upperOpacity = geometryCanClear ? 0.12 : 0.18;
+  return 0.35 + ((upperOpacity - 0.35) * ((coverage - 0.4) / (completionThreshold - 0.4)));
+}
+
+function normalizedHeading(value) {
+  return ((finite(value, 0) % 360) + 360) % 360;
+}
+
+function directionFromYawPitch(yaw, pitch) {
+  const yawRadians = (normalizedHeading(yaw) * Math.PI) / 180;
+  const pitchRadians = finite(pitch) * (Math.PI / 2);
+  return normalize({
+    x: Math.sin(yawRadians) * Math.cos(pitchRadians),
+    y: Math.sin(pitchRadians),
+    z: -Math.cos(yawRadians) * Math.cos(pitchRadians),
+  });
+}
+
+function featureSignature(featureTrackIds = []) {
+  return [...new Set((Array.isArray(featureTrackIds) ? featureTrackIds : []).filter(Boolean))].slice(0, 16);
+}
+
+function viewRecordFrom({ keyframeId, pose, orientation, featureTrackIds, translationDelta = 0, angleDelta = 0, parallax = 0 }) {
+  return {
+    keyframeId: keyframeId ?? null,
+    position: pose ? { x: finite(pose.x), y: finite(pose.y), z: finite(pose.z) } : null,
+    pose: pose ? { x: finite(pose.x), y: finite(pose.y), z: finite(pose.z) } : null,
+    heading: headingFor(orientation, pose),
+    pitch: pitchFor(orientation),
+    timestamp: Date.now(),
+    featureSignature: featureSignature(featureTrackIds),
+    translationDelta,
+    angleDelta,
+    parallax,
+  };
+}
+
+export function viewpointNovelty(previousViewpoints = [], nextView, config = directionalCoverageConfig) {
+  const previous = Array.isArray(previousViewpoints) ? previousViewpoints.filter(Boolean) : [];
+  if (!nextView) return {
+    isNovel: false,
+    translationDelta: 0,
+    angleDelta: 0,
+    parallax: 0,
+    physicalMovement: false,
+    reason: 'MISSING_VIEW',
+  };
+  if (previous.length === 0) return {
+    isNovel: true,
+    translationDelta: 0,
+    angleDelta: 0,
+    parallax: 0,
+    physicalMovement: false,
+    reason: 'FIRST_VIEW',
+  };
+  const nextHeading = headingFor({ heading: nextView.heading }, nextView.pose || nextView.position);
+  const nextPitch = finite(nextView.pitch);
+  const comparisons = previous.map((view) => {
+    const translationDelta = poseDistance(view.position || view.pose, nextView.position || nextView.pose);
+    const angleDelta = Math.max(
+      angleDistance(view.heading, nextHeading),
+      Math.abs(finite(view.pitch) - nextPitch) * 90,
+    );
+    const parallax = clamp(translationDelta / 0.45, 0, 1);
+    return { translationDelta, angleDelta, parallax };
+  });
+  const closest = comparisons.reduce((best, current) => (!best || current.translationDelta + (current.angleDelta / 180) < best.translationDelta + (best.angleDelta / 180) ? current : best), null);
+  const last = comparisons[comparisons.length - 1] || closest;
+  const meaningful = comparisons.some((comparison) => comparison.translationDelta >= config.minimumTranslationMeters
+    || comparison.angleDelta >= config.minimumAngleDegrees
+    || comparison.parallax >= config.minimumParallax);
+  const duplicate = closest.translationDelta < config.duplicateTranslationMeters
+    && closest.angleDelta < config.duplicateAngleDegrees
+    && closest.parallax < config.duplicateParallax;
+  return {
+    isNovel: meaningful && !duplicate,
+    translationDelta: last.translationDelta,
+    angleDelta: last.angleDelta,
+    parallax: last.parallax,
+    physicalMovement: last.translationDelta >= config.minimumTranslationMeters || last.parallax >= config.minimumParallax,
+    reason: duplicate ? 'DUPLICATE_VIEW' : meaningful ? null : 'LOW_NOVELTY',
+  };
+}
+
+export function createDirectionalCoverageGrid(referenceHeading = 0, config = directionalCoverageConfig) {
+  const settings = { ...directionalCoverageConfig, ...(config || {}) };
+  const pitchBands = Array.isArray(settings.pitchBands) ? settings.pitchBands : directionalCoverageConfig.pitchBands;
+  return pitchBands.flatMap((band) => Array.from({ length: settings.yawBins }, (_, index) => {
+    const yaw = normalizedHeading(referenceHeading + (index * settings.yawBinDegrees));
+    return {
+      id: `cell-${band.id}-${index}`,
+      kind: 'DIRECTIONAL_CELL',
+      band: band.id,
+      yaw,
+      pitch: band.pitch,
+      yawWidth: settings.yawBinDegrees,
+      pitchHeight: band.height,
+      estimatedDirection: directionFromYawPitch(yaw, band.pitch),
+      coverage: 0,
+      observationCount: 0,
+      distinctViewCount: 0,
+      viewpointCount: 0,
+      physicalViewCount: 0,
+      translationViewCount: 0,
+      angularViewCount: 0,
+      viewpoints: [],
+      confidence: 0,
+      coverageConfidence: 0,
+      parallaxScore: 0,
+      status: 'UNSEEN',
+      referenceHeading: normalizedHeading(referenceHeading),
+      lastSeenAt: 0,
+    };
+  }));
+}
+
+export function summarizeDirectionalCoverage(cells = []) {
+  const validCells = (Array.isArray(cells) ? cells : []).filter((cell) => !cell.skipped);
+  if (validCells.length === 0) return {
+    coverage: 0,
+    confidence: 0,
+    observedCellCount: 0,
+    activeCellCount: 0,
+    distinctViewCount: 0,
+    physicalViewCount: 0,
+    viewpointDiversity: 0,
+  };
+  const average = (key) => validCells.reduce((sum, cell) => sum + (Number(cell[key]) || 0), 0) / validCells.length;
+  const observed = validCells.filter((cell) => (Number(cell.observationCount) || 0) > 0);
+  const multiView = validCells.filter((cell) => (Number(cell.distinctViewCount ?? cell.viewpointCount) || 0) >= 2);
+  return {
+    coverage: average('coverage'),
+    confidence: average('coverageConfidence'),
+    observedCellCount: observed.length,
+    activeCellCount: validCells.filter((cell) => cell.status !== 'SUFFICIENT').length,
+    distinctViewCount: Math.max(0, ...validCells.map((cell) => Number(cell.distinctViewCount ?? cell.viewpointCount) || 0)),
+    physicalViewCount: Math.max(0, ...validCells.map((cell) => Number(cell.physicalViewCount ?? cell.translationViewCount) || 0)),
+    viewpointDiversity: clamp((observed.length / validCells.length) * 0.55 + (multiView.length / validCells.length) * 0.45, 0, 1),
+  };
 }
 
 export function targetPriorityForScan(target, furniturePassActive = false) {
@@ -233,14 +405,33 @@ export function updateFeatureTracks(previousTracks = [], featurePoints = [], con
   };
 }
 
-export function calculateViewpointDiversity(keyframes = []) {
+export function distinctViewpointsFromFrames(keyframes = [], config = directionalCoverageConfig) {
   const frames = Array.isArray(keyframes) ? keyframes : [];
+  return frames.reduce((viewpoints, frame) => {
+    const view = viewRecordFrom({
+      keyframeId: frame.keyframeId ?? frame.id,
+      pose: frame.pose || frame.estimatedPose,
+      orientation: frame.orientation,
+      featureTrackIds: frame.featureTrackIds,
+    });
+    const novelty = viewpointNovelty(viewpoints, view, config);
+    return novelty.isNovel ? [...viewpoints, {
+      ...view,
+      translationDelta: novelty.translationDelta,
+      angleDelta: novelty.angleDelta,
+      parallax: novelty.parallax,
+    }] : viewpoints;
+  }, []);
+}
+
+export function calculateViewpointDiversity(keyframes = []) {
+  const frames = distinctViewpointsFromFrames(keyframes);
   if (frames.length < 2) return 0;
   const positionBins = new Set();
   const headingBins = new Set();
   frames.forEach((frame) => {
     const pose = frame.pose || frame.estimatedPose;
-    const heading = headingFor(frame.orientation, pose);
+    const heading = Number.isFinite(Number(frame.heading)) ? Number(frame.heading) : headingFor(frame.orientation, pose);
     if (pose) positionBins.add(`${Math.round(finite(pose.x) / 0.18)},${Math.round(finite(pose.z) / 0.18)}`);
     if (heading !== null) headingBins.add(Math.round(heading / 20));
   });
@@ -361,11 +552,15 @@ function observationFromGroup(group, analysis, orientation, pose, keyframeId, de
     featureDensity: clamp(group.points.length / 40, 0, 1),
     screenBounds,
     viewpointCount: 1,
-    viewpointDiversity: 0,
+    distinctViewCount: 1,
+    observationCount: 1,
+    physicalViewCount: 0,
+    viewpointDiversity: 0.2,
     parallaxScore: 0,
     coverageConfidence: clamp((group.points.length / 40) * 0.65, 0, 1),
     lastPose: pose ? { x: finite(pose.x), y: finite(pose.y), z: finite(pose.z) } : null,
     lastOrientation: orientation || null,
+    viewpoints: [viewRecordFrom({ keyframeId, pose, orientation, featureTrackIds: group.trackIds })],
   };
 }
 
@@ -382,7 +577,26 @@ function mergeObservation(observations, incoming) {
   });
   if (matchIndex < 0) return [...observations, { ...incoming, id: `obs-${observations.length + 1}` }];
   const existing = observations[matchIndex];
-  const nextViewCount = existing.viewpointCount + 1;
+  const existingViewpoints = Array.isArray(existing.viewpoints) && existing.viewpoints.length > 0
+    ? existing.viewpoints
+    : [viewRecordFrom({
+      keyframeId: existing.observedFromKeyframes?.[0],
+      pose: existing.lastPose,
+      orientation: existing.lastOrientation,
+      featureTrackIds: existing.featureTrackIds,
+    })];
+  const incomingView = viewRecordFrom({
+    keyframeId: incoming.observedFromKeyframes?.[incoming.observedFromKeyframes.length - 1],
+    pose: incoming.lastPose,
+    orientation: incoming.lastOrientation,
+    featureTrackIds: incoming.featureTrackIds,
+  });
+  const novelty = viewpointNovelty(existingViewpoints, incomingView);
+  const nextViewCount = (Number(existing.distinctViewCount ?? existing.viewpointCount) || 0) + (novelty.isNovel ? 1 : 0);
+  const nextObservationCount = (Number(existing.observationCount ?? existing.observations) || 0) + (Number(incoming.observationCount) || 1);
+  const nextViewpoints = novelty.isNovel
+    ? [...existingViewpoints, { ...incomingView, translationDelta: novelty.translationDelta, angleDelta: novelty.angleDelta, parallax: novelty.parallax }].slice(-directionalCoverageConfig.maxViewpointsPerCell)
+    : existingViewpoints;
   const nextDirection = normalize({
     x: existing.estimatedDirection.x + incoming.estimatedDirection.x,
     y: existing.estimatedDirection.y + incoming.estimatedDirection.y,
@@ -401,19 +615,20 @@ function mergeObservation(observations, incoming) {
     },
     structuralImportance: Math.max(existing.structuralImportance, incoming.structuralImportance),
     structuralType: existing.structuralType === 'OBSERVED_REGION' ? incoming.structuralType : existing.structuralType,
-    featureDensity: ((existing.featureDensity * existing.viewpointCount) + incoming.featureDensity) / nextViewCount,
+    featureDensity: ((existing.featureDensity * Math.max(1, Number(existing.observationCount) || 1)) + incoming.featureDensity) / Math.max(1, nextObservationCount),
     viewpointCount: nextViewCount,
-    parallaxScore: Math.max(existing.parallaxScore, clamp(displacement / 0.45, 0, 1)),
-    viewpointDiversity: calculateViewpointDiversity([
-      ...(existing.viewpoints || []),
-      { pose: existing.lastPose, orientation: existing.lastOrientation },
-      { pose: incoming.lastPose, orientation: incoming.lastOrientation },
-    ]),
-    coverageConfidence: clamp(existing.coverageConfidence + (incoming.coverageConfidence * 0.35) + (displacement * 0.15), 0, 1),
+    distinctViewCount: nextViewCount,
+    observationCount: nextObservationCount,
+    physicalViewCount: (Number(existing.physicalViewCount) || 0) + (novelty.physicalMovement ? 1 : 0),
+    parallaxScore: Math.max(existing.parallaxScore, clamp(displacement / 0.45, 0, 1), novelty.parallax),
+    viewpointDiversity: calculateViewpointDiversity(nextViewpoints),
+    coverageConfidence: clamp(Math.max(Number(existing.coverageConfidence) || 0, Number(incoming.coverageConfidence) || 0), 0, 1),
     lastPose: incoming.lastPose,
     lastOrientation: incoming.lastOrientation,
-    viewpoints: [...(existing.viewpoints || []), { pose: incoming.lastPose, orientation: incoming.lastOrientation }].slice(-12),
+    viewpoints: nextViewpoints,
   };
+  next.observations = nextObservationCount;
+  next.coverage = clamp((nextViewCount / 3) * 0.42 + (next.parallaxScore * 0.33) + (next.featureDensity * 0.25), 0, 1);
   return observations.map((observation, index) => index === matchIndex ? next : observation);
 }
 
@@ -423,7 +638,8 @@ export function addSpatialObservations(existingObservations = [], incomingObserv
 
 function targetStatus(target) {
   if (target.source === 'INFERRED') return 'INFERABLE';
-  if (target.viewpointCount >= observedTargetConfig.sufficientViewpoints && target.parallaxScore >= observedTargetConfig.sufficientParallax) return 'SUFFICIENT';
+  if ((target.distinctViewCount ?? target.viewpointCount) >= observedTargetConfig.sufficientViewpoints
+    && target.parallaxScore >= observedTargetConfig.sufficientParallax) return 'SUFFICIENT';
   if (target.attempts >= observedTargetConfig.lowTextureAttempts && target.featureDensity < observedTargetConfig.lowTextureFeatureDensity) return 'LOW_TEXTURE';
   return target.viewpointCount > 0 ? 'PARTIAL' : 'UNSEEN';
 }
@@ -499,7 +715,8 @@ function targetFromObservation(observation, index) {
     estimatedDirection: observation.estimatedDirection,
     estimatedWorldCenter: observation.estimatedWorldCenter,
     estimatedNormal: observation.estimatedDirection,
-    viewpointCount: observation.viewpointCount,
+    viewpointCount: observation.distinctViewCount ?? observation.viewpointCount,
+    distinctViewCount: observation.distinctViewCount ?? observation.viewpointCount,
     viewpointDiversity: observation.viewpointDiversity,
     parallaxScore: observation.parallaxScore,
     featureDensity: observation.featureDensity,
@@ -510,8 +727,10 @@ function targetFromObservation(observation, index) {
     screenBounds: observationBounds,
     screenPosition: { x: observationBounds.x + (observationBounds.width / 2), y: observationBounds.y + (observationBounds.height / 2) },
     currentlyVisible: false,
-    observations: observation.viewpointCount,
-    observationCount: observation.viewpointCount,
+    observations: observation.observationCount ?? observation.viewpointCount,
+    observationCount: observation.observationCount ?? observation.viewpointCount,
+    physicalViewCount: observation.physicalViewCount || 0,
+    translationViewCount: observation.physicalViewCount || 0,
     acceptedKeyframeIds: observation.observedFromKeyframes,
     cameraPoses: [],
     usefulViews: 0,
@@ -629,6 +848,175 @@ export function projectCoverageOverlayRegions(regions = [], orientation, pose, d
     .sort((first, second) => ((second.screenBounds.width * second.screenBounds.height) - (first.screenBounds.width * first.screenBounds.height))
       || second.blueOpacity - first.blueOpacity)
     .slice(0, settings.maxVisibleRegions);
+}
+
+function displayBoundsForDirectionalCell(cell, orientation, pose, displayTransform, config) {
+  const currentHeading = headingFor(orientation, pose) ?? 0;
+  const horizontal = signedAngleDistance(currentHeading, cell.yaw);
+  const pitchDelta = finite(cell.pitch) - pitchFor(orientation);
+  const width = clamp(finite(cell.yawWidth, config.yawBinDegrees) / HORIZONTAL_FOV_DEGREES, 0.16, 0.42);
+  const height = clamp(finite(cell.pitchHeight, 0.32) / (VERTICAL_FOV_DEGREES / 90), 0.18, 0.7);
+  const bounds = {
+    x: 0.5 + (horizontal / HORIZONTAL_FOV_DEGREES) - (width / 2),
+    y: 0.5 - (pitchDelta / (VERTICAL_FOV_DEGREES / 90)) - (height / 2),
+    width,
+    height,
+  };
+  const visible = Math.abs(horizontal) <= ((HORIZONTAL_FOV_DEGREES / 2) + (finite(cell.yawWidth, config.yawBinDegrees) / 2))
+    && Math.abs(pitchDelta) <= (((VERTICAL_FOV_DEGREES / 90) / 2) + (finite(cell.pitchHeight, 0.32) / 2));
+  return {
+    screenBounds: displayBoundsForNormalizedBounds(bounds, displayTransform),
+    screenPosition: normalizedToDisplay({ x: bounds.x + (bounds.width / 2), y: bounds.y + (bounds.height / 2) }, displayTransform),
+    currentlyVisible: visible,
+    screenOverlap: visible ? boundsOverlap(bounds) : 0,
+    visibilityReason: visible ? null : 'OUTSIDE_FRUSTUM',
+  };
+}
+
+export function projectDirectionalCoverageCells(cells = [], orientation, pose, displayTransform = null, config = directionalCoverageConfig) {
+  const settings = { ...directionalCoverageConfig, ...coverageOverlayConfig, ...(config || {}) };
+  return (Array.isArray(cells) ? cells : [])
+    .map((cell) => {
+      const projection = displayBoundsForDirectionalCell(cell, orientation, pose, displayTransform, settings);
+      const screenBounds = clipDisplayBounds(projection.screenBounds);
+      return {
+        ...cell,
+        ...projection,
+        screenBounds,
+        blueOpacity: blueCoverageOpacity(cell, settings),
+      };
+    })
+    .filter((cell) => cell.currentlyVisible && cell.screenBounds?.width > 0 && cell.screenBounds?.height > 0)
+    // Keep the most incomplete visible sectors first so guidance placement and
+    // debug inspection both follow the strongest real coverage gap.
+    .sort((first, second) => second.blueOpacity - first.blueOpacity
+      || ((second.screenBounds.width * second.screenBounds.height) - (first.screenBounds.width * first.screenBounds.height))
+      || first.id.localeCompare(second.id))
+    .slice(0, settings.maxVisibleCells);
+}
+
+function featureDensityForBounds(analysis, bounds) {
+  const points = Array.isArray(analysis?.featurePointsDisplay) ? analysis.featurePointsDisplay : [];
+  if (!bounds || points.length === 0) return clamp((Number(analysis?.featureCount) || 0) / 850, 0, 1);
+  const inside = points.filter((point) => point.x >= bounds.x
+    && point.x <= bounds.x + bounds.width
+    && point.y >= bounds.y
+    && point.y <= bounds.y + bounds.height).length;
+  return clamp(inside / 24, 0, 1);
+}
+
+function directionalCellStatus(cell, config) {
+  const distinctViews = Number(cell.distinctViewCount ?? cell.viewpointCount) || 0;
+  const physicalViews = Number(cell.physicalViewCount ?? cell.translationViewCount) || 0;
+  if (distinctViews >= 2
+    && (physicalViews >= 1 || Number(cell.coverageConfidence) >= config.clearConfidence)
+    && Number(cell.coverage) >= config.clearCoverage) return 'SUFFICIENT';
+  return distinctViews > 0 ? 'PARTIAL' : 'UNSEEN';
+}
+
+function directionalCoverageScore(cell, confidence) {
+  const distinctViews = Number(cell.distinctViewCount ?? cell.viewpointCount) || 0;
+  const physicalViews = Number(cell.physicalViewCount ?? cell.translationViewCount) || 0;
+  const viewScore = clamp(distinctViews / 3, 0, 1) * 0.45;
+  const physicalScore = clamp(physicalViews / 2, 0, 1) * 0.25;
+  const parallaxScore = clamp(Number(cell.parallaxScore) || 0, 0, 1) * 0.15;
+  const confidenceScore = clamp(confidence, 0, 1) * 0.15;
+  return clamp(viewScore + physicalScore + parallaxScore + confidenceScore, 0, 1);
+}
+
+export function updateDirectionalCoverageGrid(previousCells = [], {
+  referenceHeading = 0,
+  orientation,
+  pose,
+  analysis,
+  keyframeId,
+  accepted = false,
+  observedAt = Date.now(),
+  featureTrackIds = [],
+  config = directionalCoverageConfig,
+} = {}) {
+  const settings = { ...directionalCoverageConfig, ...(config || {}) };
+  const cells = Array.isArray(previousCells) && previousCells.length > 0
+    ? previousCells
+    : createDirectionalCoverageGrid(referenceHeading, settings);
+  const projected = projectDirectionalCoverageCells(cells, orientation, pose, analysis?.displayTransform, settings);
+  if (!accepted || !analysis) return {
+    cells,
+    visibleCellIds: projected.filter((cell) => cell.currentlyVisible).map((cell) => cell.id),
+    acceptedDistinctViewCount: 0,
+    novelty: [],
+  };
+
+  const visibleIds = new Set(projected.filter((cell) => cell.currentlyVisible).map((cell) => cell.id));
+  const novelty = [];
+  const nextCells = cells.map((cell) => {
+    if (!visibleIds.has(cell.id)) return cell;
+    const projectedCell = projected.find((candidate) => candidate.id === cell.id);
+    const localDensity = featureDensityForBounds(analysis, projectedCell?.screenBounds);
+    const confidence = clamp(
+      (Number(analysis.qualityScore) || 0) * 0.35
+        + (Number(analysis.featureTrackingQuality) || 0) * 0.25
+        + localDensity * 0.3
+        + (Number(analysis.trackedFeatureCount) || 0) / 850 * 0.1,
+      0,
+      1,
+    );
+    const previousViewpoints = Array.isArray(cell.viewpoints) ? cell.viewpoints : [];
+    const nextView = viewRecordFrom({
+      keyframeId,
+      pose,
+      orientation,
+      featureTrackIds,
+      translationDelta: 0,
+      angleDelta: 0,
+      parallax: 0,
+    });
+    const viewNovelty = viewpointNovelty(previousViewpoints, nextView, settings);
+    novelty.push({ cellId: cell.id, ...viewNovelty });
+    const nextObservationCount = (Number(cell.observationCount) || 0) + 1;
+    if (!viewNovelty.isNovel) {
+      return {
+        ...cell,
+        observationCount: nextObservationCount,
+        confidence: Math.max(Number(cell.confidence) || 0, confidence),
+        coverageConfidence: Math.max(Number(cell.coverageConfidence) || 0, confidence),
+        lastSeenAt: observedAt,
+      };
+    }
+    const nextViewRecord = {
+      ...nextView,
+      translationDelta: viewNovelty.translationDelta,
+      angleDelta: viewNovelty.angleDelta,
+      parallax: viewNovelty.parallax,
+      timestamp: observedAt,
+    };
+    const viewpoints = [...previousViewpoints, nextViewRecord].slice(-settings.maxViewpointsPerCell);
+    const distinctViewCount = (Number(cell.distinctViewCount ?? cell.viewpointCount) || 0) + 1;
+    const physicalViewCount = (Number(cell.physicalViewCount ?? cell.translationViewCount) || 0) + (viewNovelty.physicalMovement ? 1 : 0);
+    const nextCell = {
+      ...cell,
+      observationCount: nextObservationCount,
+      distinctViewCount,
+      viewpointCount: distinctViewCount,
+      physicalViewCount,
+      translationViewCount: physicalViewCount,
+      angularViewCount: (Number(cell.angularViewCount) || 0) + (viewNovelty.physicalMovement ? 0 : 1),
+      viewpoints,
+      confidence: Math.max(Number(cell.confidence) || 0, confidence),
+      coverageConfidence: Math.max(Number(cell.coverageConfidence) || 0, confidence),
+      parallaxScore: Math.max(Number(cell.parallaxScore) || 0, viewNovelty.parallax),
+      lastSeenAt: observedAt,
+    };
+    const coverage = directionalCoverageScore(nextCell, confidence);
+    const scoredCell = { ...nextCell, coverage };
+    return { ...scoredCell, status: directionalCellStatus(scoredCell, settings) };
+  });
+  return {
+    cells: nextCells,
+    visibleCellIds: [...visibleIds],
+    acceptedDistinctViewCount: nextCells.reduce((sum, cell, index) => sum + (cell.distinctViewCount > (cells[index].distinctViewCount || 0) ? 1 : 0), 0),
+    novelty,
+  };
 }
 
 export function hasObservedNeighborEvidence(targets = [], target) {

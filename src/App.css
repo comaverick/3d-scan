@@ -125,7 +125,8 @@ button { font: inherit; }
 .spatial-target-overlay::before { top: -1px; left: -1px; border-top: 2px solid; border-left: 2px solid; border-radius: 7px 0 0; }
 .spatial-target-overlay::after { right: -1px; bottom: -1px; border-right: 2px solid; border-bottom: 2px solid; border-radius: 0 0 7px; }
 .spatial-target-overlay span { position: absolute; top: 7px; left: 8px; padding: 4px 6px; background: rgba(15, 16, 14, 0.7); color: var(--green); font-family: 'SFMono-Regular', Consolas, monospace; font-size: 8px; letter-spacing: .08em; white-space: nowrap; }
-.scan-coverage-overlay, .scanner-initial-mapping-tint { position: absolute; z-index: 1; inset: 0; pointer-events: none; }
+.scan-coverage-overlay, .scanner-initial-mapping-tint, .scanner-spatial-overlay { position: absolute; z-index: 1; inset: 0; pointer-events: none; }
+.scanner-spatial-overlay { display: block; width: 100%; height: 100%; }
 .scanner-initial-mapping-tint { background: rgba(30, 110, 255, .18); }
 .coverage-blue-region { position: absolute; box-sizing: border-box; border: 1px solid rgba(124, 197, 255, .34); background: rgb(30, 110, 255); transition: opacity 240ms ease; }
 .coverage-overlay-debug { position: absolute; z-index: 2; top: 58px; right: 18px; display: grid; gap: 3px; width: min(360px, calc(100% - 36px)); max-height: calc(100% - 120px); overflow: auto; padding: 8px 10px; border: 1px solid rgba(124, 197, 255, .5); border-radius: 8px; background: rgba(15, 16, 14, .84); color: var(--paper-muted); font: 9px/1.35 'SFMono-Regular', Consolas, monospace; }
@@ -307,14 +308,14 @@ button:focus-visible { outline: 2px solid var(--accent-hot); outline-offset: 3px
   display: block;
   width: calc(100% + 68px);
   max-width: none;
-  min-height: 100dvh;
+  min-height: calc(100dvh - 84px);
   margin: 0 -34px;
 }
-.workspace-live-compact .camera-column { min-height: 100dvh; }
+.workspace-live-compact .camera-column { min-height: calc(100dvh - 84px); }
 .workspace-live-compact .camera-frame {
   width: 100%;
-  height: 100dvh;
-  min-height: 100dvh;
+  height: calc(100dvh - 84px);
+  min-height: calc(100dvh - 84px);
   aspect-ratio: auto;
   border: 0;
   border-radius: 0;
@@ -330,7 +331,7 @@ button:focus-visible { outline: 2px solid var(--accent-hot); outline-offset: 3px
 .scanner-live-hud {
   position: absolute;
   z-index: 6;
-  top: max(72px, calc(58px + env(safe-area-inset-top, 0px)));
+  top: max(16px, env(safe-area-inset-top, 0px));
   left: 16px;
   width: min(260px, calc(100% - 32px));
   min-height: 44px;
@@ -397,10 +398,12 @@ button:focus-visible { outline: 2px solid var(--accent-hot); outline-offset: 3px
 
 @media (max-width: 640px) {
   .workspace-live-compact { width: 100%; margin: 0; }
-  .workspace-live-compact .camera-frame { height: 100dvh; min-height: 100dvh; }
-  .scanner-live-hud { top: calc(72px + env(safe-area-inset-top, 0px)); left: 16px; }
-  .scanner-mapping-toast { top: calc(130px + env(safe-area-inset-top, 0px)); }
-  .scanner-compact-guidance-top { top: calc(156px + env(safe-area-inset-top, 0px)); }
+  .workspace-live-compact { min-height: calc(100dvh - 72px); }
+  .workspace-live-compact .camera-column { min-height: calc(100dvh - 72px); }
+  .workspace-live-compact .camera-frame { height: calc(100dvh - 72px); min-height: calc(100dvh - 72px); }
+  .scanner-live-hud { top: max(12px, env(safe-area-inset-top, 0px)); left: 16px; }
+  .scanner-mapping-toast { top: calc(76px + env(safe-area-inset-top, 0px)); }
+  .scanner-compact-guidance-top { top: calc(100px + env(safe-area-inset-top, 0px)); }
   .scanner-compact-guidance { max-width: 70vw; }
   .scanner-compact-controls { right: 16px; left: 16px; }
 }

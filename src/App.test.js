@@ -1,5 +1,5 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
-import App, { blueCoverageOpacity, canManuallyFinishScan, calculateScanProgress, calculateScanReadiness, chooseGuidancePlacement, compactGuidanceFor, countFeaturesInRegion, coverageOverlayRegionsFor, createCameraDisplayTransform, createGuidanceController, createInitialScanState, determineNextAction, friendlyReconstructionError, isTargetStalled, normalizedToDisplay, ProcessingScreen, reconstructionProgressSteps, reconstructionStatusLabel, recordFrameEvaluation, stabilizeScanProgress, targetPriorityForScan, updateCoverageFromFrame, validateTargetGeometry } from './App';
+import App, { blueCoverageOpacity, canManuallyFinishScan, calculateScanProgress, calculateScanReadiness, chooseGuidancePlacement, compactGuidanceFor, continuousScanInstructionFor, countFeaturesInRegion, coverageOverlayRegionsFor, createCameraDisplayTransform, createDirectionalCoverageGrid, createGuidanceController, createInitialScanState, determineNextAction, distinctViewpointsFromFrames, friendlyReconstructionError, isTargetStalled, normalizedToDisplay, ProcessingScreen, projectDirectionalCoverageCells, reconstructionProgressSteps, reconstructionStatusLabel, recordFrameEvaluation, stabilizeScanProgress, summarizeDirectionalCoverage, targetPriorityForScan, updateCoverageFromFrame, updateDirectionalCoverageGrid, validateTargetGeometry, viewpointNovelty } from './App';
 
 const goodAnalysis = {
   qualityScore: 0.82,
@@ -29,9 +29,9 @@ test('starts with initial mapping guidance and no target request', async () => {
   const { container } = render(<App />);
   fireEvent.click(screen.getByRole('button', { name: /start scan/i }));
 
-  await waitFor(() => expect(screen.getByText('Slowly look around the room')).toBeInTheDocument());
+  await waitFor(() => expect(screen.getByText('Move slowly around the room')).toBeInTheDocument());
   expect(screen.queryByRole('region', { name: /measured scan coverage/i })).not.toBeInTheDocument();
-  expect(container.querySelector('.scanner-initial-mapping-tint')).toBeInTheDocument();
+  expect(container.querySelector('.scanner-spatial-overlay')).toBeInTheDocument();
   expect(container.querySelector('.scanner-live-hud')).toBeInTheDocument();
   expect(container.querySelector('.scanner-compact-guidance')).toBeInTheDocument();
   expect(screen.getByRole('button', { name: /pause scan/i })).toBeInTheDocument();
@@ -41,7 +41,7 @@ test('starts with initial mapping guidance and no target request', async () => {
 test('insufficient live data keeps guidance in initial mapping', () => {
   const action = determineNextAction({ ...createInitialScanState(), framesEvaluated: 4, acceptedFrames: 4 });
   expect(action.type).toBe('INITIAL_MAPPING');
-  expect(action.instruction).toBe('Slowly look around the room.');
+  expect(action.instruction).toBe('Move slowly around the room.');
 });
 
 test('rejected frames do not add keyframes or spatial observations', () => {
@@ -271,4 +271,171 @@ test('screen-space diagnostic target recognizes its first accepted observation',
 
 test('invalid target geometry reports an explicit diagnostic error', () => {
   expect(validateTargetGeometry({ id: 'bad', yaw: Number.NaN, pitch: 0 })).toEqual({ valid: false, reason: 'INVALID_TARGET_COORDINATES' });
+});
+
+test('adaptive guidance defaults to the blue coverage model', () => {
+  expect(compactGuidanceFor({ type: 'SCAN_LOW_COVERAGE_REGION' }, { phase: 'ADAPTIVE_COVERAGE' }).text).toBe('Scan the blue areas');
+});
+
+test('continuous user guidance strips diagnostic target chasing', () => {
+  const state = {
+    ...createInitialScanState(),
+    phase: 'ADAPTIVE_COVERAGE',
+    framesEvaluated: 4,
+    acceptedFrames: 4,
+    lowCoverageRegions: [{ id: 'corner-1', semanticType: 'WALL_CORNER', status: 'PARTIAL', priority: 1 }],
+  };
+  const diagnosticInstruction = determineNextAction(state);
+  expect(diagnosticInstruction.targetRegion).toBeDefined();
+  const userInstruction = continuousScanInstructionFor(state, diagnosticInstruction);
+  expect(userInstruction.targetRegion).toBeUndefined();
+  expect(compactGuidanceFor(userInstruction, state).text).toBe('Scan the blue areas');
+});
+
+test('directional grid starts with unknown blue cells', () => {
+  const cells = createDirectionalCoverageGrid(0);
+  const visible = projectDirectionalCoverageCells(cells, { heading: 0, pitch: 0 }, { x: 0, y: 1.4, z: 0 });
+  expect(cells).toHaveLength(54);
+  expect(visible.some((cell) => cell.status === 'UNSEEN' && cell.blueOpacity >= 0.55)).toBe(true);
+});
+
+test('duplicate poses remain one distinct viewpoint while sideways movement adds views', () => {
+  const frames = Array.from({ length: 20 }, (_, index) => ({
+    id: `frame-${index}`,
+    pose: { x: 0, y: 1.4, z: 0 },
+    orientation: { heading: 0, pitch: 0 },
+  }));
+  expect(distinctViewpointsFromFrames(frames)).toHaveLength(1);
+
+  const movedFrames = [0, 0.2, 0.4, 0.6].map((x, index) => ({
+    id: `moved-${index}`,
+    pose: { x, y: 1.4, z: 0 },
+    orientation: { heading: 0, pitch: 0 },
+  }));
+  expect(distinctViewpointsFromFrames(movedFrames).length).toBeGreaterThan(1);
+  expect(viewpointNovelty(distinctViewpointsFromFrames(frames), { pose: { x: 0.2, y: 1.4, z: 0 }, heading: 0, pitch: 0 }).isNovel).toBe(true);
+});
+
+test('one accepted keyframe improves multiple visible directional cells', () => {
+  const result = updateDirectionalCoverageGrid([], {
+    referenceHeading: 0,
+    orientation: { heading: 0, pitch: 0 },
+    pose: { x: 0, y: 1.4, z: 0 },
+    analysis: goodAnalysis,
+    keyframeId: 'keyframe-1',
+    accepted: true,
+    observedAt: 1000,
+    featureTrackIds: goodAnalysis.featureTrackIds,
+  });
+  const observedCells = result.cells.filter((cell) => cell.observationCount > 0);
+  expect(observedCells.length).toBeGreaterThan(1);
+  expect(observedCells.every((cell) => cell.distinctViewCount === 1)).toBe(true);
+});
+
+test('directional coverage becomes lighter with real movement and clear after strong multi-view evidence', () => {
+  let cells = [];
+  [0, 0.2, 0.4].forEach((x, index) => {
+    cells = updateDirectionalCoverageGrid(cells, {
+      referenceHeading: 0,
+      orientation: { heading: 0, pitch: 0 },
+      pose: { x, y: 1.4, z: 0 },
+      analysis: goodAnalysis,
+      keyframeId: `keyframe-${index + 1}`,
+      accepted: true,
+      observedAt: (index + 1) * 1000,
+      featureTrackIds: goodAnalysis.featureTrackIds,
+    }).cells;
+  });
+  const middle = cells.find((cell) => cell.band === 'middle' && cell.yaw === 0);
+  expect(middle.distinctViewCount).toBe(3);
+  expect(middle.status).toBe('SUFFICIENT');
+  expect(blueCoverageOpacity(middle)).toBe(0);
+});
+
+test('rotating in place does not clear directional cells', () => {
+  let cells = [];
+  [0, 45, 90, 135, 180, 225, 270, 315].forEach((heading, index) => {
+    cells = updateDirectionalCoverageGrid(cells, {
+      referenceHeading: 0,
+      orientation: { heading, pitch: 0 },
+      pose: { x: 0, y: 1.4, z: 0 },
+      analysis: goodAnalysis,
+      keyframeId: `rotation-${index + 1}`,
+      accepted: true,
+      observedAt: (index + 1) * 1000,
+      featureTrackIds: goodAnalysis.featureTrackIds,
+    }).cells;
+  });
+  expect(cells.some((cell) => cell.status === 'SUFFICIENT')).toBe(false);
+  expect(Math.max(...cells.map((cell) => cell.coverage))).toBeLessThan(0.78);
+});
+
+test('continuous region updates do not depend on activeTargetId', () => {
+  const makeRegion = (id, yaw) => ({
+    id,
+    source: 'OBSERVED',
+    definitionSource: 'OBSERVED_SPATIAL',
+    structuralImportance: 0.9,
+    semanticType: 'WALL_CORNER',
+    estimatedDirection: { x: Math.sin((yaw * Math.PI) / 180), y: 0, z: -Math.cos((yaw * Math.PI) / 180) },
+    estimatedWorldCenter: { x: yaw / 100, y: 1.4, z: -1.6 },
+    featureTrackIds: ['ft-1', 'ft-2', 'ft-3'],
+    observedFromKeyframes: ['initial-1'],
+    featureDensity: 0.7,
+    coverage: 0,
+    coverageConfidence: 0,
+    viewpointCount: 0,
+    distinctViewCount: 0,
+    observationCount: 0,
+    parallaxScore: 0,
+    status: 'UNSEEN',
+    skipped: false,
+  });
+  const state = {
+    ...createInitialScanState(),
+    phase: 'ADAPTIVE_COVERAGE',
+    coverageRegions: [makeRegion('region-a', 0), makeRegion('region-b', 20)],
+    activeTargetId: 'region-a',
+  };
+  const next = updateCoverageFromFrame(state, { heading: 0, pitch: 0 }, { x: 0, y: 1.4, z: 0 }, goodAnalysis, 0, {
+    accepted: true,
+    keyframeId: 'keyframe-1',
+    activeTargetId: 'region-a',
+    featureTrackIds: goodAnalysis.featureTrackIds,
+  });
+  expect(next.coverageRegions.filter((region) => region.observationCount > 0)).toHaveLength(2);
+});
+
+test('duplicate frames cannot saturate readiness progress', () => {
+  const progress = calculateScanProgress({
+    phase: 'ADAPTIVE_COVERAGE',
+    structuralCoverage: 0.82,
+    viewpointDiversity: 0.7,
+    acceptedFrames: 24,
+    distinctViewCount: 1,
+    reconstructionConfidence: 0.75,
+    scanReady: false,
+    scanReadiness: { ready: false },
+  });
+  expect(progress).toBeLessThan(0.99);
+});
+
+test('tracking loss preserves directional coverage', () => {
+  let cells = updateDirectionalCoverageGrid([], {
+    orientation: { heading: 0, pitch: 0 },
+    pose: { x: 0.2, y: 1.4, z: 0 },
+    analysis: goodAnalysis,
+    keyframeId: 'keyframe-1',
+    accepted: true,
+    featureTrackIds: goodAnalysis.featureTrackIds,
+  }).cells;
+  const state = {
+    ...createInitialScanState(),
+    phase: 'ADAPTIVE_COVERAGE',
+    directionalCells: cells,
+    directionalCoverage: summarizeDirectionalCoverage(cells).coverage,
+  };
+  const before = cells.map((cell) => cell.coverage);
+  const next = updateCoverageFromFrame(state, { heading: 0, pitch: 0 }, { x: 0.2, y: 1.4, z: 0 }, goodAnalysis, 0, { accepted: false });
+  expect(next.directionalCells.map((cell) => cell.coverage)).toEqual(before);
 });
