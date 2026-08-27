@@ -279,6 +279,92 @@ button:focus-visible { outline: 2px solid var(--accent-hot); outline-offset: 3px
 .reconstruction-action .primary-button { width: 100%; }
 .customizer-disclaimer { margin: 12px 0 0; color: var(--ink-muted); font-size: 10px; line-height: 1.45; }
 
+/* Camera-first live scan surface. The detailed panels stay available to
+   debug mode, while normal scanning keeps the room visible and the guidance
+   small enough to yield to the target. */
+.workspace-live-compact {
+  position: relative;
+  display: block;
+  width: calc(100% + 68px);
+  max-width: none;
+  min-height: 100dvh;
+  margin: 0 -34px;
+}
+.workspace-live-compact .camera-column { min-height: 100dvh; }
+.workspace-live-compact .camera-frame {
+  width: 100%;
+  height: 100dvh;
+  min-height: 100dvh;
+  aspect-ratio: auto;
+  border: 0;
+  border-radius: 0;
+}
+.workspace-live-compact .control-column,
+.workspace-live-compact .camera-footer,
+.workspace-live-compact .camera-meta-top,
+.workspace-live-compact .camera-meta-bottom,
+.workspace-live-compact .target-reticle { display: none; }
+.workspace-live-compact .camera-notice { top: 50%; bottom: auto; }
+.workspace-live-compact .spatial-target-overlay { z-index: 3; }
+
+.scanner-live-hud {
+  position: absolute;
+  z-index: 6;
+  top: max(72px, calc(58px + env(safe-area-inset-top, 0px)));
+  left: 16px;
+  width: min(260px, calc(100% - 32px));
+  min-height: 44px;
+  padding: 9px 12px 8px;
+  border: 1px solid rgba(241, 238, 230, .22);
+  border-radius: 12px;
+  background: rgba(21, 21, 19, .48);
+  box-shadow: 0 8px 24px rgba(15, 16, 14, .12);
+  backdrop-filter: blur(12px);
+  pointer-events: none;
+}
+.scanner-live-hud-heading { display: flex; justify-content: space-between; align-items: center; color: var(--paper-muted); font-size: 11px; }
+.scanner-live-hud-heading strong { color: var(--paper); font-family: 'SFMono-Regular', Consolas, monospace; font-size: 14px; font-weight: 600; }
+.scanner-live-progress { height: 3px; margin-top: 7px; overflow: hidden; border-radius: 99px; background: rgba(241, 238, 230, .16); }
+.scanner-live-progress span { display: block; height: 100%; border-radius: inherit; background: var(--accent-hot); transition: width 450ms cubic-bezier(.22, 1, .36, 1); }
+.scanner-mapping-toast { position: absolute; z-index: 7; top: calc(132px + env(safe-area-inset-top, 0px)); left: 50%; transform: translateX(-50%); padding: 7px 10px; border: 1px solid rgba(151, 216, 177, .4); border-radius: 999px; background: rgba(21, 21, 19, .62); color: var(--green); font-size: 11px; white-space: nowrap; backdrop-filter: blur(10px); pointer-events: none; }
+.scanner-compact-guidance {
+  position: absolute;
+  z-index: 6;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  width: max-content;
+  max-width: 70vw;
+  min-height: 40px;
+  padding: 8px 12px;
+  border: 1px solid rgba(241, 238, 230, .2);
+  border-radius: 12px;
+  background: rgba(21, 21, 19, .46);
+  color: var(--paper);
+  box-shadow: 0 8px 24px rgba(15, 16, 14, .1);
+  backdrop-filter: blur(12px);
+  pointer-events: none;
+  transition: top 180ms ease, right 180ms ease, bottom 180ms ease, left 180ms ease;
+}
+.scanner-compact-guidance-top { top: calc(150px + env(safe-area-inset-top, 0px)); left: 50%; transform: translateX(-50%); }
+.scanner-compact-guidance-bottom { bottom: calc(78px + env(safe-area-inset-bottom, 0px)); left: 50%; transform: translateX(-50%); }
+.scanner-compact-guidance-left { top: 50%; left: 14px; transform: translateY(-50%); }
+.scanner-compact-guidance-right { top: 50%; right: 14px; transform: translateY(-50%); }
+.scanner-compact-guidance-needs_small_correction { border-color: rgba(255, 194, 124, .42); }
+.scanner-compact-guidance-ready { border-color: rgba(151, 216, 177, .5); background: rgba(21, 21, 19, .54); }
+.scanner-compact-icon { display: grid; place-items: center; width: 22px; height: 22px; color: var(--accent-hot); font-size: 21px; line-height: 1; }
+.scanner-compact-guidance-ready .scanner-compact-icon { color: var(--green); }
+.scanner-compact-copy { display: grid; gap: 1px; min-width: 0; }
+.scanner-compact-copy strong { overflow: hidden; font-size: 12px; font-weight: 600; line-height: 1.15; text-overflow: ellipsis; white-space: nowrap; }
+.scanner-compact-copy small { color: var(--ink-muted); font-size: 9px; line-height: 1.1; }
+.scanner-compact-controls { position: absolute; z-index: 7; right: 16px; bottom: calc(14px + env(safe-area-inset-bottom, 0px)); left: 16px; display: flex; align-items: center; justify-content: flex-end; gap: 8px; pointer-events: auto; }
+.scanner-compact-controls button { min-height: 36px; padding: 0 12px; border-radius: 10px; cursor: pointer; font-size: 11px; font-weight: 650; }
+.scanner-compact-secondary { border: 1px solid rgba(241, 238, 230, .25); background: rgba(21, 21, 19, .52); color: var(--paper-muted); backdrop-filter: blur(10px); }
+.scanner-compact-finish { border: 1px solid rgba(240, 168, 90, .6); background: rgba(240, 168, 90, .9); color: var(--ink); }
+.scanner-compact-finish:disabled { cursor: not-allowed; opacity: .42; }
+.scanner-compact-controls-ready .scanner-compact-finish { border-color: rgba(151, 216, 177, .65); background: rgba(151, 216, 177, .92); }
+.scanner-compact-secondary:not(:disabled):active, .scanner-compact-finish:not(:disabled):active { transform: translateY(1px); }
+
 @media (max-width: 1060px) {
   .app-shell { padding: 0 22px 28px; }
   .workspace { grid-template-columns: 1fr; max-width: 760px; }
@@ -287,6 +373,16 @@ button:focus-visible { outline: 2px solid var(--accent-hot); outline-offset: 3px
   .camera-frame { min-height: 0; }
   .control-column { padding-right: 0; }
   .control-header h1 { max-width: 520px; }
+}
+
+@media (max-width: 640px) {
+  .workspace-live-compact { width: 100%; margin: 0; }
+  .workspace-live-compact .camera-frame { height: 100dvh; min-height: 100dvh; }
+  .scanner-live-hud { top: calc(72px + env(safe-area-inset-top, 0px)); left: 16px; }
+  .scanner-mapping-toast { top: calc(130px + env(safe-area-inset-top, 0px)); }
+  .scanner-compact-guidance-top { top: calc(156px + env(safe-area-inset-top, 0px)); }
+  .scanner-compact-guidance { max-width: 70vw; }
+  .scanner-compact-controls { right: 16px; left: 16px; }
 }
 
 @media (max-width: 640px) {
@@ -443,6 +539,9 @@ button:focus-visible { outline: 2px solid var(--accent-hot); outline-offset: 3px
     pointer-events: auto;
   }
 }
+
+.workspace-live-compact .control-column { display: none; }
+.workspace-live-compact .camera-footer { display: none; }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; }

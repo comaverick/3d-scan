@@ -1,5 +1,5 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
-import App, { canManuallyFinishScan, calculateScanProgress, calculateScanReadiness, countFeaturesInRegion, createCameraDisplayTransform, createGuidanceController, createInitialScanState, determineNextAction, isTargetStalled, normalizedToDisplay, recordFrameEvaluation, updateCoverageFromFrame, validateTargetGeometry } from './App';
+import App, { canManuallyFinishScan, calculateScanProgress, calculateScanReadiness, chooseGuidancePlacement, compactGuidanceFor, countFeaturesInRegion, createCameraDisplayTransform, createGuidanceController, createInitialScanState, determineNextAction, isTargetStalled, normalizedToDisplay, recordFrameEvaluation, stabilizeScanProgress, updateCoverageFromFrame, validateTargetGeometry } from './App';
 
 const goodAnalysis = {
   qualityScore: 0.82,
@@ -68,6 +68,22 @@ test('readiness allows a usable scan without requiring 100 percent coverage', ()
   expect(readiness.coverage).toBeLessThan(1);
 });
 
+test('readiness does not trap a structurally useful scan on missing floor percentage', () => {
+  const readiness = calculateScanReadiness({
+    phase: 'ADAPTIVE_COVERAGE',
+    acceptedFrames: 24,
+    totalCoverage: 0.58,
+    wallCoverage: 0.62,
+    floorCoverage: 0,
+    viewpointDiversity: 0.25,
+    imageQuality: 0.78,
+    featureTrackingQuality: 0.8,
+  });
+
+  expect(readiness.ready).toBe(true);
+  expect(readiness.blockingRequirements.find((requirement) => requirement.key === 'floor').optional).toBe(true);
+});
+
 test('manual finish unlocks after a reasonable minimum even when the scan is not ready', () => {
   expect(canManuallyFinishScan({
     phase: 'ADAPTIVE_COVERAGE',
@@ -101,6 +117,45 @@ test('guidance changes immediately when tracking returns', () => {
 test('progress reflects useful structural, viewpoint, keyframe, and reconstruction evidence', () => {
   expect(calculateScanProgress({ structuralCoverage: 0.5, viewpointDiversity: 0.5, acceptedFrames: 18, reconstructionConfidence: 0.5 })).toBeCloseTo(0.5, 2);
   expect(calculateScanProgress({ structuralCoverage: 1, viewpointDiversity: 1, acceptedFrames: 36, reconstructionConfidence: 1 })).toBe(1);
+});
+
+test('display progress stays stable when a new target changes the computed denominator', () => {
+  const next = stabilizeScanProgress(
+    { phase: 'ADAPTIVE_COVERAGE', displayProgress: 0.79, scanProgress: 0.79 },
+    { phase: 'ADAPTIVE_COVERAGE', structuralCoverage: 0.48, viewpointDiversity: 0.5, acceptedFrames: 18, reconstructionConfidence: 0.5 },
+  );
+
+  expect(next.computedProgress).toBeLessThan(0.79);
+  expect(next.displayProgress).toBe(0.79);
+  expect(next.scanProgress).toBe(0.79);
+});
+
+test('compact guidance stays short and translates technical states into actions', () => {
+  const guidance = compactGuidanceFor({ type: 'MOVE_SIDEWAYS', reason: 'LOW_PARALLAX' }, { phase: 'ADAPTIVE_COVERAGE' });
+  expect(guidance.text).toBe('Move sideways');
+  expect(guidance.text.split(' ').length).toBeLessThanOrEqual(7);
+  expect(guidance.text).not.toMatch(/feature|parallax|track|coverage/i);
+});
+
+test('furniture targets wait until the optional furniture pass', () => {
+  const furniture = { id: 'furniture-1', semanticType: 'FURNITURE_OR_FRAME_EDGE', status: 'PARTIAL', priority: 0.9 };
+  const corner = { id: 'corner-1', semanticType: 'WALL_CORNER', status: 'PARTIAL', priority: 0.5 };
+  const structuralState = {
+    ...createInitialScanState(),
+    phase: 'ADAPTIVE_COVERAGE',
+    framesEvaluated: 1,
+    acceptedFrames: 1,
+    coverageRegions: [furniture, corner],
+    lowCoverageRegions: [furniture, corner],
+    scanReadiness: { ready: false },
+  };
+  expect(determineNextAction(structuralState).targetRegion.id).toBe('corner-1');
+  expect(determineNextAction({ ...structuralState, scanReady: true, furniturePassActive: true }).targetRegion.id).toBe('furniture-1');
+});
+
+test('guidance placement moves away from bottom and left targets', () => {
+  expect(chooseGuidancePlacement({ x: 0.4, y: 0.78, width: 0.2, height: 0.14 })).toBe('top');
+  expect(chooseGuidancePlacement({ x: 0.04, y: 0.42, width: 0.18, height: 0.16 })).toBe('right');
 });
 
 test('stalled target watchdog waits for a sustained period and meaningful local gain', () => {

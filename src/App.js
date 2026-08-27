@@ -534,7 +534,12 @@ function createInitialScanState() {
     relocalizationAttempts: 0,
     structuralCoverage: 0,
     scanProgress: 0,
+    computedProgress: 0,
+    displayProgress: 0,
     reconstructionConfidence: 0,
+    progressBlocker: 'accepted keyframes',
+    finishUnlocked: false,
+    furniturePassActive: false,
     visibleRegionIds: [],
     sceneUnderstanding: null,
     diagnosticTarget: diagnosticTargetForFrame(null, { pitch: null }, false),
@@ -560,6 +565,7 @@ function createInitialScanState() {
       structuralCoverage: 0,
       reconstructionConfidence: 0,
       ready: false,
+      blockingRequirements: [],
     },
     scanReady: false,
   };
@@ -917,6 +923,14 @@ function determineNextActionLegacy(scanState) {
 export function calculateScanReadiness(scanState) {
   if (scanState?.phase === SCANNER_PHASES.INITIAL_MAPPING) {
     const mapping = calculateInitialMappingReadiness(scanState);
+    const blockingRequirements = [
+      { key: 'acceptedKeyframes', label: 'accepted keyframes', pass: mapping.acceptedKeyframes >= mappingReadinessConfig.minimumAcceptedKeyframes, value: mapping.acceptedKeyframes, required: mappingReadinessConfig.minimumAcceptedKeyframes },
+      { key: 'trackedFeatures', label: 'tracked features', pass: mapping.trackedFeatures >= mappingReadinessConfig.minimumTrackedFeatures, value: mapping.trackedFeatures, required: mappingReadinessConfig.minimumTrackedFeatures },
+      { key: 'multiFrameFeatureTracks', label: 'multi-frame feature tracks', pass: mapping.multiFrameFeatureTracks >= mappingReadinessConfig.minimumMultiFrameFeatureTracks, value: mapping.multiFrameFeatureTracks, required: mappingReadinessConfig.minimumMultiFrameFeatureTracks },
+      { key: 'orientationCoverage', label: 'orientation coverage', pass: mapping.orientationCoverage >= mappingReadinessConfig.minimumOrientationCoverage, value: mapping.orientationCoverage, required: mappingReadinessConfig.minimumOrientationCoverage },
+      { key: 'viewpointDiversity', label: 'viewpoint diversity', pass: mapping.viewpointDiversity >= mappingReadinessConfig.minimumViewpointDiversity, value: mapping.viewpointDiversity, required: mappingReadinessConfig.minimumViewpointDiversity },
+      { key: 'successfulRelativePoses', label: 'successful relative poses', pass: mapping.successfulRelativePoses >= mappingReadinessConfig.minimumSuccessfulRelativePoses, value: mapping.successfulRelativePoses, required: mappingReadinessConfig.minimumSuccessfulRelativePoses },
+    ];
     return {
       coverage: 0,
       viewpointDiversity: mapping.viewpointDiversity,
@@ -926,6 +940,7 @@ export function calculateScanReadiness(scanState) {
       ready: mapping.ready,
       reason: mapping.reason,
       mapping,
+      blockingRequirements,
     };
   }
   const coverage = Number(scanState?.totalCoverage) || 0;
@@ -940,12 +955,19 @@ export function calculateScanReadiness(scanState) {
     0,
     1,
   );
-  const ready = acceptedKeyframes >= scannerReadinessConfig.readyAcceptedKeyframes
-    && coverage >= scannerReadinessConfig.readyStructuralCoverage
-    && wallCoverage >= scannerReadinessConfig.readyWallCoverage
-    && floorCoverage >= scannerReadinessConfig.readyFloorCoverage
-    && viewpointDiversity >= scannerReadinessConfig.readyViewpointDiversity
-    && reconstructionConfidence >= scannerReadinessConfig.readyReconstructionConfidence;
+  // Completion is based on stable room-shell evidence. Floor coverage remains
+  // useful context, but it must not be a hard gate that traps the user at the
+  // last few percent when the walls and viewpoints are already sufficient.
+  const blockingRequirements = [
+    { key: 'wallStructure', label: 'wall structure', pass: wallCoverage >= scannerReadinessConfig.readyWallCoverage, value: wallCoverage, required: scannerReadinessConfig.readyWallCoverage },
+    { key: 'floor', label: 'floor', pass: floorCoverage >= scannerReadinessConfig.readyFloorCoverage, value: floorCoverage, required: scannerReadinessConfig.readyFloorCoverage, optional: true },
+    { key: 'viewpointDiversity', label: 'viewpoint diversity', pass: viewpointDiversity >= scannerReadinessConfig.readyViewpointDiversity, value: viewpointDiversity, required: scannerReadinessConfig.readyViewpointDiversity },
+    { key: 'acceptedKeyframes', label: 'accepted keyframes', pass: acceptedKeyframes >= scannerReadinessConfig.readyAcceptedKeyframes, value: acceptedKeyframes, required: scannerReadinessConfig.readyAcceptedKeyframes },
+    { key: 'reconstructionConfidence', label: 'reconstruction confidence', pass: reconstructionConfidence >= scannerReadinessConfig.readyReconstructionConfidence, value: reconstructionConfidence, required: scannerReadinessConfig.readyReconstructionConfidence },
+    { key: 'remainingStructuralRegion', label: 'remaining structural region', pass: coverage >= scannerReadinessConfig.readyStructuralCoverage, value: coverage, required: scannerReadinessConfig.readyStructuralCoverage },
+    { key: 'optionalFurniture', label: 'optional furniture', pass: true, value: 'NOT REQUIRED', required: null, optional: true },
+  ];
+  const ready = blockingRequirements.filter((requirement) => !requirement.optional).every((requirement) => requirement.pass);
   return {
     coverage,
     viewpointDiversity,
@@ -953,6 +975,7 @@ export function calculateScanReadiness(scanState) {
     structuralCoverage: coverage,
     reconstructionConfidence,
     ready,
+    blockingRequirements,
   };
 }
 
@@ -961,7 +984,6 @@ export function canManuallyFinishScan(scanState) {
   return (Number(scanState?.acceptedFrames) || 0) >= scannerReadinessConfig.manualFinishAcceptedKeyframes
     && (Number(scanState?.totalCoverage) || 0) >= scannerReadinessConfig.manualFinishStructuralCoverage
     && (Number(scanState?.wallCoverage) || 0) >= scannerReadinessConfig.manualFinishWallCoverage
-    && (Number(scanState?.floorCoverage) || 0) >= scannerReadinessConfig.manualFinishFloorCoverage
     && (Number(scanState?.viewpointDiversity) || 0) >= scannerReadinessConfig.manualFinishViewpointDiversity;
 }
 
@@ -990,6 +1012,25 @@ export function calculateScanProgress(scanState) {
     0,
     1,
   );
+}
+
+export function stabilizeScanProgress(previousState, nextState) {
+  const computedProgress = calculateScanProgress(nextState);
+  const previousDisplayProgress = Number(previousState?.displayProgress ?? previousState?.scanProgress) || 0;
+  const displayProgress = nextState?.phase === SCANNER_PHASES.INITIAL_MAPPING
+    ? computedProgress
+    : Math.max(previousDisplayProgress, computedProgress);
+  const blockingRequirements = nextState?.scanReadiness?.blockingRequirements || [];
+  const progressBlocker = nextState?.scanReady || nextState?.finishUnlocked
+    ? null
+    : blockingRequirements.find((requirement) => requirement.required !== null && !requirement.pass)?.label || null;
+  return {
+    ...nextState,
+    computedProgress,
+    displayProgress,
+    scanProgress: displayProgress,
+    progressBlocker,
+  };
 }
 
 export function isTargetStalled(watchdog, targetRegion, now = Date.now()) {
@@ -1124,12 +1165,16 @@ function movementForTarget(targetRegion, currentOrientation, scanState) {
 export function determineNextAction(scanState) {
   const currentOrientation = scanState?.currentOrientation || {};
   const phase = scanState?.phase || SCANNER_PHASES.INITIAL_MAPPING;
+  const readiness = scanState?.scanReadiness || calculateScanReadiness(scanState);
+  const furniturePassActive = Boolean(scanState?.furniturePassActive);
+  const isFurnitureTarget = (region) => region?.semanticType === 'FURNITURE_OR_FRAME_EDGE';
   const lockedTarget = scanState?.activeTargetId
     ? scanState.coverageRegions?.find((region) => region.id === scanState.activeTargetId
       && !region.skipped
-      && !['SUFFICIENT', 'INFERABLE'].includes(region.status))
+      && !['SUFFICIENT', 'INFERABLE'].includes(region.status)
+      && (furniturePassActive || !isFurnitureTarget(region)))
     : null;
-  const targetRegion = lockedTarget || scanState?.lowCoverageRegions?.[0];
+  const targetRegion = lockedTarget || scanState?.lowCoverageRegions?.find((region) => furniturePassActive || !isFurnitureTarget(region));
   if ((scanState?.framesEvaluated || 0) === 0 && (scanState?.acceptedFrames || 0) === 0) {
     return { type: 'START_SCAN', direction: 'O', label: 'READY TO SCAN', eyebrow: 'Initial room mapping', title: 'Start with a slow room sweep', instruction: 'Slowly move around the room while looking around.', helper: 'The scanner will build a spatial map before it suggests any area to capture.', target: 'Initial mapping', priority: 1, confidence: 1, adaptiveGuidance: null };
   }
@@ -1152,8 +1197,7 @@ export function determineNextAction(scanState) {
       adaptiveGuidance: null,
     };
   }
-  const readiness = scanState?.scanReadiness || calculateScanReadiness(scanState);
-  if (scanState?.scanReady || readiness.ready) {
+  if ((scanState?.scanReady || readiness.ready) && !furniturePassActive) {
     return { type: 'SCAN_COMPLETE', direction: 'OK', label: 'SCAN READY', eyebrow: 'Enough data collected', title: 'Your room scan is ready', instruction: 'You can finish now, or keep moving toward the highlighted area for a little more detail.', helper: 'Small hidden or obstructed areas do not need to be perfect.', target: `${Math.round(readiness.coverage * 100)}% useful coverage`, priority: 0.8, confidence: 0.9, adaptiveGuidance: null };
   }
   if (!targetRegion) {
@@ -1218,6 +1262,85 @@ export function determineNextAction(scanState) {
     reason, aimInstruction: { direction: 'CENTER', targetScreenPosition: targetRegion.screenPosition }, movementInstruction,
     adaptiveGuidance: { targetRegionId: targetRegion.id, aimInstruction: { direction: 'CENTER', targetScreenPosition: targetRegion.screenPosition }, movementInstruction, reason, message: instruction, confidence: 0.84 },
   };
+}
+
+function normalizedRectIntersects(first, second) {
+  return first.x < second.x + second.width
+    && first.x + first.width > second.x
+    && first.y < second.y + second.height
+    && first.y + first.height > second.y;
+}
+
+export function chooseGuidancePlacement(targetBounds) {
+  const guidance = { width: 0.44, height: 0.1 };
+  const placements = {
+    top: { x: 0.5 - (guidance.width / 2), y: 0.12, width: guidance.width, height: guidance.height },
+    bottom: { x: 0.5 - (guidance.width / 2), y: 0.76, width: guidance.width, height: guidance.height },
+    left: { x: 0.08, y: 0.5 - (guidance.height / 2), width: guidance.width, height: guidance.height },
+    right: { x: 0.48, y: 0.5 - (guidance.height / 2), width: guidance.width, height: guidance.height },
+  };
+  if (!targetBounds) return 'bottom';
+  const target = {
+    x: Number(targetBounds.x) || 0,
+    y: Number(targetBounds.y) || 0,
+    width: Math.max(0, Number(targetBounds.width) || 0),
+    height: Math.max(0, Number(targetBounds.height) || 0),
+  };
+  const preferred = target.x + target.width < 0.38
+    ? ['right', 'bottom', 'top', 'left']
+    : target.x > 0.62
+      ? ['left', 'bottom', 'top', 'right']
+      : target.y < 0.32
+        ? ['bottom', 'right', 'left', 'top']
+        : target.y > 0.68
+          ? ['top', 'right', 'left', 'bottom']
+          : ['bottom', 'top', 'right', 'left'];
+  return preferred.find((placement) => !normalizedRectIntersects(placements[placement], target)) || preferred[0];
+}
+
+export function compactGuidanceFor(instruction, scanState = {}) {
+  const iconForType = {
+    INITIAL_MAPPING: '↔',
+    START_SCAN: '↔',
+    TRACKING_LOST: '↺',
+    LOOK_UP: '↑',
+    LOOK_DOWN: '↓',
+    MOVE_LEFT: '←',
+    MOVE_RIGHT: '→',
+    MOVE_SIDEWAYS: '↔',
+    SKIP_AREA: '↗',
+    SCAN_COMPLETE: '✓',
+  };
+  if (scanState.phase === SCANNER_PHASES.INITIAL_MAPPING) {
+    return { mode: 'SCANNING', icon: '↔', text: 'Walk slowly around the room', hint: 'Keep moving' };
+  }
+  if (instruction?.type === 'TRACKING_LOST') {
+    return { mode: 'NEEDS_SMALL_CORRECTION', icon: '↺', text: 'Point to a scanned area', hint: '' };
+  }
+  if (scanState.scanReady && !scanState.furniturePassActive && instruction?.type === 'SCAN_COMPLETE') {
+    return { mode: 'READY', icon: '✓', text: 'Room captured', hint: 'Finish or improve detail' };
+  }
+  const target = instruction?.targetRegion;
+  const reason = instruction?.reason;
+  if (reason === 'LOW_FEATURE_DENSITY' || instruction?.type === 'SKIP_AREA') {
+    return { mode: 'NEEDS_SMALL_CORRECTION', icon: '↗', text: 'Include a nearby corner', hint: '' };
+  }
+  if (reason === 'LOW_PARALLAX' || reason === 'LOW_VIEWPOINT_DIVERSITY' || instruction?.type === 'MOVE_SIDEWAYS') {
+    return { mode: 'NEEDS_SMALL_CORRECTION', icon: '↔', text: 'Move sideways', hint: '' };
+  }
+  if (!target || !target.currentlyVisible) {
+    const textByType = {
+      LOOK_UP: 'Aim slightly higher',
+      LOOK_DOWN: 'Aim slightly lower',
+      MOVE_LEFT: 'Aim slightly left',
+      MOVE_RIGHT: 'Aim slightly right',
+    };
+    const text = textByType[instruction?.type] || 'Keep walking';
+    return { mode: text === 'Keep walking' ? 'SCANNING' : 'NEEDS_SMALL_CORRECTION', icon: iconForType[instruction?.type] || '→', text, hint: '' };
+  }
+  if (instruction?.type === 'MOVE_LEFT') return { mode: 'NEEDS_SMALL_CORRECTION', icon: '←', text: 'Move slowly left', hint: '' };
+  if (instruction?.type === 'MOVE_RIGHT') return { mode: 'NEEDS_SMALL_CORRECTION', icon: '→', text: 'Move slowly right', hint: '' };
+  return { mode: 'SCANNING', icon: '→', text: 'Keep walking', hint: '' };
 }
 
 function readHeading(event) {
@@ -1679,16 +1802,12 @@ function updateCoverageFromFrameLegacyCurrent(previousState, orientation, pose, 
     viewpointDiversity,
   };
   const scanReadiness = calculateScanReadiness(nextState);
-  const readinessState = {
+  return {
     ...nextState,
     structuralCoverage: scanReadiness.structuralCoverage,
     reconstructionConfidence: scanReadiness.reconstructionConfidence,
     scanReadiness,
     scanReady: scanReadiness.ready,
-  };
-  return {
-    ...readinessState,
-    scanProgress: calculateScanProgress(readinessState),
   };
 }
 
@@ -1922,12 +2041,12 @@ export function updateCoverageFromFrame(previousState, orientation, pose, analys
     structuralCoverage: scanReadiness.structuralCoverage,
     reconstructionConfidence: scanReadiness.reconstructionConfidence,
     scanReadiness,
-    scanReady: phase === SCANNER_PHASES.ADAPTIVE_COVERAGE && scanReadiness.ready,
+    scanReady: previousState.scanReady || (phase === SCANNER_PHASES.ADAPTIVE_COVERAGE && scanReadiness.ready),
   };
-  return {
+  return stabilizeScanProgress(previousState, {
     ...readinessState,
-    scanProgress: calculateScanProgress(readinessState),
-  };
+    finishUnlocked: previousState.finishUnlocked || canManuallyFinishScan(readinessState),
+  });
 }
 
 function loadGLTFAsset(url, onLoad, onError) {
@@ -1967,6 +2086,7 @@ function App() {
   const lastTrackingLogAtRef = useRef(0);
   const lastFrameDecisionLogAtRef = useRef(0);
   const guidanceWatchdogRef = useRef({ targetId: null, startedAt: 0, startingCoverage: 0 });
+  const mappingToastTimerRef = useRef(null);
   const [isScanning, setIsScanning] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
   const [isFinished, setIsFinished] = useState(false);
@@ -1981,6 +2101,7 @@ function App() {
   const [importError, setImportError] = useState('');
   const [objects, setObjects] = useState([]);
   const [lastEvent, setLastEvent] = useState('Ready when you are.');
+  const [mappingToast, setMappingToast] = useState('');
   const [liveTelemetry, setLiveTelemetry] = useState(EMPTY_POSE);
   const [scanState, setScanState] = useState(() => createInitialScanState());
   const [motionTelemetry, setMotionTelemetry] = useState(() => motionTrackerRef.current.getSnapshot());
@@ -2010,11 +2131,12 @@ function App() {
     setMotionTelemetry(snapshot);
   };
   const telemetry = liveTelemetry;
-  const roomCoverage = Math.round((scanState.scanProgress || scanState.totalCoverage) * 100);
-  const canFinish = isFinished || canManuallyFinishScan(scanState) || scanState.scanReady;
+  const roomCoverage = Math.round((scanState.displayProgress ?? scanState.scanProgress ?? scanState.totalCoverage ?? 0) * 100);
+  const canFinish = isFinished || scanState.finishUnlocked || canManuallyFinishScan(scanState) || scanState.scanReady;
 
   const finishHint = useMemo(() => {
     if (isFinished) return 'Scan complete. Review the real room mesh in the simulator.';
+    if (scanState.furniturePassActive) return 'Room structure is ready. Finish whenever you want.';
     if (scanState.scanReady) return 'Enough data collected. Finish whenever the room feels covered.';
     if (scanState.acceptedFrames < scannerReadinessConfig.manualFinishAcceptedKeyframes) return `${scannerReadinessConfig.manualFinishAcceptedKeyframes - scanState.acceptedFrames} more useful views before Finish Scan is available.`;
     return 'Keep moving around the room. Finish Scan will unlock once the main surfaces have enough overlap.';
@@ -2024,6 +2146,8 @@ function App() {
   const activeTarget = scanInstruction.targetRegion;
   const targetScreenBounds = activeTarget?.screenBounds;
   const targetViewCount = Math.min(targetViewConfig.requiredUsefulViews, Number(activeTarget?.usefulViews) || 0);
+  const compactGuidance = useMemo(() => compactGuidanceFor(scanInstruction, scanState), [scanInstruction, scanState]);
+  const guidancePlacement = chooseGuidancePlacement(targetScreenBounds);
   const targetDebugReason = activeTarget ? targetReason(activeTarget, scanState) : '—';
 
   useEffect(() => {
@@ -2034,6 +2158,7 @@ function App() {
       frameStoreRef.current.forEach((frame) => {
         if (frame.previewUrl) URL.revokeObjectURL(frame.previewUrl);
       });
+      if (mappingToastTimerRef.current) window.clearTimeout(mappingToastTimerRef.current);
     };
   }, []);
 
@@ -2239,7 +2364,12 @@ function App() {
           multiFrameFeatureTrackCount: analysis.multiFrameFeatureTrackCount,
         },
       );
-      if (coverageState.mappingJustInitialized) setLastEvent('Room mapping initialized.');
+      if (coverageState.mappingJustInitialized) {
+        setMappingToast('Room mapped');
+        if (mappingToastTimerRef.current) window.clearTimeout(mappingToastTimerRef.current);
+        mappingToastTimerRef.current = window.setTimeout(() => setMappingToast(''), 1200);
+        setLastEvent('Room mapping initialized.');
+      }
       if (SCANNER_DEBUG) {
         const targetDecision = coverageState.lastTargetViewDecision;
         if (activeTargetIdRef.current && targetDecision?.targetRegionId !== activeTargetIdRef.current) {
@@ -2275,18 +2405,14 @@ function App() {
         lastAcceptedAt: now,
       };
       const scanReadiness = calculateScanReadiness(nextStateBeforeReadiness);
-      const nextState = {
+      const nextState = stabilizeScanProgress(scanStateRef.current, {
         ...nextStateBeforeReadiness,
         structuralCoverage: scanReadiness.structuralCoverage,
         reconstructionConfidence: scanReadiness.reconstructionConfidence,
         scanReadiness,
-        scanReady: scanReadiness.ready,
-        scanProgress: calculateScanProgress({
-          ...nextStateBeforeReadiness,
-          structuralCoverage: scanReadiness.structuralCoverage,
-          reconstructionConfidence: scanReadiness.reconstructionConfidence,
-        }),
-      };
+        scanReady: scanStateRef.current.scanReady || scanReadiness.ready,
+        finishUnlocked: scanStateRef.current.finishUnlocked || canManuallyFinishScan(nextStateBeforeReadiness),
+      });
       scanStateRef.current = nextState;
       setScanState(nextState);
     }, 'image/jpeg', 0.86);
@@ -2319,6 +2445,8 @@ function App() {
     setReconstructionState(null);
     setIsPaused(false);
     setFramesCaptured(0);
+    setMappingToast('');
+    if (mappingToastTimerRef.current) window.clearTimeout(mappingToastTimerRef.current);
     frameStoreRef.current = [];
     nextKeyframeIdRef.current = 1;
     setObjects([]);
@@ -2579,6 +2707,15 @@ function App() {
     return () => window.cancelAnimationFrame(animationFrame);
   }, [cameraState, isPaused, isScanning]);
 
+  const improveFurniture = () => {
+    const currentState = scanStateRef.current;
+    const nextState = { ...currentState, furniturePassActive: true };
+    scanStateRef.current = nextState;
+    guidanceControllerRef.current.reset();
+    setScanState(nextState);
+    setLastEvent('Furniture detail pass started.');
+  };
+
   const skipCurrentTarget = () => {
     const targetId = scanInstruction.targetRegion?.id;
     if (!targetId) return;
@@ -2596,18 +2733,14 @@ function App() {
       targetStalled: false,
     };
     const scanReadiness = calculateScanReadiness(nextStateBeforeReadiness);
-    const nextState = {
+    const nextState = stabilizeScanProgress(currentState, {
       ...nextStateBeforeReadiness,
       structuralCoverage: scanReadiness.structuralCoverage,
       reconstructionConfidence: scanReadiness.reconstructionConfidence,
       scanReadiness,
-      scanReady: scanReadiness.ready,
-      scanProgress: calculateScanProgress({
-        ...nextStateBeforeReadiness,
-        structuralCoverage: scanReadiness.structuralCoverage,
-        reconstructionConfidence: scanReadiness.reconstructionConfidence,
-      }),
-    };
+      scanReady: currentState.scanReady || scanReadiness.ready,
+      finishUnlocked: currentState.finishUnlocked || canManuallyFinishScan(nextStateBeforeReadiness),
+    });
     scanStateRef.current = nextState;
     guidanceWatchdogRef.current = { targetId: null, startedAt: 0, startingCoverage: 0 };
     guidanceControllerRef.current.reset();
@@ -2646,6 +2779,9 @@ function App() {
         ceilingCoverage: scanState.ceilingCoverage,
         totalCoverage: scanState.totalCoverage,
         scanProgress: scanState.scanProgress,
+        computedProgress: scanState.computedProgress,
+        displayProgress: scanState.displayProgress,
+        progressBlocker: scanState.progressBlocker,
         viewpointDiversity: scanState.viewpointDiversity,
         coverageRegions: scanState.coverageRegions,
         visibleRegionIds: scanState.visibleRegionIds,
@@ -2659,6 +2795,8 @@ function App() {
         reconstructionConfidence: scanState.reconstructionConfidence,
         scanReadiness: scanState.scanReadiness,
         scanReady: scanState.scanReady,
+        finishUnlocked: scanState.finishUnlocked,
+        furniturePassActive: scanState.furniturePassActive,
       },
       frames,
       objects: objects.map((object) => ({ ...object })),
@@ -2920,7 +3058,7 @@ function App() {
           isReconstructing={isReconstructing}
           reconstructionState={reconstructionState}
         />
-      ) : <div className={`workspace ${isScanning ? 'workspace-scanning' : ''}`}>
+      ) : <div className={`workspace ${isScanning ? 'workspace-scanning' : ''} ${isScanning && !SCANNER_DEBUG ? 'workspace-live-compact' : ''}`}>
         <section className="camera-column" aria-label="Camera preview">
           <div className={`camera-frame ${SCANNER_TARGET_DEBUG ? 'camera-frame-target-debug' : ''}`} ref={cameraFrameRef}>
             <video ref={videoRef} className={`camera-video ${cameraState === 'live' ? 'camera-video-live' : ''}`} autoPlay muted playsInline />
@@ -2969,11 +3107,34 @@ function App() {
                   top: `${targetScreenBounds.y * 100}%`,
                   width: `${targetScreenBounds.width * 100}%`,
                   height: `${targetScreenBounds.height * 100}%`,
-                }}
-                aria-label={`Target visible: ${targetDisplayName(activeTarget)}`}
-              >
-                <span>SCAN THIS AREA</span>
-              </div>
+                  }}
+                  aria-label={`Target visible: ${targetDisplayName(activeTarget)}`}
+              />
+            )}
+            {isScanning && !SCANNER_DEBUG && (
+              <>
+                <div className="scanner-live-hud" aria-label={`Scan room ${roomCoverage}%`}>
+                  <div className="scanner-live-hud-heading">
+                    <span>Scan room</span>
+                    <strong>{roomCoverage}%</strong>
+                  </div>
+                  <div className="scanner-live-progress" aria-hidden="true"><span style={{ width: `${roomCoverage}%` }} /></div>
+                </div>
+                {mappingToast && <div className="scanner-mapping-toast" role="status">✓ {mappingToast}</div>}
+                <div className={`scanner-compact-guidance scanner-compact-guidance-${guidancePlacement} scanner-compact-guidance-${compactGuidance.mode.toLowerCase()}`} role="status" aria-live="polite">
+                  <span className="scanner-compact-icon" aria-hidden="true">{compactGuidance.icon}</span>
+                  <span className="scanner-compact-copy">
+                    <strong>{compactGuidance.text}</strong>
+                    {compactGuidance.hint && <small>{compactGuidance.hint}</small>}
+                  </span>
+                </div>
+                <div className={`scanner-compact-controls ${scanState.scanReady ? 'scanner-compact-controls-ready' : ''}`}>
+                  {scanInstruction.type === 'SKIP_AREA' && <button className="scanner-compact-secondary" type="button" onClick={skipCurrentTarget}>Skip</button>}
+                  {scanState.scanReady && !scanState.furniturePassActive && <button className="scanner-compact-secondary" type="button" onClick={improveFurniture}>Improve furniture</button>}
+                  <button className="scanner-compact-secondary" type="button" onClick={() => setIsPaused((paused) => !paused)}>{isPaused ? 'Resume' : 'Pause'}</button>
+                  <button className="scanner-compact-finish" type="button" onClick={finishScan} disabled={!canFinish}>{scanState.scanReady ? 'Finish scan' : 'Finish'}</button>
+                </div>
+              </>
             )}
             <div className={`camera-meta camera-meta-bottom ${SCANNER_DEBUG ? 'camera-meta-debug' : 'camera-meta-calm'}`}>
               {SCANNER_DEBUG ? (
@@ -3112,6 +3273,18 @@ function App() {
                   <span>Other</span><b>{scanState.rejectionReasons.other || 0}</b>
                   <span>Useful coverage</span><b>{roomCoverage}%</b>
                   <span>Readiness</span><b>{scanState.scanReady ? 'READY' : 'BUILDING'}</b>
+                </div>
+                <div className="scanner-debug-section">Progress blocker</div>
+                <div className="scanner-debug-grid">
+                  <span>Displayed progress</span><b>{roomCoverage}%</b>
+                  <span>Computed progress</span><b>{Math.round((scanState.computedProgress || 0) * 100)}%</b>
+                  <span>Blocking requirement</span><b>{scanState.progressBlocker || 'none'}</b>
+                  {(scanState.scanReadiness?.blockingRequirements || []).map((requirement) => (
+                    [
+                      <span key={`${requirement.key}-label`}>{requirement.label}{requirement.optional ? ' (optional)' : ''}</span>,
+                      <b key={`${requirement.key}-value`}>{requirement.value === 'NOT REQUIRED' ? requirement.value : requirement.pass ? 'PASS' : 'BLOCKED'}</b>,
+                    ]
+                  ))}
                 </div>
                 {activeTarget && (
                   <>
