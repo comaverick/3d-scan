@@ -1,8 +1,22 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import * as THREE from 'three';
 import './App.css';
+import { createMotionTracker, MOTION_STATES, scannerMotionConfig } from './scannerMotion';
 
 const RECONSTRUCTION_API = process.env.REACT_APP_RECONSTRUCTION_API || '';
+
+function scannerDebugEnabled() {
+  if (process.env.NODE_ENV === 'production') return false;
+  if (process.env.REACT_APP_SCANNER_DEBUG === 'true') return true;
+  try {
+    return new URLSearchParams(window.location.search).get('scannerDebug') === '1'
+      || window.localStorage?.getItem('buildwise:scanner-debug') === 'true';
+  } catch (error) {
+    return false;
+  }
+}
+
+const SCANNER_DEBUG = scannerDebugEnabled();
 
 /* Legacy fixed-route guidance is intentionally disabled. Adaptive guidance below uses live scan state.
 const GUIDANCE_STEPS = [
@@ -158,6 +172,19 @@ function createInitialScanState() {
     sharpness: 0,
     brightness: 0,
     movementSpeed: 0,
+    motionState: MOTION_STATES.GOOD,
+    motionScore: 0,
+    motionQuality: 1,
+    imageQuality: 0,
+    featureTrackingQuality: 0,
+    featureCount: 0,
+    smoothedAngularVelocity: { pitch: 0, yaw: 0, roll: 0 },
+    rawAngularVelocity: { pitch: 0, yaw: 0, roll: 0 },
+    highSpeedDurationMs: 0,
+    warningDurationMs: 0,
+    instructionGraceActive: false,
+    targetErrorDegrees: null,
+    movingTowardTarget: null,
     rotationOnly: false,
     motionBlur: false,
     poorLighting: false,
@@ -258,9 +285,6 @@ function determineNextAction(scanState) {
   if (scanState?.motionBlur || frameQuality < 0.3) {
     return { type: 'SLOW_DOWN', direction: '⏸', label: 'LOW QUALITY', eyebrow: 'Stabilize the camera', title: 'Slow down so the room can be tracked', instruction: 'Hold the phone steadier for a moment, then continue with overlapping views.', helper: 'Blurry or poorly exposed frames are rejected instead of being uploaded.', target: `${Math.round(frameQuality * 100)}% frame quality`, priority: 0.95, confidence: 0.88 };
   }
-  if (Number(scanState?.movementSpeed) > 0.85) {
-    return { type: 'SLOW_DOWN', direction: '⏸', label: 'TOO FAST', eyebrow: 'Protect tracking quality', title: 'Slow down your movement', instruction: 'Move more slowly so adjacent frames overlap and the camera motion can be estimated.', helper: 'Fast motion reduces overlap and increases blur.', target: `${Number(scanState.movementSpeed).toFixed(2)} m/s`, priority: 0.9, confidence: 0.9 };
-  }
   if (scanState?.rotationOnly) {
     return { type: 'MOVE_SIDEWAYS', direction: '↔', label: 'NEED PARALLAX', eyebrow: 'Create depth from movement', title: 'Move sideways while scanning', instruction: 'Rotation alone cannot estimate reliable depth here. Take a few steps sideways and keep this area visible.', helper: 'The scanner detected orientation change without enough camera translation.', target: 'Translation needed', priority: 0.86, confidence: 0.86 };
   }
@@ -291,6 +315,59 @@ function readHeading(event) {
   const alphaHeading = Number(event.alpha);
   const heading = Number.isFinite(compassHeading) ? compassHeading : alphaHeading;
   return Number.isFinite(heading) ? (heading + 360) % 360 : null;
+}
+
+function sensorEventTimestamp(event) {
+  const eventTimestamp = Number(event?.timeStamp);
+  if (!Number.isFinite(eventTimestamp)) return Date.now();
+  if (eventTimestamp < 100000000000 && Number.isFinite(Number(window.performance?.timeOrigin))) {
+    return Number(window.performance.timeOrigin) + eventTimestamp;
+  }
+  return eventTimestamp;
+}
+
+function hasRotationRate(event) {
+  return ['alpha', 'beta', 'gamma'].some((axis) => Number.isFinite(Number(event?.rotationRate?.[axis])));
+}
+
+function createOrientationSnapshot(event) {
+  const heading = readHeading(event);
+  const pitch = orientationPitch(event.beta);
+  return {
+    alpha: Number.isFinite(Number(event.alpha)) ? Number(event.alpha) : null,
+    beta: Number.isFinite(Number(event.beta)) ? Number(event.beta) : null,
+    gamma: Number.isFinite(Number(event.gamma)) ? Number(event.gamma) : null,
+    heading,
+    pitch,
+    pitchDegrees: pitch * 90,
+    headingDegrees: heading,
+    rollDegrees: Number.isFinite(Number(event.gamma)) ? Number(event.gamma) : 0,
+  };
+}
+
+function directionalProgressMessage(instructionType) {
+  if (instructionType === 'LOOK_UP') return 'Good — keep pointing upward';
+  if (instructionType === 'LOOK_DOWN') return 'Good — keep pointing downward';
+  if (instructionType === 'TURN_LEFT' || instructionType === 'MOVE_LEFT') return 'Good — keep moving left';
+  if (instructionType === 'TURN_RIGHT' || instructionType === 'MOVE_RIGHT') return 'Good — keep moving right';
+  return 'Good speed';
+}
+
+function motionFeedback(instruction, motion) {
+  if (!motion || !instruction) return { message: '', tone: 'good' };
+  if (motion.motionState === MOTION_STATES.RECOVERY) {
+    return { message: 'Tracking lost. Slowly return toward the last scanned area.', tone: 'recovery' };
+  }
+  if (motion.motionState === MOTION_STATES.WARNING || motion.motionState === MOTION_STATES.TOO_FAST) {
+    return { message: 'Slow down slightly', tone: 'warning' };
+  }
+  if (motion.targetErrorDegrees !== null && motion.targetErrorDegrees <= 8) {
+    return { message: 'Almost there', tone: 'good' };
+  }
+  if (motion.movingTowardTarget) {
+    return { message: directionalProgressMessage(instruction.type), tone: 'good' };
+  }
+  return { message: 'Good speed', tone: 'good' };
 }
 
 function motionMagnitude(event) {
@@ -413,12 +490,16 @@ function analyzeVideoFrame(video, canvas, previousGray) {
   const sceneChange = temporalSamples > 0 ? clamp(temporalDifference / temporalSamples / 0.12, 0, 1) : 1;
   const featureStats = matchLocalFeatures(gray, previousGray, width, height);
   const featureCount = previousGray ? featureStats.tracked : featureStats.detected;
+  const featureTrackingQuality = previousGray
+    ? clamp(((featureStats.tracked / Math.max(1, featureStats.detected)) * 0.55) + ((featureStats.tracked / 850) * 0.45), 0, 1)
+    : clamp(featureStats.detected / 850, 0, 1);
   const qualityScore = clamp((sharpness * 0.42) + (detailScore * 0.38) + (exposureScore * 0.2), 0, 1);
   return {
     qualityScore,
     featureCount,
     detectedFeatureCount: featureStats.detected,
     trackedFeatureCount: featureStats.tracked,
+    featureTrackingQuality,
     sharpness,
     brightness,
     variance,
@@ -449,10 +530,13 @@ function updateCoverageFromFrame(previousState, orientation, pose, analysis, par
     ...previousState,
     cameraPose: pose,
     currentOrientation: orientation,
+    featureCount: analysis.featureCount,
     trackedFeatureCount: analysis.featureCount,
     detectedFeatureCount: analysis.detectedFeatureCount,
     trackingQuality,
     frameQuality: analysis.qualityScore,
+    imageQuality: analysis.qualityScore,
+    featureTrackingQuality: analysis.featureTrackingQuality,
     sharpness: analysis.sharpness,
     brightness: analysis.brightness,
     motionBlur: analysis.motionBlur,
@@ -488,6 +572,15 @@ function App() {
   const lastTranslationAtRef = useRef(0);
   const rotationOnlyRef = useRef(false);
   const latestMotionRef = useRef({ acceleration: null, rotationRate: null });
+  const motionTrackerRef = useRef(null);
+  if (!motionTrackerRef.current) {
+    motionTrackerRef.current = createMotionTracker(scannerMotionConfig, { debug: SCANNER_DEBUG });
+  }
+  const motionUsingRotationRateRef = useRef(false);
+  const lastMotionStateRef = useRef(MOTION_STATES.GOOD);
+  const lastMotionWarningUiAtRef = useRef(0);
+  const lastMotionTelemetryUiAtRef = useRef(0);
+  const lastTrackingLogAtRef = useRef(0);
   const [isScanning, setIsScanning] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
   const [isFinished, setIsFinished] = useState(false);
@@ -504,11 +597,27 @@ function App() {
   const [lastEvent, setLastEvent] = useState('Ready when you are.');
   const [liveTelemetry, setLiveTelemetry] = useState(EMPTY_POSE);
   const [scanState, setScanState] = useState(() => createInitialScanState());
+  const [motionTelemetry, setMotionTelemetry] = useState(() => motionTrackerRef.current.getSnapshot());
   const scanStateRef = useRef(scanState);
   const orientationRef = useRef({ alpha: null, beta: null, gamma: null, heading: null, pitch: 0 });
   const frameStoreRef = useRef([]);
   const captureFrameRef = useRef(null);
   const scanInstruction = useMemo(() => determineNextAction(scanState), [scanState]);
+  const motionUi = motionFeedback(scanInstruction, motionTelemetry);
+  const instructionTargetId = scanInstruction.targetRegion?.id || '';
+  const scanInstructionType = scanInstruction.type;
+  const scanTargetPitch = Number.isFinite(Number(scanInstruction.targetRegion?.pitch))
+    ? Number(scanInstruction.targetRegion.pitch)
+    : null;
+  const scanTargetYaw = Number.isFinite(Number(scanInstruction.targetRegion?.yaw))
+    ? Number(scanInstruction.targetRegion.yaw)
+    : null;
+  const publishMotionTelemetry = (snapshot, force = false) => {
+    const now = Date.now();
+    if (!force && now - lastMotionTelemetryUiAtRef.current < 100) return;
+    lastMotionTelemetryUiAtRef.current = now;
+    setMotionTelemetry(snapshot);
+  };
   const telemetry = liveTelemetry;
   const roomCoverage = Math.round((isFinished ? 1 : scanState.totalCoverage) * 100);
   const canFinish = isFinished || (
@@ -539,6 +648,25 @@ function App() {
       });
     };
   }, []);
+
+  useEffect(() => {
+    const motionTracker = motionTrackerRef.current;
+    const target = {
+      pitchDegrees: scanTargetPitch === null || !['LOOK_UP', 'LOOK_DOWN'].includes(scanInstructionType)
+        ? null
+        : scanTargetPitch * 90,
+      headingDegrees: scanTargetYaw === null || !['TURN_LEFT', 'TURN_RIGHT', 'MOVE_LEFT', 'MOVE_RIGHT', 'MOVE_SIDEWAYS', 'MOVE_AROUND_OBJECT'].includes(scanInstructionType)
+        ? null
+        : scanTargetYaw,
+    };
+    const snapshot = motionTracker.setInstruction(
+      isScanning ? scanInstructionType : 'START_SCAN',
+      isScanning ? target : null,
+      Date.now(),
+    );
+    setMotionTelemetry(snapshot);
+    lastMotionStateRef.current = snapshot.motionState;
+  }, [instructionTargetId, isScanning, scanInstructionType, scanTargetPitch, scanTargetYaw]);
 
   const enableCamera = async () => {
     if (!navigator.mediaDevices?.getUserMedia) {
@@ -705,13 +833,19 @@ function App() {
     const initialScanState = createInitialScanState();
     scanStateRef.current = initialScanState;
     setScanState(initialScanState);
-    orientationRef.current = { alpha: null, beta: null, gamma: null, heading: null, pitch: 0 };
+    orientationRef.current = { alpha: null, beta: null, gamma: null, heading: null, pitch: 0, pitchDegrees: 0, headingDegrees: null, rollDegrees: 0 };
     previousFrameGrayRef.current = null;
     lastAcceptedFrameRef.current = null;
     lastCoveragePoseRef.current = null;
     lastTranslationAtRef.current = 0;
     rotationOnlyRef.current = false;
     latestMotionRef.current = { acceleration: null, rotationRate: null };
+    motionUsingRotationRateRef.current = false;
+    lastMotionStateRef.current = MOTION_STATES.GOOD;
+    lastMotionWarningUiAtRef.current = 0;
+    lastMotionTelemetryUiAtRef.current = 0;
+    lastTrackingLogAtRef.current = 0;
+    publishMotionTelemetry(motionTrackerRef.current.setInstruction('START_SCAN', null, Date.now()), true);
     scanStartedAtRef.current = Date.now();
     scanSessionIdRef.current = createSessionId();
     pathRef.current = { x: 0, y: 0, z: 0, velocity: 0, lastMotionAt: null };
@@ -732,19 +866,19 @@ function App() {
     if (!isScanning || isPaused) return undefined;
 
     const handleOrientation = (event) => {
-      const heading = readHeading(event);
-      const nextOrientation = {
-        alpha: Number.isFinite(Number(event.alpha)) ? Number(event.alpha) : null,
-        beta: Number.isFinite(Number(event.beta)) ? Number(event.beta) : null,
-        gamma: Number.isFinite(Number(event.gamma)) ? Number(event.gamma) : null,
-        heading,
-        pitch: orientationPitch(event.beta),
-      };
+      const timestamp = sensorEventTimestamp(event);
+      const nextOrientation = createOrientationSnapshot(event);
+      const heading = nextOrientation.heading;
       const previousHeading = orientationRef.current.heading;
       if (heading !== null && previousHeading !== null && angleDistance(previousHeading, heading) > 8 && Date.now() - lastTranslationAtRef.current > 850) {
         rotationOnlyRef.current = true;
       }
       orientationRef.current = nextOrientation;
+      const motionTracker = motionTrackerRef.current;
+      const motionSnapshot = motionUsingRotationRateRef.current
+        ? motionTracker.updateOrientation({ timestamp, orientation: nextOrientation })
+        : motionTracker.updateOrientationSample({ timestamp, orientation: nextOrientation });
+      publishMotionTelemetry(motionSnapshot);
       updateLiveTelemetry(heading, pathRef.current.velocity);
     };
 
@@ -766,6 +900,21 @@ function App() {
       pathRef.current.z -= Math.cos(headingRadians) * distance;
       pathRef.current.velocity = nextVelocity;
       pathRef.current.lastMotionAt = now;
+      const rotationRateAvailable = hasRotationRate(event);
+      if (rotationRateAvailable) motionUsingRotationRateRef.current = true;
+      const nextOrientation = orientationRef.current;
+      const rotationRate = rotationRateAvailable ? {
+        pitch: Number(event.rotationRate.beta) || 0,
+        yaw: Number(event.rotationRate.alpha) || 0,
+        roll: Number(event.rotationRate.gamma) || 0,
+      } : null;
+      const motionSnapshot = rotationRate
+        ? motionTrackerRef.current.updateAngularVelocity({
+          timestamp: sensorEventTimestamp(event),
+          angularVelocity: rotationRate,
+          orientation: nextOrientation,
+        })
+        : null;
       latestMotionRef.current = {
         acceleration: {
           x: Number(event.acceleration?.x ?? event.accelerationIncludingGravity?.x) || 0,
@@ -777,7 +926,12 @@ function App() {
           beta: Number(event.rotationRate.beta) || 0,
           gamma: Number(event.rotationRate.gamma) || 0,
         } : null,
+        rawAngularVelocity: motionSnapshot?.rawAngularVelocity || latestMotionRef.current.rawAngularVelocity || { pitch: 0, yaw: 0, roll: 0 },
+        smoothedAngularVelocity: motionSnapshot?.smoothedAngularVelocity || latestMotionRef.current.smoothedAngularVelocity || { pitch: 0, yaw: 0, roll: 0 },
+        motionScore: motionSnapshot?.motionScore || latestMotionRef.current.motionScore || 0,
+        motionState: motionSnapshot?.motionState || latestMotionRef.current.motionState || MOTION_STATES.GOOD,
       };
+      if (motionSnapshot) publishMotionTelemetry(motionSnapshot);
       if (isMoving) {
         lastTranslationAtRef.current = now;
         rotationOnlyRef.current = false;
@@ -807,13 +961,52 @@ function App() {
         if (analysis) {
           previousFrameGrayRef.current = analysis.gray;
           const pose = { ...lastTelemetryRef.current };
-          const parallaxDistance = lastCoveragePoseRef.current ? poseDistance(lastCoveragePoseRef.current, pose) : 0;
-          const nextState = updateCoverageFromFrame(scanStateRef.current, orientationRef.current, pose, analysis, parallaxDistance);
-          nextState.movementSpeed = pathRef.current.velocity;
-          nextState.rotationOnly = rotationOnlyRef.current;
-          scanStateRef.current = nextState;
-          setScanState(nextState);
-          lastCoveragePoseRef.current = pose;
+           const parallaxDistance = lastCoveragePoseRef.current ? poseDistance(lastCoveragePoseRef.current, pose) : 0;
+           const nextState = updateCoverageFromFrame(scanStateRef.current, orientationRef.current, pose, analysis, parallaxDistance);
+           nextState.movementSpeed = pathRef.current.velocity;
+           nextState.rotationOnly = rotationOnlyRef.current;
+           const motionSnapshot = motionTrackerRef.current.updateTrackingQuality({
+             timestamp: Date.now(),
+             quality: nextState.trackingQuality,
+             frameQuality: analysis.qualityScore,
+             featureCount: analysis.featureCount,
+             motionBlur: analysis.motionBlur,
+           });
+           nextState.motionState = motionSnapshot.motionState;
+           nextState.motionScore = motionSnapshot.motionScore;
+           nextState.motionQuality = motionSnapshot.motionQuality;
+           nextState.imageQuality = analysis.qualityScore;
+           nextState.smoothedAngularVelocity = motionSnapshot.smoothedAngularVelocity;
+           nextState.rawAngularVelocity = motionSnapshot.rawAngularVelocity;
+           nextState.highSpeedDurationMs = motionSnapshot.highSpeedDurationMs;
+           nextState.warningDurationMs = motionSnapshot.warningDurationMs;
+           nextState.instructionGraceActive = motionSnapshot.instructionGraceActive;
+           nextState.targetErrorDegrees = motionSnapshot.targetErrorDegrees;
+           nextState.movingTowardTarget = motionSnapshot.movingTowardTarget;
+           scanStateRef.current = nextState;
+           setScanState(nextState);
+           publishMotionTelemetry(motionSnapshot);
+           const now = Date.now();
+           const previousMotionState = lastMotionStateRef.current;
+           if (motionSnapshot.motionState !== previousMotionState) {
+             if ((motionSnapshot.motionState === MOTION_STATES.WARNING || motionSnapshot.motionState === MOTION_STATES.TOO_FAST)
+               && now - lastMotionWarningUiAtRef.current >= scannerMotionConfig.warningUiCooldownMs) {
+               setLastEvent('Slow down slightly. The current instruction is still active.');
+               lastMotionWarningUiAtRef.current = now;
+             } else if (motionSnapshot.motionState === MOTION_STATES.GOOD
+               && (previousMotionState === MOTION_STATES.WARNING || previousMotionState === MOTION_STATES.TOO_FAST)) {
+               setLastEvent('Good speed. Continue with the same instruction.');
+             } else if (motionSnapshot.motionState === MOTION_STATES.RECOVERY) {
+               setLastEvent('Tracking lost. Slowly return toward the last scanned area.');
+             }
+             lastMotionStateRef.current = motionSnapshot.motionState;
+           }
+           if (SCANNER_DEBUG && motionSnapshot.trackingQuality >= 0.55 && now - lastTrackingLogAtRef.current >= 2000) {
+             // eslint-disable-next-line no-console
+             console.log(`[TRACKING] tracking remains stable featureCount=${motionSnapshot.featureCount}`);
+             lastTrackingLogAtRef.current = now;
+           }
+           lastCoveragePoseRef.current = pose;
 
           const previous = lastAcceptedFrameRef.current;
           const movementSinceCapture = previous ? poseDistance(previous.pose, pose) : 1;
@@ -849,6 +1042,10 @@ function App() {
       scanState: {
         trackedFeatureCount: scanState.trackedFeatureCount,
         trackingQuality: scanState.trackingQuality,
+        featureTrackingQuality: scanState.featureTrackingQuality,
+        imageQuality: scanState.imageQuality,
+        motionQuality: scanState.motionQuality,
+        motionState: scanState.motionState,
         floorCoverage: scanState.floorCoverage,
         wallCoverage: scanState.wallCoverage,
         ceilingCoverage: scanState.ceilingCoverage,
@@ -1060,6 +1257,11 @@ function App() {
     scanSessionIdRef.current = null;
     pathRef.current = { x: 0, y: 0, z: 0, velocity: 0, lastMotionAt: null };
     lastTelemetryRef.current = EMPTY_POSE;
+    motionUsingRotationRateRef.current = false;
+    lastMotionStateRef.current = MOTION_STATES.GOOD;
+    lastMotionWarningUiAtRef.current = 0;
+    lastMotionTelemetryUiAtRef.current = 0;
+    publishMotionTelemetry(motionTrackerRef.current.setInstruction('START_SCAN', null, Date.now()), true);
   };
 
   return (
@@ -1128,6 +1330,31 @@ function App() {
               <span>Frame quality <b>{cameraState === 'live' ? `${Math.round(scanState.frameQuality * 100)}%` : '—'}</b></span>
               <span>Accepted viewpoints <b>{scanState.acceptedFrames}</b></span>
             </div>
+            {SCANNER_DEBUG && isScanning && (
+              <aside className="scanner-debug-overlay" aria-label="Scanner motion debug">
+                <div className="scanner-debug-heading">
+                  <span>Motion debug</span>
+                  <strong>{motionTelemetry.motionState}</strong>
+                </div>
+                <div className="scanner-debug-instruction">Instruction: {scanInstruction.type}</div>
+                <div className="scanner-debug-grid">
+                  <span>Pitch velocity</span><b>{motionTelemetry.rawAngularVelocity.pitch.toFixed(1)}°/s</b>
+                  <span>Yaw velocity</span><b>{motionTelemetry.rawAngularVelocity.yaw.toFixed(1)}°/s</b>
+                  <span>Roll velocity</span><b>{motionTelemetry.rawAngularVelocity.roll.toFixed(1)}°/s</b>
+                  <span>Smoothed pitch</span><b>{motionTelemetry.smoothedAngularVelocity.pitch.toFixed(1)}°/s</b>
+                  <span>Smoothed yaw</span><b>{motionTelemetry.smoothedAngularVelocity.yaw.toFixed(1)}°/s</b>
+                  <span>Smoothed roll</span><b>{motionTelemetry.smoothedAngularVelocity.roll.toFixed(1)}°/s</b>
+                  <span>Smoothed score</span><b>{motionTelemetry.motionScore.toFixed(1)}°/s</b>
+                  <span>Warning / critical</span><b>{motionTelemetry.warningThreshold} / {motionTelemetry.criticalThreshold}°/s</b>
+                  <span>High-speed timer</span><b>{Math.round(motionTelemetry.highSpeedDurationMs)} ms</b>
+                  <span>Target pitch</span><b>{motionTelemetry.targetPitchDegrees === null ? '—' : `${motionTelemetry.targetPitchDegrees.toFixed(0)}°`}</b>
+                  <span>Current pitch</span><b>{motionTelemetry.currentPitchDegrees === null ? '—' : `${motionTelemetry.currentPitchDegrees.toFixed(0)}°`}</b>
+                  <span>Target error</span><b>{motionTelemetry.targetErrorDegrees === null ? '—' : `${motionTelemetry.targetErrorDegrees.toFixed(0)}°`}</b>
+                  <span>Feature count</span><b>{motionTelemetry.featureCount}</b>
+                  <span>Tracking / image</span><b>{Math.round(motionTelemetry.trackingQuality * 100)}% / {Math.round(motionTelemetry.imageQuality * 100)}%</b>
+                </div>
+              </aside>
+            )}
           </div>
 
           <div className="camera-footer">
@@ -1185,6 +1412,7 @@ function App() {
                 <p className="section-label">{scanInstruction.eyebrow}</p>
                 <h2>{scanInstruction.title}</h2>
                 <p className="instruction-copy">{instructionText}</p>
+                {isScanning && <div className={`motion-feedback motion-feedback-${motionUi.tone}`}>{motionUi.message}</div>}
               </div>
             </div>
             <div className="instruction-meter-row">
@@ -1746,5 +1974,5 @@ function TelemetryValue({ label, value }) {
   return <div className="telemetry-value"><span>{label}</span><strong>{value}</strong></div>;
 }
 
-export { createInitialScanState, determineNextAction, updateCoverageFromFrame };
+export { createInitialScanState, determineNextAction, updateCoverageFromFrame, scannerMotionConfig, MOTION_STATES };
 export default App;

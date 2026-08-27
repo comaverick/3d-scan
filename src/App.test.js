@@ -35,3 +35,16 @@ test('changes the next-best-view instruction from measured scan state', () => {
   expect(parallaxWarning.type).toBe('MOVE_SIDEWAYS');
   expect(qualityWarning.title).not.toBe(parallaxWarning.title);
 });
+
+test('keeps adaptive guidance active when estimated translation speed is high', () => {
+  const action = determineNextAction({
+    ...createInitialScanState(),
+    acceptedFrames: 4,
+    trackingQuality: 0.72,
+    frameQuality: 0.72,
+    movementSpeed: 1.2,
+  });
+
+  expect(action.type).toBe('LOOK_UP');
+  expect(action.label).not.toBe('TOO FAST');
+});
