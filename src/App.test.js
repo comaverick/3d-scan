@@ -1,5 +1,5 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
-import App, { canManuallyFinishScan, calculateScanReadiness, createGuidanceController, createInitialScanState, determineNextAction, updateCoverageFromFrame } from './App';
+import App, { canManuallyFinishScan, calculateScanProgress, calculateScanReadiness, createGuidanceController, createInitialScanState, determineNextAction, isTargetStalled, updateCoverageFromFrame } from './App';
 
 test('renders the SmartScan starting state', () => {
   render(<App />);
@@ -116,4 +116,134 @@ test('guidance changes immediately when tracking returns', () => {
 
   controller.update(lost, 1000);
   expect(controller.update(recovered, 1100)).toBe(recovered);
+});
+
+test('a visible upper-wall cell changes from aiming to lateral movement guidance', () => {
+  const base = createInitialScanState();
+  const target = {
+    ...base.coverageRegions.find((region) => region.id === 'upper-1'),
+    currentlyVisible: true,
+    screenBounds: { x: 0.4, y: 0.2, width: 0.2, height: 0.2 },
+    screenPosition: { x: 0.5, y: 0.3 },
+    coverage: 0.22,
+    status: 'PARTIAL',
+    featureDensity: 0.7,
+    uniqueViewAngles: 1,
+    parallaxScore: 0.12,
+    priority: 0.9,
+  };
+  const state = {
+    ...base,
+    framesEvaluated: 12,
+    acceptedFrames: 6,
+    currentOrientation: { heading: 30, pitch: 0.28 },
+    coverageRegions: base.coverageRegions.map((region) => region.id === target.id ? target : region),
+    lowCoverageRegions: [target],
+  };
+  const aimAction = determineNextAction({
+    ...state,
+    currentOrientation: { heading: 0, pitch: 0 },
+    lowCoverageRegions: [{ ...target, currentlyVisible: false }],
+  });
+
+  const action = determineNextAction(state);
+
+  expect(aimAction.type).toBe('LOOK_UP');
+  expect(aimAction.reason).toBe('TARGET_NOT_VISIBLE');
+  expect(action.type).toBe('MOVE_RIGHT');
+  expect(action.reason).toBe('LOW_VIEWPOINT_DIVERSITY');
+  expect(action.aimInstruction.direction).toBe('CENTER');
+  expect(action.movementInstruction.type).toBe('STEP_RIGHT');
+  expect(action.instruction).toMatch(/keep.*visible.*step/i);
+});
+
+test('guidance switches immediately from aim to move when the held target becomes visible', () => {
+  const controller = createGuidanceController({ minHoldMs: 4000 });
+  const target = { id: 'upper-1', currentlyVisible: false };
+  const aim = { type: 'LOOK_UP', targetRegion: target, adaptiveGuidance: { aimInstruction: { direction: 'UP' }, movementInstruction: { type: 'NONE' } }, priority: 0.8, confidence: 0.86 };
+  const move = { type: 'MOVE_RIGHT', targetRegion: { ...target, currentlyVisible: true }, adaptiveGuidance: { aimInstruction: { direction: 'CENTER' }, movementInstruction: { type: 'STEP_RIGHT' } }, priority: 0.8, confidence: 0.84 };
+
+  controller.update(aim, 1000);
+  expect(controller.update(move, 1100)).toBe(move);
+});
+
+test('a localized target completes after useful lateral viewpoints instead of looping', () => {
+  const base = createInitialScanState();
+  const analysis = {
+    qualityScore: 0.82,
+    featureCount: 220,
+    detectedFeatureCount: 250,
+    trackedFeatureCount: 150,
+    featureTrackingQuality: 0.8,
+    sharpness: 0.8,
+    brightness: 0.5,
+    motionBlur: false,
+    poorLighting: false,
+    sceneChange: 0.8,
+    sceneUnderstanding: {
+      grid: Array.from({ length: 3 }, () => Array.from({ length: 3 }, () => ({ detail: 0.8, brightness: 0.5 }))),
+    },
+  };
+  const orientation = { heading: 30, pitch: 0.28 };
+  const first = updateCoverageFromFrame(base, orientation, { x: 0, y: 0, z: 0 }, analysis, 0.2, { accepted: true, keyframeId: 1, observedAt: 1000 });
+  const second = updateCoverageFromFrame(first, orientation, { x: 0.2, y: 0, z: 0 }, analysis, 0.2, { accepted: true, keyframeId: 2, observedAt: 2000 });
+  const third = updateCoverageFromFrame(second, orientation, { x: 0.4, y: 0, z: 0 }, analysis, 0.2, { accepted: true, keyframeId: 3, observedAt: 3000 });
+  const target = third.coverageRegions.find((region) => region.id === 'upper-1');
+
+  expect(first.visibleRegionIds).toContain('upper-1');
+  expect(first.sceneUnderstanding.method).toBe('deterministic-spatial-gradient');
+  expect(target.observationCount).toBe(3);
+  expect(target.acceptedKeyframeIds).toEqual([1, 2, 3]);
+  expect(target.uniqueViewAngles).toBe(3);
+  expect(target.status).toBe('SUFFICIENT');
+  expect(third.lowCoverageRegions.some((region) => region.id === 'upper-1')).toBe(false);
+});
+
+test('progress reflects useful structural, viewpoint, keyframe, and reconstruction evidence', () => {
+  expect(calculateScanProgress({
+    structuralCoverage: 0.5,
+    viewpointDiversity: 0.5,
+    acceptedFrames: 18,
+    reconstructionConfidence: 0.5,
+  })).toBeCloseTo(0.5, 2);
+  expect(calculateScanProgress({ structuralCoverage: 1, viewpointDiversity: 1, acceptedFrames: 36, reconstructionConfidence: 1 })).toBe(1);
+});
+
+test('stalled target watchdog waits for a sustained period and meaningful local gain', () => {
+  const target = { id: 'upper-2', coverage: 0.2 };
+  const watchdog = { targetId: target.id, startedAt: 1000, startingCoverage: 0.2 };
+
+  expect(isTargetStalled(watchdog, target, 10999)).toBe(false);
+  expect(isTargetStalled(watchdog, { ...target, coverage: 0.25 }, 11000)).toBe(false);
+  expect(isTargetStalled(watchdog, target, 11000)).toBe(true);
+});
+
+test('repeated low-texture observations become inferable from strong neighboring cells', () => {
+  const base = createInitialScanState();
+  const seeded = {
+    ...base,
+    coverageRegions: base.coverageRegions.map((region) => ['upper-0', 'upper-2'].includes(region.id)
+      ? { ...region, coverage: 0.82, status: 'SUFFICIENT' }
+      : region),
+  };
+  const plainAnalysis = {
+    qualityScore: 0.82,
+    featureCount: 12,
+    detectedFeatureCount: 14,
+    trackedFeatureCount: 10,
+    featureTrackingQuality: 0.5,
+    sharpness: 0.8,
+    brightness: 0.5,
+    motionBlur: false,
+    poorLighting: false,
+    sceneChange: 0.4,
+    sceneUnderstanding: { grid: Array.from({ length: 3 }, () => Array.from({ length: 3 }, () => ({ detail: 0, brightness: 0.5 }))) },
+  };
+  const orientation = { heading: 30, pitch: 0.28 };
+  const first = updateCoverageFromFrame(seeded, orientation, { x: 0, y: 0, z: 0 }, plainAnalysis, 0, { accepted: true, observedAt: 1000 });
+  const second = updateCoverageFromFrame(first, orientation, { x: 0, y: 0, z: 0 }, plainAnalysis, 0, { accepted: true, observedAt: 2000 });
+  const third = updateCoverageFromFrame(second, orientation, { x: 0, y: 0, z: 0 }, plainAnalysis, 0, { accepted: true, observedAt: 3000 });
+
+  expect(third.coverageRegions.find((region) => region.id === 'upper-1').status).toBe('INFERABLE');
+  expect(third.lowCoverageRegions.some((region) => region.id === 'upper-1')).toBe(false);
 });
