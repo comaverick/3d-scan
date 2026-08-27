@@ -162,6 +162,39 @@ export const scannerQualityConfig = Object.freeze({
   lowTextureFeatureDensity: 0.12,
 });
 
+// Target-view measurements use meters, degrees, normalized screen overlap,
+// and normalized [0, 1] image/parallax scores respectively.  These are
+// deliberately separate from the frame-acceptance thresholds above.
+export const targetViewConfig = Object.freeze({
+  requiredUsefulViews: 3,
+  minimumScreenOverlap: 0.35,
+  minimumTargetFeatures: 8,
+  minimumFeatureMatches: 4,
+  minimumTranslationMeters: 0.15,
+  minimumAngleDegrees: 8,
+  minimumParallax: 0.08,
+  duplicateTranslationMeters: 0.04,
+  duplicateAngleDegrees: 3,
+  duplicateParallax: 0.03,
+  usefulViewUtilityThreshold: 0.35,
+});
+
+function createTargetViewRejectionReasons() {
+  return {
+    TARGET_NOT_VISIBLE: 0,
+    LOW_SCREEN_OVERLAP: 0,
+    LOW_TRANSLATION: 0,
+    LOW_ANGLE_CHANGE: 0,
+    LOW_PARALLAX: 0,
+    LOW_FEATURES: 0,
+    POSE_MISSING: 0,
+    TARGET_ID_MISMATCH: 0,
+    DUPLICATE_VIEW: 0,
+    FRAME_REJECTED: 0,
+    UNKNOWN: 0,
+  };
+}
+
 export const scannerReadinessConfig = Object.freeze({
   // Ready means useful structural coverage, not every view-sector cell.
   readyAcceptedKeyframes: 24,
@@ -206,6 +239,13 @@ function createCoverageRegions() {
     featureDensity: 0,
     featureMatchCount: 0,
     quality: 0,
+    usefulViews: 0,
+    targetCaptureState: 'LOCATING',
+    targetViewCandidates: 0,
+    targetViewRejectionReasons: createTargetViewRejectionReasons(),
+    lastTargetViewPose: null,
+    lastTargetViewDecision: null,
+    captureSource: 'OBSERVED',
     attempts: 0,
     lastObservedAt: 0,
     coverageScore: 0,
@@ -266,6 +306,8 @@ function createInitialScanState() {
     reconstructionConfidence: 0,
     visibleRegionIds: [],
     sceneUnderstanding: null,
+    activeTargetId: null,
+    lastTargetViewDecision: null,
     skippedRegionIds: [],
     targetStalled: false,
     scanReadiness: {
@@ -360,6 +402,9 @@ function projectCoverageRegions(regions, orientation) {
       ...region,
       currentlyVisible: horizontalVisible && verticalVisible,
       screenBounds,
+      // This is a normalized estimate of how much of the projected target is
+      // inside the usable camera frustum, not a pixel measurement.
+      screenOverlap: horizontalVisible && verticalVisible ? visibleScore : 0,
       visibilityScore: visibleScore,
       screenPosition: { x: xCenter, y: yCenter },
     };
@@ -395,6 +440,17 @@ function isMeaningfullyDifferentView(previousView, nextView) {
   return translation >= 0.1 || headingChange >= 10 || pitchChange >= 0.14;
 }
 
+function targetAngleDelta(previousView, nextView) {
+  if (!previousView || !nextView) return 0;
+  const headingChange = previousView.heading === null || nextView.heading === null
+    ? 0
+    : angleDistance(previousView.heading, nextView.heading);
+  // pitch is normalized to approximately [-1, 1], so convert it to degrees
+  // before comparing it with heading, which is already in degrees.
+  const pitchChangeDegrees = Math.abs((Number(previousView.pitch) || 0) - (Number(nextView.pitch) || 0)) * 90;
+  return Math.max(headingChange, pitchChangeDegrees);
+}
+
 function regionFeatureDensity(region, analysis) {
   const globalDensity = clamp((Number(analysis?.featureCount) || 0) / 850, 0, 1);
   const grid = analysis?.sceneUnderstanding?.grid;
@@ -405,6 +461,99 @@ function regionFeatureDensity(region, analysis) {
   const row = clamp(Math.floor(centerY * 3), 0, 2);
   const localDensity = Number(grid[row]?.[column]?.detail) || 0;
   return clamp((globalDensity * 0.45) + (localDensity * 0.55), 0, 1);
+}
+
+function targetViewMetrics(targetRegion, analysis, pose, orientation, previousView, fallbackParallax = 0) {
+  const currentView = targetRegion ? cameraPoseForRegion(targetRegion, pose, orientation) : null;
+  const poseAvailable = Boolean(currentView?.position)
+    && Object.values(currentView.position).every((value) => Number.isFinite(Number(value)));
+  const translationDelta = previousView && poseAvailable
+    ? poseDistance(previousView.position, currentView.position)
+    : 0;
+  const angleDelta = targetAngleDelta(previousView, currentView);
+  const rawParallaxMeters = previousView && poseAvailable ? translationDelta : Number(fallbackParallax) || 0;
+  const parallax = clamp(rawParallaxMeters / 0.45, 0, 1);
+  const screenOverlap = clamp(Number(targetRegion?.screenOverlap ?? targetRegion?.visibilityScore) || 0, 0, 1);
+  const targetFeatureDensity = regionFeatureDensity(targetRegion, analysis);
+  const targetFeatureCount = Math.round(targetFeatureDensity * 850);
+  const targetMatchedFeatureCount = Math.round((Number(analysis?.trackedFeatureCount) || 0) * screenOverlap);
+  // sceneChange is the existing normalized feature-displacement proxy from
+  // the frame analyzer. It supplements pose when browser translation is noisy.
+  const featureDisplacement = clamp(Number(analysis?.sceneChange) || 0, 0, 1);
+  const visualParallax = featureDisplacement >= 0.18 && targetMatchedFeatureCount >= targetViewConfig.minimumFeatureMatches
+    ? clamp(featureDisplacement / 0.28, 0, 1)
+    : 0;
+  const parallaxEvidence = Math.max(parallax, visualParallax);
+  const translationScore = clamp(translationDelta / targetViewConfig.minimumTranslationMeters, 0, 1);
+  const angleScore = clamp(angleDelta / targetViewConfig.minimumAngleDegrees, 0, 1);
+  const parallaxUtilityScore = clamp(parallaxEvidence / targetViewConfig.minimumParallax, 0, 1);
+  const featureScore = clamp(targetFeatureCount / 40, 0, 1);
+  const utilityScore = clamp(
+    (translationScore * 0.30)
+      + (angleScore * 0.30)
+      + (parallaxUtilityScore * 0.25)
+      + (featureScore * 0.15),
+    0,
+    1,
+  );
+  return {
+    currentView,
+    poseAvailable,
+    translationDelta,
+    angleDelta,
+    parallax,
+    visualParallax,
+    featureDisplacement,
+    parallaxEvidence,
+    parallaxUtilityScore,
+    screenOverlap,
+    targetFeatureCount,
+    targetMatchedFeatureCount,
+    utilityScore,
+  };
+}
+
+export function qualifyTargetView({ targetRegion, activeTargetId, analysis, pose, orientation, previousView, parallaxDistance = 0, frameAccepted = true }) {
+  const base = targetViewMetrics(targetRegion, analysis, pose, orientation, previousView, parallaxDistance);
+  const result = {
+    targetRegionId: activeTargetId || targetRegion?.id || null,
+    targetType: targetRegion?.semanticType || null,
+    visible: Boolean(targetRegion?.currentlyVisible),
+    qualified: false,
+    reason: 'UNKNOWN',
+    ...base,
+  };
+  if (!frameAccepted) return { ...result, reason: 'FRAME_REJECTED' };
+  if (!activeTargetId || !targetRegion || targetRegion.id !== activeTargetId) return { ...result, reason: 'TARGET_ID_MISMATCH' };
+  if (!targetRegion.currentlyVisible) return { ...result, reason: 'TARGET_NOT_VISIBLE' };
+  if (base.screenOverlap < targetViewConfig.minimumScreenOverlap) return { ...result, reason: 'LOW_SCREEN_OVERLAP' };
+  if (base.targetFeatureCount < targetViewConfig.minimumTargetFeatures) return { ...result, reason: 'LOW_FEATURES' };
+  if (previousView && !base.poseAvailable && base.angleDelta === 0) return { ...result, reason: 'POSE_MISSING' };
+
+  if (!previousView) {
+    return { ...result, qualified: true, reason: null };
+  }
+
+  const translationEnough = base.translationDelta >= targetViewConfig.minimumTranslationMeters;
+  const angleEnough = base.angleDelta >= targetViewConfig.minimumAngleDegrees;
+  const parallaxEnough = base.parallaxEvidence >= targetViewConfig.minimumParallax;
+  const duplicate = previousView
+    && base.translationDelta < targetViewConfig.duplicateTranslationMeters
+    && base.angleDelta < targetViewConfig.duplicateAngleDegrees
+    && base.parallaxEvidence < targetViewConfig.duplicateParallax
+    && base.featureDisplacement < 0.08;
+  if (duplicate) return { ...result, reason: 'DUPLICATE_VIEW' };
+  if (!translationEnough && !angleEnough && !parallaxEnough) {
+    if (base.translationDelta < targetViewConfig.minimumTranslationMeters) return { ...result, reason: 'LOW_TRANSLATION' };
+    if (base.angleDelta < targetViewConfig.minimumAngleDegrees) return { ...result, reason: 'LOW_ANGLE_CHANGE' };
+    return { ...result, reason: 'LOW_PARALLAX' };
+  }
+  // The first accepted view establishes the target baseline. Every later view
+  // must provide at least one independent source of geometric evidence.
+  if (base.utilityScore >= targetViewConfig.usefulViewUtilityThreshold) {
+    return { ...result, qualified: true, reason: null };
+  }
+  return { ...result, reason: 'LOW_PARALLAX' };
 }
 
 function hasNeighborEvidence(regions, region) {
@@ -422,7 +571,8 @@ function updateRegionStatuses(regions) {
     if (region.skipped) return { ...region, status: region.status === 'UNSEEN' ? 'INFERABLE' : region.status };
     const lowTexture = region.attempts >= scannerQualityConfig.lowTextureAttempts
       && region.featureDensity < scannerQualityConfig.lowTextureFeatureDensity;
-    const sufficient = region.coverage >= 0.72
+    const sufficient = region.targetCaptureState === 'COMPLETE'
+      || region.coverage >= 0.72
       || (region.uniqueViewAngles >= 3 && region.parallaxScore >= 0.32 && region.observations >= 3);
     let status = region.status;
     if (sufficient) status = 'SUFFICIENT';
@@ -693,7 +843,12 @@ function movementForTarget(targetRegion, currentOrientation, scanState) {
 
 export function determineNextAction(scanState) {
   const currentOrientation = scanState?.currentOrientation || {};
-  const targetRegion = scanState?.lowCoverageRegions?.[0];
+  const lockedTarget = scanState?.activeTargetId
+    ? scanState.coverageRegions?.find((region) => region.id === scanState.activeTargetId
+      && !region.skipped
+      && !['SUFFICIENT', 'INFERABLE'].includes(region.status))
+    : null;
+  const targetRegion = lockedTarget || scanState?.lowCoverageRegions?.[0];
   if ((scanState?.framesEvaluated || 0) === 0 && (scanState?.acceptedFrames || 0) === 0) {
     return { type: 'START_SCAN', direction: 'O', label: 'READY TO SCAN', eyebrow: 'Build coverage from your movement', title: 'Aim at the room and start moving', instruction: 'Keep the camera level and move naturally. The scanner will keep the useful views.', helper: 'Follow the highlighted area when you are ready for another part of the room.', target: 'Waiting for camera', priority: 1, confidence: 1, adaptiveGuidance: null };
   }
@@ -1037,7 +1192,11 @@ export function updateCoverageFromFrame(previousState, orientation, pose, analys
   if (!analysis) return previousState;
   const frameOrientation = orientationForFrame(orientation, pose, previousState);
   const projectedRegions = projectCoverageRegions(previousState.coverageRegions, frameOrientation);
-  const targetRegion = nearestCoverageRegion(projectedRegions, frameOrientation);
+  const activeTargetId = options.activeTargetId || previousState.activeTargetId || null;
+  const activeTarget = activeTargetId
+    ? projectedRegions.find((region) => region.id === activeTargetId) || null
+    : null;
+  const nearestRegion = nearestCoverageRegion(projectedRegions, frameOrientation);
   const accepted = options.accepted !== false;
   const observedAt = Number(options.observedAt) || Date.now();
   const usableObservation = accepted
@@ -1046,8 +1205,73 @@ export function updateCoverageFromFrame(previousState, orientation, pose, analys
     && !analysis.motionBlur
     && !analysis.poorLighting;
   let regions = projectedRegions;
-  if (targetRegion && usableObservation && !targetRegion.skipped) {
-    const regionIndex = regions.findIndex((candidate) => candidate.id === targetRegion.id);
+  let targetViewDecision = previousState.lastTargetViewDecision || null;
+  if (activeTargetId) {
+    const activeIndex = regions.findIndex((candidate) => candidate.id === activeTargetId);
+    if (activeIndex >= 0) {
+      const region = { ...regions[activeIndex] };
+      const previousTargetView = region.lastTargetViewPose || null;
+      targetViewDecision = qualifyTargetView({
+        targetRegion: region,
+        activeTargetId,
+        analysis,
+        pose,
+        orientation: frameOrientation,
+        previousView: previousTargetView,
+        parallaxDistance,
+        frameAccepted: usableObservation,
+      });
+      if (usableObservation) {
+        region.targetViewCandidates = (region.targetViewCandidates || 0) + 1;
+        if (region.currentlyVisible && region.targetCaptureState === 'LOCATING') {
+          region.targetCaptureState = 'COLLECTING_VIEWS';
+        }
+        if (targetViewDecision.qualified) {
+          region.usefulViews = Math.min(targetViewConfig.requiredUsefulViews, (region.usefulViews || 0) + 1);
+          region.uniqueViewAngles = region.usefulViews;
+          region.targetCaptureState = region.usefulViews >= targetViewConfig.requiredUsefulViews
+            ? 'COMPLETE'
+            : 'COLLECTING_VIEWS';
+        } else {
+          const reasons = { ...createTargetViewRejectionReasons(), ...(region.targetViewRejectionReasons || {}) };
+          reasons[targetViewDecision.reason || 'UNKNOWN'] = (reasons[targetViewDecision.reason || 'UNKNOWN'] || 0) + 1;
+          region.targetViewRejectionReasons = reasons;
+        }
+        if (targetViewDecision.visible) region.lastTargetViewPose = targetViewDecision.currentView;
+      } else if (accepted) {
+        const reasons = { ...createTargetViewRejectionReasons(), ...(region.targetViewRejectionReasons || {}) };
+        reasons.FRAME_REJECTED += 1;
+        region.targetViewRejectionReasons = reasons;
+      }
+      region.lastTargetViewDecision = targetViewDecision;
+      regions[activeIndex] = region;
+    } else {
+      targetViewDecision = {
+        targetRegionId: activeTargetId,
+        targetType: null,
+        visible: false,
+        qualified: false,
+        reason: 'TARGET_ID_MISMATCH',
+        translationDelta: 0,
+        angleDelta: 0,
+        parallax: 0,
+        parallaxEvidence: 0,
+        featureDisplacement: 0,
+        screenOverlap: 0,
+        targetFeatureCount: 0,
+        targetMatchedFeatureCount: 0,
+        utilityScore: 0,
+      };
+    }
+  }
+
+  // An accepted frame can still contribute to general room coverage when it
+  // sees a different region. It must never increment the active target's view
+  // count unless that canonical target passed the visibility/novelty checks.
+  const coverageTarget = activeTargetId && activeTarget?.currentlyVisible ? activeTarget : nearestRegion;
+  if (coverageTarget && usableObservation && !coverageTarget.skipped) {
+    const regionIndex = regions.findIndex((candidate) => candidate.id === coverageTarget.id);
+    if (regionIndex < 0) return previousState;
     const region = { ...regions[regionIndex] };
     const parallax = clamp((Number(parallaxDistance) || 0) / 0.45, 0, 1);
     const nextPose = cameraPoseForRegion(region, pose, frameOrientation);
@@ -1058,8 +1282,10 @@ export function updateCoverageFromFrame(previousState, orientation, pose, analys
     region.observations += 1;
     region.parallax = Math.max(region.parallax, parallax);
     region.observationCount = region.observations;
-    region.uniqueViewAngles = Math.min(4, region.uniqueViewAngles + (region.observations === 1 || meaningfulView ? 1 : 0));
-    region.viewpointDiversity = clamp(region.uniqueViewAngles / 3, 0, 1);
+    if (!activeTargetId) {
+      region.uniqueViewAngles = Math.min(4, region.uniqueViewAngles + (region.observations === 1 || meaningfulView ? 1 : 0));
+    }
+    region.viewpointDiversity = clamp((region.usefulViews || region.uniqueViewAngles) / 3, 0, 1);
     region.averageQuality = ((region.averageQuality * Math.max(0, region.observations - 1)) + analysis.qualityScore) / region.observations;
     region.quality = region.averageQuality;
     region.parallaxScore = Math.max(region.parallaxScore, parallax);
@@ -1101,6 +1327,8 @@ export function updateCoverageFromFrame(previousState, orientation, pose, analys
       ? { method: 'deterministic-spatial-gradient', ...analysis.sceneUnderstanding }
       : null,
     coverageRegions: regions,
+    activeTargetId,
+    lastTargetViewDecision: targetViewDecision,
     visibleRegionIds: regions.filter((region) => region.currentlyVisible).map((region) => region.id),
     lowCoverageRegions: summary.lowCoverageRegions,
     floorCoverage: summary.floorCoverage,
@@ -1176,6 +1404,7 @@ function App() {
   const [motionTelemetry, setMotionTelemetry] = useState(() => motionTrackerRef.current.getSnapshot());
   const scanStateRef = useRef(scanState);
   const orientationRef = useRef({ alpha: null, beta: null, gamma: null, heading: null, pitch: 0 });
+  const activeTargetIdRef = useRef(null);
   const frameStoreRef = useRef([]);
   const nextKeyframeIdRef = useRef(1);
   const captureFrameRef = useRef(null);
@@ -1212,7 +1441,7 @@ function App() {
   const instructionText = scanInstruction.instruction;
   const activeTarget = scanInstruction.targetRegion;
   const targetScreenBounds = activeTarget?.screenBounds;
-  const targetViewCount = Math.min(3, Number(activeTarget?.uniqueViewAngles) || 0);
+  const targetViewCount = Math.min(targetViewConfig.requiredUsefulViews, Number(activeTarget?.usefulViews) || 0);
   const targetDebugReason = activeTarget ? targetReason(activeTarget, scanState) : '—';
 
   useEffect(() => {
@@ -1244,6 +1473,7 @@ function App() {
     setMotionTelemetry(snapshot);
     lastMotionStateRef.current = snapshot.motionState;
     const target = scanInstruction.targetRegion;
+    activeTargetIdRef.current = target?.id || null;
     if (!target) {
       guidanceWatchdogRef.current = { targetId: null, startedAt: 0, startingCoverage: 0 };
     } else if (guidanceWatchdogRef.current.targetId !== target.id) {
@@ -1410,8 +1640,35 @@ function App() {
         pose,
         analysis,
         translationSinceLast,
-        { accepted: true, observedAt: now, keyframeId },
+        { accepted: true, observedAt: now, keyframeId, activeTargetId: activeTargetIdRef.current },
       );
+      if (SCANNER_DEBUG) {
+        const targetDecision = coverageState.lastTargetViewDecision;
+        if (activeTargetIdRef.current && targetDecision?.targetRegionId !== activeTargetIdRef.current) {
+          // eslint-disable-next-line no-console
+          console.warn('[TARGET_ID_MISMATCH]', {
+            overlayTargetId: activeTargetIdRef.current,
+            coverageTargetId: targetDecision?.targetRegionId || null,
+          });
+        }
+        // eslint-disable-next-line no-console
+        console.log('KEYFRAME:', {
+          id: keyframeId,
+          timestamp: now,
+          activeTargetId: activeTargetIdRef.current,
+          targetType: targetDecision?.targetType || null,
+          targetVisible: targetDecision?.visible || false,
+          targetOverlap: targetDecision?.screenOverlap || 0,
+          translationDeltaMeters: targetDecision?.translationDelta || 0,
+          angleDeltaDegrees: targetDecision?.angleDelta || 0,
+          parallax: targetDecision?.parallaxEvidence || 0,
+          featureDisplacement: targetDecision?.featureDisplacement || 0,
+          utilityScore: targetDecision?.utilityScore || 0,
+          utilityThreshold: targetViewConfig.usefulViewUtilityThreshold,
+          qualified: targetDecision?.qualified ? 'YES' : 'NO',
+          rejectionReason: targetDecision?.reason || null,
+        });
+      }
       setFramesCaptured(frameStoreRef.current.length);
       const nextStateBeforeReadiness = {
         ...coverageState,
@@ -1470,6 +1727,7 @@ function App() {
     setLiveTelemetry(EMPTY_POSE);
     guidanceControllerRef.current.reset();
     guidanceWatchdogRef.current = { targetId: null, startedAt: 0, startingCoverage: 0 };
+    activeTargetIdRef.current = null;
     const initialScanState = createInitialScanState();
     scanStateRef.current = initialScanState;
     setScanState(initialScanState);
@@ -1614,7 +1872,7 @@ function App() {
           const pose = { ...lastTelemetryRef.current };
            const now = Date.now();
            const parallaxDistance = lastCoveragePoseRef.current ? poseDistance(lastCoveragePoseRef.current, pose) : 0;
-           const nextState = updateCoverageFromFrame(scanStateRef.current, orientationRef.current, pose, analysis, parallaxDistance, { accepted: false, observedAt: now });
+           const nextState = updateCoverageFromFrame(scanStateRef.current, orientationRef.current, pose, analysis, parallaxDistance, { accepted: false, observedAt: now, activeTargetId: activeTargetIdRef.current });
            const watchdog = guidanceWatchdogRef.current;
            const watchedTarget = watchdog.targetId ? nextState.coverageRegions.find((region) => region.id === watchdog.targetId) : null;
            nextState.targetStalled = isTargetStalled(watchdog, watchedTarget, now);
@@ -1974,6 +2232,7 @@ function App() {
     const initialScanState = createInitialScanState();
     guidanceControllerRef.current.reset();
     guidanceWatchdogRef.current = { targetId: null, startedAt: 0, startingCoverage: 0 };
+    activeTargetIdRef.current = null;
     scanStateRef.current = initialScanState;
     setScanState(initialScanState);
     setLiveTelemetry(EMPTY_POSE);
@@ -2132,13 +2391,17 @@ function App() {
                       <span>Visible</span><b>{activeTarget.currentlyVisible ? 'YES' : 'NO'}</b>
                       <span>Screen coverage</span><b>{targetScreenBounds ? `${Math.round(targetScreenBounds.width * targetScreenBounds.height * 100)}% area` : '—'}</b>
                       <span>Observations</span><b>{activeTarget.observationCount || activeTarget.observations || 0}</b>
-                      <span>Unique viewpoints</span><b>{activeTarget.uniqueViewAngles || 0}</b>
+                      <span>Useful views</span><b>{activeTarget.usefulViews || 0}</b>
+                      <span>Target state</span><b>{activeTarget.targetCaptureState || 'LOCATING'}</b>
+                      <span>Accepted candidates</span><b>{activeTarget.targetViewCandidates || 0}</b>
                       <span>Parallax</span><b>{(activeTarget.parallaxScore || 0).toFixed(2)}</b>
                       <span>Features</span><b>{Math.round((activeTarget.featureDensity || 0) * 850)}</b>
                       <span>Feature matches</span><b>{activeTarget.featureMatchCount || 0}</b>
                       <span>Coverage</span><b>{Math.round((activeTarget.coverage || 0) * 100)}%</b>
                       <span>Attempts</span><b>{activeTarget.attempts || 0}</b>
                       <span>Reason incomplete</span><b>{targetDebugReason}</b>
+                      <span>Last view result</span><b>{scanState.lastTargetViewDecision?.qualified ? 'YES' : scanState.lastTargetViewDecision?.reason || '—'}</b>
+                      <span>Target view rejects</span><b>{Object.entries(activeTarget.targetViewRejectionReasons || {}).filter(([, count]) => count > 0).map(([reason, count]) => `${reason}:${count}`).join(' ') || 'none'}</b>
                       <span>Next instruction</span><b>{scanInstruction.adaptiveGuidance?.movementInstruction?.type || scanInstruction.adaptiveGuidance?.aimInstruction?.direction || scanInstruction.type}</b>
                     </div>
                   </>
@@ -2209,7 +2472,7 @@ function App() {
                     <span className="target-progress-dots" aria-hidden="true">
                       {[0, 1, 2].map((dot) => <i key={dot} className={dot < targetViewCount ? 'target-progress-dot target-progress-dot-filled' : 'target-progress-dot'} />)}
                     </span>
-                    <small>{activeTarget.status === 'SUFFICIENT' ? 'Area captured' : `${targetViewCount}/3 useful views`}</small>
+                    <small>{activeTarget.status === 'SUFFICIENT' || activeTarget.targetCaptureState === 'COMPLETE' ? 'Area captured' : `${targetViewCount}/3 useful views`}</small>
                   </div>
                 )}
               </div>

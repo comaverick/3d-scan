@@ -1,5 +1,5 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
-import App, { canManuallyFinishScan, calculateScanProgress, calculateScanReadiness, createGuidanceController, createInitialScanState, determineNextAction, isTargetStalled, updateCoverageFromFrame } from './App';
+import App, { canManuallyFinishScan, calculateScanProgress, calculateScanReadiness, createGuidanceController, createInitialScanState, determineNextAction, isTargetStalled, targetViewConfig, updateCoverageFromFrame } from './App';
 
 test('renders the SmartScan starting state', () => {
   render(<App />);
@@ -185,18 +185,81 @@ test('a localized target completes after useful lateral viewpoints instead of lo
     },
   };
   const orientation = { heading: 30, pitch: 0.28 };
-  const first = updateCoverageFromFrame(base, orientation, { x: 0, y: 0, z: 0 }, analysis, 0.2, { accepted: true, keyframeId: 1, observedAt: 1000 });
-  const second = updateCoverageFromFrame(first, orientation, { x: 0.2, y: 0, z: 0 }, analysis, 0.2, { accepted: true, keyframeId: 2, observedAt: 2000 });
-  const third = updateCoverageFromFrame(second, orientation, { x: 0.4, y: 0, z: 0 }, analysis, 0.2, { accepted: true, keyframeId: 3, observedAt: 3000 });
+  const targetId = 'upper-1';
+  const first = updateCoverageFromFrame(base, orientation, { x: 0, y: 0, z: 0 }, analysis, 0.2, { accepted: true, activeTargetId: targetId, keyframeId: 1, observedAt: 1000 });
+  const second = updateCoverageFromFrame(first, orientation, { x: 0.2, y: 0, z: 0 }, analysis, 0.2, { accepted: true, activeTargetId: targetId, keyframeId: 2, observedAt: 2000 });
+  const third = updateCoverageFromFrame(second, orientation, { x: 0.4, y: 0, z: 0 }, analysis, 0.2, { accepted: true, activeTargetId: targetId, keyframeId: 3, observedAt: 3000 });
   const target = third.coverageRegions.find((region) => region.id === 'upper-1');
 
   expect(first.visibleRegionIds).toContain('upper-1');
   expect(first.sceneUnderstanding.method).toBe('deterministic-spatial-gradient');
   expect(target.observationCount).toBe(3);
   expect(target.acceptedKeyframeIds).toEqual([1, 2, 3]);
+  expect(first.coverageRegions.find((region) => region.id === targetId).usefulViews).toBe(1);
+  expect(second.coverageRegions.find((region) => region.id === targetId).usefulViews).toBe(2);
+  expect(target.usefulViews).toBe(targetViewConfig.requiredUsefulViews);
+  expect(target.targetCaptureState).toBe('COMPLETE');
   expect(target.uniqueViewAngles).toBe(3);
   expect(target.status).toBe('SUFFICIENT');
   expect(third.lowCoverageRegions.some((region) => region.id === 'upper-1')).toBe(false);
+});
+
+test('a duplicate accepted viewpoint does not increment the active target', () => {
+  const base = createInitialScanState();
+  const analysis = {
+    qualityScore: 0.82,
+    featureCount: 220,
+    trackedFeatureCount: 150,
+    featureTrackingQuality: 0.8,
+    sharpness: 0.8,
+    brightness: 0.5,
+    motionBlur: false,
+    poorLighting: false,
+    sceneChange: 0.01,
+    sceneUnderstanding: {
+      grid: Array.from({ length: 3 }, () => Array.from({ length: 3 }, () => ({ detail: 0.8, brightness: 0.5 }))),
+    },
+  };
+  const orientation = { heading: 30, pitch: 0.28 };
+  const first = updateCoverageFromFrame(base, orientation, { x: 0, y: 0, z: 0 }, analysis, 0, { accepted: true, activeTargetId: 'upper-1', keyframeId: 1, observedAt: 1000 });
+  const duplicate = updateCoverageFromFrame(first, orientation, { x: 0, y: 0, z: 0 }, analysis, 0, { accepted: true, activeTargetId: 'upper-1', keyframeId: 2, observedAt: 2000 });
+  const target = duplicate.coverageRegions.find((region) => region.id === 'upper-1');
+
+  expect(target.usefulViews).toBe(1);
+  expect(target.targetViewRejectionReasons.DUPLICATE_VIEW).toBe(1);
+  expect(duplicate.lastTargetViewDecision.reason).toBe('DUPLICATE_VIEW');
+});
+
+test('an accepted frame is recorded against the canonical active target, not the nearest cell', () => {
+  const base = createInitialScanState();
+  const analysis = {
+    qualityScore: 0.82,
+    featureCount: 220,
+    trackedFeatureCount: 150,
+    featureTrackingQuality: 0.8,
+    motionBlur: false,
+    poorLighting: false,
+    sceneChange: 0.4,
+    sceneUnderstanding: {
+      grid: Array.from({ length: 3 }, () => Array.from({ length: 3 }, () => ({ detail: 0.8, brightness: 0.5 }))),
+    },
+  };
+  // At heading 60 the nearest cell is upper-2, but upper-1 is still visibly
+  // inside the frustum and is the target shown by the UI.
+  const state = updateCoverageFromFrame(
+    base,
+    { heading: 60, pitch: 0.28 },
+    { x: 0, y: 0, z: 0 },
+    analysis,
+    0,
+    { accepted: true, activeTargetId: 'upper-1', keyframeId: 1, observedAt: 1000 },
+  );
+
+  expect(state.activeTargetId).toBe('upper-1');
+  expect(state.lastTargetViewDecision.targetRegionId).toBe('upper-1');
+  expect(state.lastTargetViewDecision.qualified).toBe(true);
+  expect(state.coverageRegions.find((region) => region.id === 'upper-1').usefulViews).toBe(1);
+  expect(state.coverageRegions.find((region) => region.id === 'upper-2').usefulViews).toBe(0);
 });
 
 test('progress reflects useful structural, viewpoint, keyframe, and reconstruction evidence', () => {
