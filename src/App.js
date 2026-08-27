@@ -2,6 +2,22 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import * as THREE from 'three';
 import './App.css';
 import { createMotionTracker, MOTION_STATES, scannerMotionConfig } from './scannerMotion';
+import {
+  SCANNER_PHASES,
+  addSpatialObservations,
+  calculateInitialMappingReadiness,
+  calculateOrientationCoverage,
+  calculateViewpointDiversity,
+  createSpatialObservationsFromFrame,
+  deriveTargetStatuses,
+  generateObservedTargets,
+  mappingReadinessConfig,
+  observedTargetConfig,
+  relativePoseEstimate,
+  updateFeatureTracks,
+  projectObservedTargets,
+  targetDescription,
+} from './scannerCoverage';
 
 const RECONSTRUCTION_API = process.env.REACT_APP_RECONSTRUCTION_API || '';
 
@@ -146,7 +162,11 @@ const TELEMETRY = [
 */
 
 const COVERAGE_COLUMNS = 12;
+// Legacy sector constants are retained only by the disabled compatibility
+// helpers below; normal scanning never constructs targets from these sectors.
+// eslint-disable-next-line no-unused-vars
 const COVERAGE_HORIZONTAL_FOV_DEGREES = 70;
+// eslint-disable-next-line no-unused-vars
 const COVERAGE_VERTICAL_FOV = 0.78;
 const COVERAGE_ROWS = [
   { id: 'ceiling', label: 'Ceiling', pitch: 0.62 },
@@ -393,7 +413,7 @@ export const scannerQualityConfig = Object.freeze({
 export const targetViewConfig = Object.freeze({
   requiredUsefulViews: 3,
   minimumScreenOverlap: 0.35,
-  minimumTargetFeatures: 8,
+  minimumTargetFeatures: 3,
   minimumFeatureMatches: 4,
   minimumTranslationMeters: 0.15,
   minimumAngleDegrees: 8,
@@ -438,50 +458,36 @@ export const scannerReadinessConfig = Object.freeze({
 const EMPTY_POSE = { x: '0.00', y: '0.00', z: '0.00', yaw: '—', speed: '0.00', quality: 'Waiting' };
 
 function createCoverageRegions() {
-  return COVERAGE_ROWS.flatMap((row) => Array.from({ length: COVERAGE_COLUMNS }, (_, column) => ({
-    id: `${row.id}-${column}`,
-    surfaceId: `${row.id}-surface-${column}`,
-    semanticType: row.id === 'floor' ? 'FLOOR' : row.id === 'ceiling' ? 'CEILING' : 'WALL',
-    label: row.label,
-    row: row.id,
-    column,
-    yaw: (column / COVERAGE_COLUMNS) * 360,
-    pitch: row.pitch,
-    estimatedWorldCenter: null,
-    estimatedNormal: null,
-    currentlyVisible: false,
-    screenBounds: null,
-    coverage: 0,
-    observations: 0,
-    acceptedKeyframeIds: [],
-    cameraPoses: [],
-    parallax: 0,
-    observationCount: 0,
-    uniqueViewAngles: 0,
-    viewpointDiversity: 0,
-    averageQuality: 0,
-    parallaxScore: 0,
-    featureDensity: 0,
-    featureMatchCount: 0,
-    quality: 0,
-    usefulViews: 0,
-    targetCaptureState: 'LOCATING',
-    targetViewCandidates: 0,
-    targetViewRejectionReasons: createTargetViewRejectionReasons(),
-    lastTargetViewPose: null,
-    lastTargetViewDecision: null,
-    captureSource: 'OBSERVED',
-    attempts: 0,
-    lastObservedAt: 0,
-    coverageScore: 0,
-    status: 'UNSEEN',
-    skipped: false,
-  })));
+  // Normal scanning starts with no targets. Regions are created only after
+  // the initial mapper has real accepted keyframes and spatial observations.
+  return [];
 }
 
 function createInitialScanState() {
   const regions = createCoverageRegions();
   return {
+    phase: SCANNER_PHASES.INITIAL_MAPPING,
+    mapping: {
+      referenceCameraPose: null,
+      acceptedKeyframes: 0,
+      keyframes: [],
+      trackedFeatureCount: 0,
+      multiFrameFeatureTrackCount: 0,
+      featureTracks: [],
+      orientationCoverage: 0,
+      viewpointDiversity: 0,
+      successfulRelativePoseCount: 0,
+      relativePoses: [],
+      sparseObservations: [],
+      mappingReady: false,
+      readinessReason: 'Waiting for accepted keyframes, tracks, viewpoint diversity, and relative poses.',
+    },
+    mappingReady: false,
+    mappingReadiness: calculateInitialMappingReadiness({ mapping: { acceptedKeyframes: 0, trackedFeatureCount: 0, multiFrameFeatureTrackCount: 0, orientationCoverage: 0, viewpointDiversity: 0, successfulRelativePoseCount: 0 } }),
+    multiFrameFeatureTrackCount: 0,
+    successfulRelativePoseCount: 0,
+    referenceCameraPose: null,
+    featureTracks: [],
     cameraPose: EMPTY_POSE,
     currentOrientation: { alpha: null, beta: null, gamma: null, heading: null, pitch: 0 },
     trackedFeatureCount: 0,
@@ -601,6 +607,7 @@ function nearestCoverageRegion(regions, orientation) {
   }, null)?.region;
 }
 
+// eslint-disable-next-line no-unused-vars
 function coverageRowBounds(row) {
   if (row === 'ceiling') return { y: 0.02, height: 0.25 };
   if (row === 'upper') return { y: 0.2, height: 0.28 };
@@ -626,6 +633,7 @@ export function validateTargetGeometry(target) {
   return { valid: true, reason: null };
 }
 
+// eslint-disable-next-line no-unused-vars
 function displayBoundsForNormalizedBounds(bounds, transform) {
   if (!transform) return bounds;
   const corners = [
@@ -641,6 +649,7 @@ function displayBoundsForNormalizedBounds(bounds, transform) {
   return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
 }
 
+// eslint-disable-next-line no-unused-vars
 function normalizedBoundsOverlap(bounds) {
   if (!bounds || bounds.width <= 0 || bounds.height <= 0) return 0;
   const intersectionWidth = Math.max(0, Math.min(1, bounds.x + bounds.width) - Math.max(0, bounds.x));
@@ -648,66 +657,11 @@ function normalizedBoundsOverlap(bounds) {
   return clamp((intersectionWidth * intersectionHeight) / (bounds.width * bounds.height), 0, 1);
 }
 
-function projectCoverageRegions(regions, orientation, displayTransform = null) {
-  const heading = Number.isFinite(Number(orientation?.heading))
-    ? Number(orientation.heading)
-    : Number.isFinite(Number(orientation?.alpha)) ? Number(orientation.alpha) : 0;
-  const pitch = Number(orientation?.pitch) || 0;
-  return regions.map((region) => {
-    const geometry = validateTargetGeometry(region);
-    if (!geometry.valid) {
-      if (SCANNER_DEBUG) {
-        // eslint-disable-next-line no-console
-        console.error('INVALID SCAN TARGET', region);
-      }
-      return {
-        ...region,
-        definitionSource: 'CAMERA_RELATIVE',
-        currentlyVisible: false,
-        screenBounds: null,
-        screenOverlap: 0,
-        visibilityScore: 0,
-        screenPosition: null,
-        visibilityReason: geometry.reason,
-      };
-    }
-    const yawDelta = normalizedAngleDelta(heading, region.yaw);
-    const pitchDelta = region.pitch - pitch;
-    const xCenter = clamp(0.5 + (yawDelta / COVERAGE_HORIZONTAL_FOV_DEGREES), 0.02, 0.98);
-    const yCenter = clamp(0.5 - (pitchDelta / COVERAGE_VERTICAL_FOV), 0.03, 0.97);
-    const width = clamp(0.18 + (0.06 * (1 - Math.min(1, Math.abs(yawDelta) / 45))), 0.12, 0.24);
-    const rowBounds = coverageRowBounds(region.row);
-    const height = rowBounds.height * 0.78;
-    const horizontalVisible = Math.abs(yawDelta) <= (COVERAGE_HORIZONTAL_FOV_DEGREES / 2) + 8;
-    const verticalVisible = Math.abs(pitchDelta) <= (COVERAGE_VERTICAL_FOV / 2) + 0.12;
-    const rawScreenBounds = {
-      x: xCenter - (width / 2),
-      y: yCenter - (height / 2),
-      width,
-      height,
-    };
-    const screenBounds = displayBoundsForNormalizedBounds(rawScreenBounds, displayTransform);
-    const visibleScore = clamp(
-      (1 - (Math.abs(yawDelta) / ((COVERAGE_HORIZONTAL_FOV_DEGREES / 2) + 8))) * 0.55
-      + (1 - (Math.abs(pitchDelta) / ((COVERAGE_VERTICAL_FOV / 2) + 0.12))) * 0.45,
-      0,
-      1,
-    );
-    const rawVisible = geometry.valid && horizontalVisible && verticalVisible;
-    const screenOverlap = rawVisible ? normalizedBoundsOverlap(screenBounds) : 0;
-    return {
-      ...region,
-      definitionSource: 'CAMERA_RELATIVE',
-      currentlyVisible: rawVisible && screenOverlap > 0,
-      screenBounds,
-      // This is a normalized estimate of how much of the projected target is
-      // inside the usable camera frustum, not a pixel measurement.
-      screenOverlap,
-      visibilityScore: visibleScore,
-      screenPosition: displayTransform ? normalizedToDisplay({ x: xCenter, y: yCenter }, displayTransform) : { x: xCenter, y: yCenter },
-      visibilityReason: !geometry.valid ? geometry.reason : rawVisible && screenOverlap > 0 ? null : 'OUTSIDE_FRUSTUM',
-    };
-  });
+function projectCoverageRegions(regions, orientation, displayTransform = null, pose = null) {
+  // Target projection is now derived from each target's observed world
+  // direction. The old pitch/yaw sector projection remains available only in
+  // the dead legacy helpers below and is not used by the scan path.
+  return projectObservedTargets(regions, orientation, pose, displayTransform);
 }
 
 function orientationForFrame(orientation, pose, previousState) {
@@ -866,6 +820,7 @@ export function qualifyTargetView({ targetRegion, activeTargetId, analysis, pose
   return { ...result, reason: 'LOW_PARALLAX' };
 }
 
+// eslint-disable-next-line no-unused-vars
 function hasNeighborEvidence(regions, region) {
   const neighbors = regions.filter((candidate) => {
     const sameRow = candidate.row === region.row && Math.abs(candidate.column - region.column) === 1;
@@ -877,42 +832,33 @@ function hasNeighborEvidence(regions, region) {
 }
 
 function updateRegionStatuses(regions) {
-  return regions.map((region) => {
-    if (region.skipped) return { ...region, status: region.status === 'UNSEEN' ? 'INFERABLE' : region.status };
-    const lowTexture = region.attempts >= scannerQualityConfig.lowTextureAttempts
-      && region.featureDensity < scannerQualityConfig.lowTextureFeatureDensity;
-    const sufficient = region.targetCaptureState === 'COMPLETE'
-      || region.coverage >= 0.72
-      || (region.uniqueViewAngles >= 3 && region.parallaxScore >= 0.32 && region.observations >= 3);
-    let status = region.status;
-    if (sufficient) status = 'SUFFICIENT';
-    else if (lowTexture) status = hasNeighborEvidence(regions, region) ? 'INFERABLE' : 'LOW_TEXTURE';
-    else if (region.observations > 0) status = 'PARTIAL';
-    else status = 'UNSEEN';
-    return { ...region, status };
-  });
+  return deriveTargetStatuses(regions);
 }
 
 function summarizeCoverage(regions) {
-  const average = (items) => items.length > 0 ? items.reduce((sum, region) => sum + region.coverage, 0) / items.length : 0;
-  const floor = regions.filter((region) => region.row === 'floor');
-  const ceiling = regions.filter((region) => region.row === 'ceiling');
-  const walls = regions.filter((region) => region.row === 'upper' || region.row === 'middle');
+  const observed = (Array.isArray(regions) ? regions : []).filter((region) => !region.skipped);
+  const average = (items) => items.length > 0 ? items.reduce((sum, region) => sum + (Number(region.coverage) || 0), 0) / items.length : 0;
+  const floor = observed.filter((region) => (Number(region.estimatedDirection?.y) || 0) < -0.28);
+  const ceiling = observed.filter((region) => (Number(region.estimatedDirection?.y) || 0) > 0.28);
+  const walls = observed.filter((region) => !floor.includes(region) && !ceiling.includes(region));
   const floorCoverage = average(floor);
   const wallCoverage = average(walls);
   const ceilingCoverage = average(ceiling);
-  // A room scan is not four equally important rows of pixels. Walls carry the
-  // most structure, with floor and ceiling as supporting evidence.
-  const totalCoverage = (wallCoverage * 0.6) + (floorCoverage * 0.25) + (ceilingCoverage * 0.15);
+  const totalCoverage = observed.length > 0
+    ? observed.reduce((sum, region) => sum + ((Number(region.coverage) || 0) * (Number(region.structuralImportance) || 0.5)), 0)
+      / observed.reduce((sum, region) => sum + (Number(region.structuralImportance) || 0.5), 0)
+    : 0;
+  const viewpointDiversity = average(observed.map((region) => ({ ...region, coverage: Number(region.viewpointDiversity) || 0 })));
   const lowCoverageRegions = [...regions]
     .filter((region) => !region.skipped && !['SUFFICIENT', 'INFERABLE'].includes(region.status))
-    .map((region) => ({ ...region, priority: (1 - region.coverage) + (region.coverage > 0.15 && region.parallax < 0.35 ? 0.28 : 0) }))
+    .map((region) => ({ ...region, priority: Number.isFinite(Number(region.priority)) ? region.priority : (1 - (Number(region.coverage) || 0)) }))
     .sort((first, second) => second.priority - first.priority);
   return {
     floorCoverage,
     wallCoverage,
     ceilingCoverage,
     totalCoverage,
+    viewpointDiversity,
     lowCoverageRegions,
   };
 }
@@ -969,6 +915,19 @@ function determineNextActionLegacy(scanState) {
   */
 }
 export function calculateScanReadiness(scanState) {
+  if (scanState?.phase === SCANNER_PHASES.INITIAL_MAPPING) {
+    const mapping = calculateInitialMappingReadiness(scanState);
+    return {
+      coverage: 0,
+      viewpointDiversity: mapping.viewpointDiversity,
+      acceptedKeyframes: mapping.acceptedKeyframes,
+      structuralCoverage: 0,
+      reconstructionConfidence: 0,
+      ready: mapping.ready,
+      reason: mapping.reason,
+      mapping,
+    };
+  }
   const coverage = Number(scanState?.totalCoverage) || 0;
   const wallCoverage = Number(scanState?.wallCoverage) || 0;
   const floorCoverage = Number(scanState?.floorCoverage) || 0;
@@ -998,6 +957,7 @@ export function calculateScanReadiness(scanState) {
 }
 
 export function canManuallyFinishScan(scanState) {
+  if (scanState?.phase === SCANNER_PHASES.INITIAL_MAPPING) return false;
   return (Number(scanState?.acceptedFrames) || 0) >= scannerReadinessConfig.manualFinishAcceptedKeyframes
     && (Number(scanState?.totalCoverage) || 0) >= scannerReadinessConfig.manualFinishStructuralCoverage
     && (Number(scanState?.wallCoverage) || 0) >= scannerReadinessConfig.manualFinishWallCoverage
@@ -1006,6 +966,18 @@ export function canManuallyFinishScan(scanState) {
 }
 
 export function calculateScanProgress(scanState) {
+  if (scanState?.phase === SCANNER_PHASES.INITIAL_MAPPING) {
+    const mapping = scanState.mappingReadiness || calculateInitialMappingReadiness(scanState);
+    const progress = [
+      mapping.acceptedKeyframes / mappingReadinessConfig.minimumAcceptedKeyframes,
+      mapping.trackedFeatures / mappingReadinessConfig.minimumTrackedFeatures,
+      mapping.multiFrameFeatureTracks / mappingReadinessConfig.minimumMultiFrameFeatureTracks,
+      mapping.orientationCoverage / mappingReadinessConfig.minimumOrientationCoverage,
+      mapping.viewpointDiversity / mappingReadinessConfig.minimumViewpointDiversity,
+      mapping.successfulRelativePoses / mappingReadinessConfig.minimumSuccessfulRelativePoses,
+    ];
+    return clamp(progress.reduce((sum, value) => sum + Math.min(1, value), 0) / progress.length, 0, 1);
+  }
   const structuralCoverage = clamp(Number(scanState?.structuralCoverage ?? scanState?.totalCoverage) || 0, 0, 1);
   const viewpointCoverage = clamp(Number(scanState?.viewpointDiversity) || 0, 0, 1);
   const usefulKeyframeProgress = clamp((Number(scanState?.acceptedFrames) || 0) / 36, 0, 1);
@@ -1113,19 +1085,14 @@ function determineNextActionLegacySpatial(scanState) {
 }
 
 function targetDisplayName(region) {
-  if (!region) return 'this area';
-  const horizontal = region.column <= 3 ? 'left' : region.column >= 8 ? 'right' : 'center';
-  if (region.row === 'ceiling') return `${horizontal} ceiling area`;
-  if (region.row === 'floor') return `${horizontal} floor area`;
-  const vertical = region.row === 'upper' ? 'upper' : 'middle';
-  return `${vertical}-${horizontal} wall area`;
+  return region ? (region.label || targetDescription(region)) : 'this area';
 }
 
 function targetReason(targetRegion, scanState) {
   if (!targetRegion?.currentlyVisible) return 'TARGET_NOT_VISIBLE';
   if (scanState?.targetStalled) return 'TARGET_OCCLUDED';
   if (targetRegion.status === 'LOW_TEXTURE' || targetRegion.featureDensity < scannerQualityConfig.lowTextureFeatureDensity) return 'LOW_FEATURE_DENSITY';
-  if (targetRegion.uniqueViewAngles < 2) return 'LOW_VIEWPOINT_DIVERSITY';
+  if ((targetRegion.viewpointCount || targetRegion.uniqueViewAngles || 0) < 2) return 'LOW_VIEWPOINT_DIVERSITY';
   if (targetRegion.parallaxScore < 0.32) return 'LOW_PARALLAX';
   if (targetRegion.coverage < 0.72) return 'NEEDS_MORE_OBSERVATIONS';
   if (scanState?.targetStalled) return 'TARGET_OCCLUDED';
@@ -1136,8 +1103,11 @@ function aimDirectionForTarget(targetRegion, currentOrientation) {
   const heading = Number.isFinite(Number(currentOrientation?.heading)) ? Number(currentOrientation.heading) : 0;
   const yawDelta = normalizedAngleDelta(heading, targetRegion?.yaw || 0);
   const pitchDelta = (Number(targetRegion?.pitch) || 0) - (Number(currentOrientation?.pitch) || 0);
-  if (Math.abs(pitchDelta) > 0.16) return pitchDelta > 0 ? 'UP' : 'DOWN';
-  if (Math.abs(yawDelta) > 12) return yawDelta > 0 ? 'RIGHT' : 'LEFT';
+  const vertical = Math.abs(pitchDelta) > 0.16 ? (pitchDelta > 0 ? 'UP' : 'DOWN') : '';
+  const horizontal = Math.abs(yawDelta) > 12 ? (yawDelta > 0 ? 'RIGHT' : 'LEFT') : '';
+  if (vertical && horizontal) return `${vertical}_${horizontal}`;
+  if (vertical) return vertical;
+  if (horizontal) return horizontal;
   return 'CENTER';
 }
 
@@ -1153,6 +1123,7 @@ function movementForTarget(targetRegion, currentOrientation, scanState) {
 
 export function determineNextAction(scanState) {
   const currentOrientation = scanState?.currentOrientation || {};
+  const phase = scanState?.phase || SCANNER_PHASES.INITIAL_MAPPING;
   const lockedTarget = scanState?.activeTargetId
     ? scanState.coverageRegions?.find((region) => region.id === scanState.activeTargetId
       && !region.skipped
@@ -1160,10 +1131,26 @@ export function determineNextAction(scanState) {
     : null;
   const targetRegion = lockedTarget || scanState?.lowCoverageRegions?.[0];
   if ((scanState?.framesEvaluated || 0) === 0 && (scanState?.acceptedFrames || 0) === 0) {
-    return { type: 'START_SCAN', direction: 'O', label: 'READY TO SCAN', eyebrow: 'Build coverage from your movement', title: 'Aim at the room and start moving', instruction: 'Keep the camera level and move naturally. The scanner will keep the useful views.', helper: 'Follow the highlighted area when you are ready for another part of the room.', target: 'Waiting for camera', priority: 1, confidence: 1, adaptiveGuidance: null };
+    return { type: 'START_SCAN', direction: 'O', label: 'READY TO SCAN', eyebrow: 'Initial room mapping', title: 'Start with a slow room sweep', instruction: 'Slowly move around the room while looking around.', helper: 'The scanner will build a spatial map before it suggests any area to capture.', target: 'Initial mapping', priority: 1, confidence: 1, adaptiveGuidance: null };
   }
   if (scanState?.trackingStatus === 'LOST' || scanState?.motionState === MOTION_STATES.TRACKING_LOST) {
     return { type: 'TRACKING_LOST', direction: 'O', label: 'STAY WITH THE SCAN', eyebrow: 'Automatic relocalization is still running', title: 'I lost track of the room', instruction: "Slowly point the camera toward an area you've already scanned.", helper: 'Your captured coverage is safe. Once the room comes back into view, keep scanning.', target: 'Finding the room again', priority: 1.2, confidence: 0.95, adaptiveGuidance: null };
+  }
+  if (phase === SCANNER_PHASES.INITIAL_MAPPING) {
+    const mappingReadiness = scanState?.mappingReadiness || calculateInitialMappingReadiness(scanState);
+    return {
+      type: 'INITIAL_MAPPING',
+      direction: 'O',
+      label: 'BUILDING ROOM MAP',
+      eyebrow: 'Initial mapping',
+      title: 'Look around while moving slowly',
+      instruction: 'Slowly move around the room while looking around.',
+      helper: mappingReadiness.reason,
+      target: `${mappingReadiness.acceptedKeyframes || 0} accepted keyframes`,
+      priority: 0.7,
+      confidence: 0.9,
+      adaptiveGuidance: null,
+    };
   }
   const readiness = scanState?.scanReadiness || calculateScanReadiness(scanState);
   if (scanState?.scanReady || readiness.ready) {
@@ -1191,9 +1178,11 @@ export function determineNextAction(scanState) {
     };
   }
   if (!isVisible) {
-    const aimText = aimDirection === 'CENTER' ? `Aim at the ${targetName}.` : `Aim slightly ${aimDirection.toLowerCase()} toward the ${targetName}.`;
+    const aimText = aimDirection === 'CENTER'
+      ? `Aim at the ${targetName}.`
+      : `Aim slightly ${aimDirection.split('_').map((direction) => direction.toLowerCase()).join(' and ')} toward the ${targetName}.`;
     return {
-      type: aimDirection === 'UP' ? 'LOOK_UP' : aimDirection === 'DOWN' ? 'LOOK_DOWN' : aimDirection === 'LEFT' ? 'MOVE_LEFT' : aimDirection === 'RIGHT' ? 'MOVE_RIGHT' : 'SCAN_LOW_COVERAGE_REGION',
+      type: aimDirection.includes('UP') ? 'LOOK_UP' : aimDirection.includes('DOWN') ? 'LOOK_DOWN' : aimDirection.includes('LEFT') ? 'MOVE_LEFT' : aimDirection.includes('RIGHT') ? 'MOVE_RIGHT' : 'SCAN_LOW_COVERAGE_REGION',
       direction: aimDirection === 'UP' ? '↑' : aimDirection === 'DOWN' ? '↓' : aimDirection === 'LEFT' ? '←' : aimDirection === 'RIGHT' ? '→' : 'O',
       label: 'SCAN THIS AREA', eyebrow: 'Find the next useful view', title: `Aim at the ${targetName}`,
       instruction: aimText, helper: 'Once it is visible, the scanner will ask for another viewpoint instead of more tilting.',
@@ -1206,10 +1195,16 @@ export function determineNextAction(scanState) {
 
   const movementInstruction = movementForTarget(targetRegion, currentOrientation, scanState);
   const movementDirection = movementInstruction.type === 'STEP_LEFT' ? 'left' : 'right';
+  const hasOnlyOneView = (Number(targetRegion.viewpointCount) || 0) <= 1 && (Number(targetRegion.usefulViews) || 0) <= 1;
+  const needsParallax = (Number(targetRegion.parallaxScore) || 0) < 0.32;
   const instruction = reason === 'TARGET_OCCLUDED'
     ? `Move to another position while keeping the ${targetName} visible.`
     : reason === 'LOW_FEATURE_DENSITY'
     ? `Keep the ${targetName} in view and move toward a corner so I can track its edges.`
+    : hasOnlyOneView
+    ? `Keep this area visible and move slowly to the ${movementDirection}.`
+    : needsParallax
+    ? `Move sideways while keeping this ${targetName} visible.`
     : `Keep the ${targetName} visible and move one step to your ${movementDirection}.`;
   return {
     type: movementInstruction.type === 'STEP_LEFT' ? 'MOVE_LEFT' : movementInstruction.type === 'MOVE_AROUND' ? 'MOVE_SIDEWAYS' : 'MOVE_RIGHT',
@@ -1508,7 +1503,8 @@ function updateCoverageFromFrameLegacy(previousState, orientation, pose, analysi
   };
 }
 
-export function updateCoverageFromFrame(previousState, orientation, pose, analysis, parallaxDistance, options = {}) {
+// eslint-disable-next-line no-unused-vars
+function updateCoverageFromFrameLegacyCurrent(previousState, orientation, pose, analysis, parallaxDistance, options = {}) {
   if (!analysis) return previousState;
   const frameOrientation = orientationForFrame(orientation, pose, previousState);
   const projectedRegions = projectCoverageRegions(previousState.coverageRegions, frameOrientation, analysis.displayTransform);
@@ -1696,6 +1692,244 @@ export function updateCoverageFromFrame(previousState, orientation, pose, analys
   };
 }
 
+function isUsableScanAnalysis(analysis, accepted) {
+  return accepted
+    && Number(analysis?.qualityScore) >= scannerQualityConfig.acceptableFrameScore
+    && Number(analysis?.featureCount ?? analysis?.trackedFeatureCount ?? 0) >= scannerQualityConfig.minimumFeatureCount
+    && !analysis?.motionBlur
+    && !analysis?.poorLighting;
+}
+
+function featureTrackIdsForBounds(analysis, bounds) {
+  const points = Array.isArray(analysis?.featurePointsDisplay) ? analysis.featurePointsDisplay : [];
+  const ids = Array.isArray(analysis?.featureTrackIds) ? analysis.featureTrackIds : [];
+  return points.reduce((result, point, index) => normalizedPointInBounds(point, bounds) && ids[index]
+    ? [...result, ids[index]]
+    : result, []);
+}
+
+function updateInitialMapping(previousState, frameOrientation, pose, analysis, usableObservation, options) {
+  const previousMapping = previousState.mapping || {};
+  const featureTracks = Array.isArray(options.featureTracks)
+    ? options.featureTracks
+    : (previousMapping.featureTracks || previousState.featureTracks || []);
+  const trackedFeatureCount = Number.isFinite(Number(options.trackedFeatureCount))
+    ? Number(options.trackedFeatureCount)
+    : Number(analysis.trackedFeatureCount ?? analysis.featureCount ?? previousMapping.trackedFeatureCount ?? 0);
+  const multiFrameFeatureTrackCount = Number.isFinite(Number(options.multiFrameFeatureTrackCount))
+    ? Number(options.multiFrameFeatureTrackCount)
+    : Number(analysis.multiFrameFeatureTrackCount ?? previousMapping.multiFrameFeatureTrackCount ?? 0);
+  let keyframes = Array.isArray(previousMapping.keyframes) ? previousMapping.keyframes : [];
+  let relativePoses = Array.isArray(previousMapping.relativePoses) ? previousMapping.relativePoses : [];
+  let sparseObservations = Array.isArray(previousMapping.sparseObservations) ? previousMapping.sparseObservations : [];
+  let referenceCameraPose = previousMapping.referenceCameraPose || null;
+  const acceptedKeyframe = usableObservation ? {
+    id: options.keyframeId ?? `keyframe-${keyframes.length + 1}`,
+    pose: pose ? { ...pose } : null,
+    orientation: { ...frameOrientation },
+    featureTrackIds: [...new Set(options.featureTrackIds || analysis.featureTrackIds || [])],
+    trackedFeatureCount,
+    capturedAt: Number(options.observedAt) || Date.now(),
+  } : null;
+  if (acceptedKeyframe) {
+    if (!referenceCameraPose) referenceCameraPose = acceptedKeyframe.pose;
+    const previousKeyframe = keyframes[keyframes.length - 1] || null;
+    const relativePose = options.relativePoseEstimate || relativePoseEstimate(previousKeyframe, acceptedKeyframe, trackedFeatureCount);
+    if (relativePose?.success) relativePoses = [...relativePoses, relativePose].slice(-64);
+    keyframes = [...keyframes, acceptedKeyframe].slice(-120);
+    const frameObservations = createSpatialObservationsFromFrame({
+      analysis,
+      orientation: frameOrientation,
+      pose,
+      keyframeId: acceptedKeyframe.id,
+    });
+    sparseObservations = addSpatialObservations(sparseObservations, frameObservations).slice(-120);
+  }
+  const orientationCoverage = calculateOrientationCoverage(keyframes);
+  const viewpointDiversity = calculateViewpointDiversity(keyframes);
+  const mapping = {
+    ...previousMapping,
+    referenceCameraPose,
+    acceptedKeyframes: keyframes.length,
+    keyframes,
+    trackedFeatureCount,
+    multiFrameFeatureTrackCount,
+    featureTracks,
+    orientationCoverage,
+    viewpointDiversity,
+    successfulRelativePoseCount: relativePoses.length,
+    relativePoses,
+    sparseObservations,
+  };
+  const mappingReadiness = calculateInitialMappingReadiness({ mapping });
+  mapping.mappingReady = mappingReadiness.ready;
+  mapping.readinessReason = mappingReadiness.reason;
+  return { mapping, mappingReadiness };
+}
+
+function updateObservedTargetFromFrame(target, analysis, pose, frameOrientation, keyframeId, targetViewDecision, usableObservation) {
+  const next = { ...target };
+  const localFeatureCount = next.screenBounds ? countFeaturesInRegion(analysis.featurePointsDisplay, next.screenBounds) : 0;
+  const localFeatureDensity = clamp(localFeatureCount / 40, 0, 1);
+  const previousPose = next.lastObservedPose || next.cameraPoses?.[next.cameraPoses.length - 1] || null;
+  const translation = previousPose && pose ? poseDistance(previousPose, pose) : 0;
+  if (usableObservation && next.currentlyVisible) {
+    next.attempts = (next.attempts || 0) + 1;
+    next.featureDensity = ((Number(next.featureDensity) || 0) * (Number(next.attempts) - 1) + localFeatureDensity) / next.attempts;
+    next.featureTrackIds = [...new Set([...(next.featureTrackIds || []), ...featureTrackIdsForBounds(analysis, next.screenBounds)])];
+    next.featureMatchCount = Math.max(Number(next.featureMatchCount) || 0, localFeatureCount);
+    next.lastObservedPose = pose ? { ...pose } : previousPose;
+    next.cameraPoses = [...(next.cameraPoses || []), cameraPoseForRegion(next, pose, frameOrientation)].slice(-16);
+    const viewpointNovelty = (Number(next.viewpointCount) || 0) === 0
+      || Boolean(targetViewDecision?.qualified)
+      || translation >= 0.1
+      || (Number(targetViewDecision?.angleDelta) || 0) >= 8
+      || (Number(targetViewDecision?.parallaxEvidence) || 0) >= 0.08;
+    if (keyframeId !== undefined && keyframeId !== null && localFeatureCount >= 3 && viewpointNovelty) {
+      next.observedFromKeyframes = [...new Set([...(next.observedFromKeyframes || []), keyframeId])];
+      next.acceptedKeyframeIds = next.observedFromKeyframes;
+      next.viewpointCount = next.observedFromKeyframes.length;
+      next.observationCount = next.viewpointCount;
+      next.observations = next.viewpointCount;
+    }
+    next.parallaxScore = Math.max(Number(next.parallaxScore) || 0, clamp(translation / 0.45, 0, 1), Number(targetViewDecision?.parallaxEvidence) || 0);
+    next.viewpointDiversity = clamp((Number(next.viewpointCount) || 0) / 4, 0, 1);
+    const gain = clamp((Number(analysis.qualityScore) * 0.08) + (localFeatureDensity * 0.08) + (next.parallaxScore * 0.12), 0.015, 0.16);
+    next.coverage = clamp((Number(next.coverage) || 0) + gain, 0, 1);
+    next.coverageConfidence = clamp(Math.max(Number(next.coverageConfidence) || 0, (Number(next.featureDensity) || 0) * 0.6 + (Number(next.parallaxScore) || 0) * 0.4), 0, 1);
+  }
+  return next;
+}
+
+export function updateCoverageFromFrame(previousState, orientation, pose, analysis, parallaxDistance, options = {}) {
+  if (!analysis) return previousState;
+  const frameOrientation = orientationForFrame(orientation, pose, previousState);
+  const accepted = options.accepted === true;
+  const usableObservation = isUsableScanAnalysis(analysis, accepted);
+  const observedAt = Number(options.observedAt) || Date.now();
+  const mappingResult = updateInitialMapping(previousState, frameOrientation, pose, analysis, usableObservation, options);
+  const mappingJustInitialized = previousState.phase === SCANNER_PHASES.INITIAL_MAPPING && mappingResult.mappingReadiness.ready;
+  let phase = previousState.phase || SCANNER_PHASES.INITIAL_MAPPING;
+  let regions = Array.isArray(previousState.coverageRegions) ? previousState.coverageRegions : [];
+  if (phase === SCANNER_PHASES.INITIAL_MAPPING && mappingJustInitialized) {
+    phase = SCANNER_PHASES.ADAPTIVE_COVERAGE;
+    regions = generateObservedTargets(mappingResult.mapping.sparseObservations, regions);
+  } else if (phase === SCANNER_PHASES.ADAPTIVE_COVERAGE && regions.length === 0) {
+    regions = generateObservedTargets(mappingResult.mapping.sparseObservations, regions);
+  }
+
+  const projectedRegions = phase === SCANNER_PHASES.ADAPTIVE_COVERAGE
+    ? projectCoverageRegions(regions, frameOrientation, analysis.displayTransform, pose)
+    : [];
+  const activeTargetId = options.activeTargetId || previousState.activeTargetId || null;
+  const activeTarget = activeTargetId ? projectedRegions.find((region) => region.id === activeTargetId) || null : null;
+  let targetViewDecision = previousState.lastTargetViewDecision || null;
+  let nextRegions = projectedRegions;
+  if (activeTargetId && activeTarget) {
+    const activeIndex = nextRegions.findIndex((region) => region.id === activeTargetId);
+    const previousTargetView = activeTarget.lastTargetViewPose || null;
+    targetViewDecision = qualifyTargetView({
+      targetRegion: activeTarget,
+      activeTargetId,
+      analysis,
+      pose,
+      orientation: frameOrientation,
+      previousView: previousTargetView,
+      parallaxDistance,
+      frameAccepted: usableObservation,
+    });
+    if (activeIndex >= 0) {
+      const nextTarget = { ...nextRegions[activeIndex] };
+      if (usableObservation && activeTarget.currentlyVisible) {
+        nextTarget.targetViewCandidates = (nextTarget.targetViewCandidates || 0) + 1;
+        if (targetViewDecision.qualified) {
+          nextTarget.usefulViews = Math.min(targetViewConfig.requiredUsefulViews, (nextTarget.usefulViews || 0) + 1);
+          nextTarget.targetCaptureState = nextTarget.usefulViews >= targetViewConfig.requiredUsefulViews ? 'COMPLETE' : 'COLLECTING_VIEWS';
+        }
+        nextTarget.lastTargetViewPose = targetViewDecision.currentView;
+        nextTarget.lastTargetViewDecision = targetViewDecision;
+      }
+      if (usableObservation && !activeTarget.currentlyVisible) {
+        nextTarget.targetViewRejectionReasons = { ...(nextTarget.targetViewRejectionReasons || {}), TARGET_NOT_VISIBLE: ((nextTarget.targetViewRejectionReasons || {}).TARGET_NOT_VISIBLE || 0) + 1 };
+      } else if (accepted && !usableObservation) {
+        nextTarget.targetViewRejectionReasons = { ...(nextTarget.targetViewRejectionReasons || {}), FRAME_REJECTED: ((nextTarget.targetViewRejectionReasons || {}).FRAME_REJECTED || 0) + 1 };
+      } else if (usableObservation && !targetViewDecision.qualified) {
+        nextTarget.targetViewRejectionReasons = { ...(nextTarget.targetViewRejectionReasons || {}), [targetViewDecision.reason || 'UNKNOWN']: ((nextTarget.targetViewRejectionReasons || {})[targetViewDecision.reason || 'UNKNOWN'] || 0) + 1 };
+      }
+      nextRegions[activeIndex] = updateObservedTargetFromFrame(nextTarget, analysis, pose, frameOrientation, options.keyframeId, targetViewDecision, usableObservation);
+    }
+  }
+
+  // Accepted frames enrich every observed target that is actually in the
+  // current frustum. The active target still owns useful-view qualification;
+  // this loop only keeps the spatial evidence map alive.
+  if (phase === SCANNER_PHASES.ADAPTIVE_COVERAGE && usableObservation) {
+    nextRegions = nextRegions.map((region) => {
+      if (region.id === activeTargetId || !region.currentlyVisible || region.source !== 'OBSERVED' || region.skipped) return region;
+      return updateObservedTargetFromFrame(region, analysis, pose, frameOrientation, options.keyframeId, null, usableObservation);
+    });
+  }
+  nextRegions = updateRegionStatuses(nextRegions);
+  const summary = summarizeCoverage(nextRegions);
+  const diagnosticTarget = diagnosticTargetForFrame(analysis, frameOrientation, usableObservation, previousState.diagnosticTarget);
+  const featureQuality = clamp((Number(analysis.featureCount) || 0) / 850 * 0.3, 0, 0.3);
+  const trackingQuality = clamp((Number(analysis.featureTrackingQuality) * 0.55) + (Number(analysis.qualityScore) * 0.45) + featureQuality, 0, 1);
+  const nextState = {
+    ...previousState,
+    phase,
+    mapping: mappingResult.mapping,
+    mappingReady: mappingResult.mappingReadiness.ready,
+    mappingReadiness: mappingResult.mappingReadiness,
+    referenceCameraPose: mappingResult.mapping.referenceCameraPose,
+    featureTracks: mappingResult.mapping.featureTracks,
+    multiFrameFeatureTrackCount: mappingResult.mapping.multiFrameFeatureTrackCount,
+    successfulRelativePoseCount: mappingResult.mapping.successfulRelativePoseCount,
+    acceptedFrames: previousState.acceptedFrames + (usableObservation ? 1 : 0),
+    cameraPose: pose,
+    currentOrientation: frameOrientation,
+    featureCount: Number(analysis.featureCount) || 0,
+    trackedFeatureCount: Number(analysis.trackedFeatureCount ?? analysis.featureCount) || 0,
+    detectedFeatureCount: Number(analysis.detectedFeatureCount) || 0,
+    trackingQuality,
+    frameQuality: Number(analysis.qualityScore) || 0,
+    imageQuality: Number(analysis.qualityScore) || 0,
+    featureTrackingQuality: Number(analysis.featureTrackingQuality) || 0,
+    sharpness: Number(analysis.sharpness) || 0,
+    brightness: Number(analysis.brightness) || 0,
+    motionBlur: Boolean(analysis.motionBlur),
+    poorLighting: Boolean(analysis.poorLighting),
+    coverageRegions: nextRegions,
+    diagnosticTarget,
+    featurePointsDisplay: analysis.featurePointsDisplay || [],
+    cameraFrameDimensions: analysis.frameDimensions || previousState.cameraFrameDimensions,
+    displayDimensions: analysis.displayDimensions || previousState.displayDimensions,
+    displayTransform: analysis.displayTransform || previousState.displayTransform,
+    activeTargetId: phase === SCANNER_PHASES.ADAPTIVE_COVERAGE ? activeTargetId : null,
+    lastTargetViewDecision: targetViewDecision,
+    visibleRegionIds: nextRegions.filter((region) => region.currentlyVisible).map((region) => region.id),
+    lowCoverageRegions: summary.lowCoverageRegions,
+    floorCoverage: summary.floorCoverage,
+    wallCoverage: summary.wallCoverage,
+    ceilingCoverage: summary.ceilingCoverage,
+    totalCoverage: summary.totalCoverage,
+    viewpointDiversity: phase === SCANNER_PHASES.INITIAL_MAPPING ? mappingResult.mapping.viewpointDiversity : summary.viewpointDiversity,
+    mappingJustInitialized,
+    lastObservedAt: observedAt,
+  };
+  const scanReadiness = calculateScanReadiness(nextState);
+  const readinessState = {
+    ...nextState,
+    structuralCoverage: scanReadiness.structuralCoverage,
+    reconstructionConfidence: scanReadiness.reconstructionConfidence,
+    scanReadiness,
+    scanReady: phase === SCANNER_PHASES.ADAPTIVE_COVERAGE && scanReadiness.ready,
+  };
+  return {
+    ...readinessState,
+    scanProgress: calculateScanProgress(readinessState),
+  };
+}
+
 function loadGLTFAsset(url, onLoad, onError) {
   import('three/examples/jsm/loaders/GLTFLoader.js')
     .then(({ GLTFLoader }) => new GLTFLoader().load(url, onLoad, undefined, onError))
@@ -1713,6 +1947,8 @@ function App() {
   const lastCaptureAtRef = useRef(0);
   const analysisCanvasRef = useRef(null);
   const previousFrameGrayRef = useRef(null);
+  const featureTracksRef = useRef([]);
+  const featureFrameIndexRef = useRef(0);
   const lastAcceptedFrameRef = useRef(null);
   const lastCoveragePoseRef = useRef(null);
   const lastTranslationAtRef = useRef(0);
@@ -1981,6 +2217,7 @@ function App() {
           featureCount: analysis.featureCount,
           sceneChange: analysis.sceneChange,
         },
+        featureTrackIds: analysis.featureTrackIds || [],
         image: blob,
         previewUrl,
       });
@@ -1991,8 +2228,18 @@ function App() {
         pose,
         analysis,
         translationSinceLast,
-        { accepted: true, observedAt: now, keyframeId, activeTargetId: activeTargetIdRef.current },
+        {
+          accepted: true,
+          observedAt: now,
+          keyframeId,
+          activeTargetId: activeTargetIdRef.current,
+          featureTracks: featureTracksRef.current,
+          featureTrackIds: analysis.featureTrackIds || [],
+          trackedFeatureCount: analysis.trackedFeatureCount,
+          multiFrameFeatureTrackCount: analysis.multiFrameFeatureTrackCount,
+        },
       );
+      if (coverageState.mappingJustInitialized) setLastEvent('Room mapping initialized.');
       if (SCANNER_DEBUG) {
         const targetDecision = coverageState.lastTargetViewDecision;
         if (activeTargetIdRef.current && targetDecision?.targetRegionId !== activeTargetIdRef.current) {
@@ -2084,6 +2331,8 @@ function App() {
     setScanState(initialScanState);
     orientationRef.current = { alpha: null, beta: null, gamma: null, heading: null, pitch: 0, pitchDegrees: 0, headingDegrees: null, rollDegrees: 0 };
     previousFrameGrayRef.current = null;
+    featureTracksRef.current = [];
+    featureFrameIndexRef.current = 0;
     lastAcceptedFrameRef.current = null;
     lastCoveragePoseRef.current = null;
     lastTranslationAtRef.current = 0;
@@ -2220,10 +2469,29 @@ function App() {
         }
         if (analysis) {
           previousFrameGrayRef.current = analysis.gray;
+          featureFrameIndexRef.current += 1;
+          const trackResult = updateFeatureTracks(
+            featureTracksRef.current,
+            analysis.featurePointsDisplay || analysis.featurePoints || [],
+            { frameIndex: featureFrameIndexRef.current },
+          );
+          featureTracksRef.current = trackResult.tracks;
+          analysis = {
+            ...analysis,
+            featureTrackIds: trackResult.currentTrackIds,
+            multiFrameFeatureTrackCount: trackResult.multiFrameFeatureTrackCount,
+          };
           const pose = { ...lastTelemetryRef.current };
            const now = Date.now();
            const parallaxDistance = lastCoveragePoseRef.current ? poseDistance(lastCoveragePoseRef.current, pose) : 0;
-           const nextState = updateCoverageFromFrame(scanStateRef.current, orientationRef.current, pose, analysis, parallaxDistance, { accepted: false, observedAt: now, activeTargetId: activeTargetIdRef.current });
+           const nextState = updateCoverageFromFrame(scanStateRef.current, orientationRef.current, pose, analysis, parallaxDistance, {
+             accepted: false,
+             observedAt: now,
+             activeTargetId: activeTargetIdRef.current,
+             featureTracks: featureTracksRef.current,
+             trackedFeatureCount: analysis.trackedFeatureCount,
+             multiFrameFeatureTrackCount: analysis.multiFrameFeatureTrackCount,
+           });
            const watchdog = guidanceWatchdogRef.current;
            const watchedTarget = watchdog.targetId ? nextState.coverageRegions.find((region) => region.id === watchdog.targetId) : null;
            nextState.targetStalled = isTargetStalled(watchdog, watchedTarget, now);
@@ -2361,6 +2629,9 @@ function App() {
       durationSeconds: Math.max(0, (finishedAt - (scanStartedAtRef.current || finishedAt)) / 1000),
       coordinateSystem: 'browser-estimated local path; synchronized DeviceOrientation and DeviceMotion when available',
       scanState: {
+        phase: scanState.phase,
+        mapping: scanState.mapping,
+        mappingReadiness: scanState.mappingReadiness,
         trackedFeatureCount: scanState.trackedFeatureCount,
         trackingQuality: scanState.trackingQuality,
         trackingStatus: scanState.trackingStatus,
@@ -2584,6 +2855,8 @@ function App() {
     setCameraState('idle');
     setSensorState('idle');
     const initialScanState = createInitialScanState();
+    featureTracksRef.current = [];
+    featureFrameIndexRef.current = 0;
     guidanceControllerRef.current.reset();
     guidanceWatchdogRef.current = { targetId: null, startedAt: 0, startingCoverage: 0 };
     activeTargetIdRef.current = null;
@@ -2717,6 +2990,34 @@ function App() {
             </div>
             {SCANNER_DEBUG && isScanning && (
               <aside className="scanner-debug-overlay" aria-label="Scanner motion debug">
+                {SCANNER_TARGET_DEBUG && (
+                  <>
+                    <div className="scanner-debug-section scanner-debug-section-first">Scanner architecture</div>
+                    <div className="scanner-debug-grid">
+                      <span>Scanner phase</span><b>{scanState.phase}</b>
+                      <span>Accepted keyframes</span><b>{scanState.mapping?.acceptedKeyframes || scanState.acceptedFrames}</b>
+                      <span>Tracked features</span><b>{scanState.mapping?.trackedFeatureCount || scanState.trackedFeatureCount}</b>
+                      <span>Multi-frame feature tracks</span><b>{scanState.mapping?.multiFrameFeatureTrackCount || scanState.multiFrameFeatureTrackCount}</b>
+                      <span>Successful relative poses</span><b>{scanState.mapping?.successfulRelativePoseCount || scanState.successfulRelativePoseCount}</b>
+                      <span>Viewpoint diversity</span><b>{Number(scanState.mapping?.viewpointDiversity || scanState.viewpointDiversity || 0).toFixed(2)}</b>
+                      <span>Mapping ready</span><b>{scanState.mappingReadiness?.ready ? 'YES' : 'NO'}</b>
+                      <span>Reason</span><b>{scanState.mappingReadiness?.reason || '—'}</b>
+                    </div>
+                    <div className="scanner-debug-section">Adaptive target</div>
+                    <div className="scanner-debug-grid">
+                      <span>Active target ID</span><b>{activeTarget?.id || '—'}</b>
+                      <span>Target source</span><b>{activeTarget?.source || '—'}</b>
+                      <span>Target source keyframes</span><b>{activeTarget?.observedFromKeyframes?.join(', ') || '—'}</b>
+                      <span>Target feature tracks</span><b>{activeTarget?.featureTrackIds?.join(', ') || '—'}</b>
+                      <span>Target visible</span><b>{activeTarget?.currentlyVisible ? 'YES' : 'NO'}</b>
+                      <span>Target viewpoint count</span><b>{activeTarget?.viewpointCount || 0}</b>
+                      <span>Target parallax</span><b>{Number(activeTarget?.parallaxScore || 0).toFixed(2)}</b>
+                      <span>Target feature density</span><b>{Number(activeTarget?.featureDensity || 0).toFixed(2)}</b>
+                      <span>Target confidence</span><b>{Number(activeTarget?.coverageConfidence || 0).toFixed(2)}</b>
+                      <span>Target status</span><b>{activeTarget?.status || '—'}</b>
+                    </div>
+                  </>
+                )}
                 {SCANNER_TARGET_DEBUG && (
                   <>
                     <div className="scanner-debug-section scanner-debug-section-first">Target recognition diagnostics</div>
@@ -2866,7 +3167,7 @@ function App() {
               <p className="section-label">AI-assisted guided spatial scanning</p>
               <h1>{isFinished ? 'Ready to review your room.' : 'Scan the room with your phone.'}</h1>
             </div>
-            <span className="phase-chip">Adaptive scan</span>
+            <span className="phase-chip">{scanState.phase === SCANNER_PHASES.INITIAL_MAPPING ? 'Initial mapping' : 'Adaptive coverage'}</span>
           </div>
 
           <section className="progress-panel" aria-label="Room scan capture progress">
@@ -3460,20 +3761,22 @@ function CoverageMap({ scanState, targetRegion }) {
         </div>
         <span className="tracking-badge" title="Weighted useful scan progress">{Math.round(((scanState.scanProgress ?? scanState.totalCoverage) || 0) * 100)}%</span>
       </div>
-      <div className="coverage-map" role="img" aria-label="Coverage by camera orientation and vertical surface band">
-        {COVERAGE_ROWS.map((row) => (
-          <div className="coverage-map-row" key={row.id}>
-            <span className="coverage-map-label">{row.label}</span>
+      <div className="coverage-map" role="img" aria-label="Coverage from observed spatial regions">
+        {scanState.phase === SCANNER_PHASES.INITIAL_MAPPING ? (
+          <div className="coverage-map-row"><span className="coverage-map-label">Spatial map</span><span className="coverage-map-empty">Collecting accepted views and feature tracks…</span></div>
+        ) : (
+          <div className="coverage-map-row">
+            <span className="coverage-map-label">Observed regions</span>
             <div className="coverage-map-cells">
-              {scanState.coverageRegions.filter((region) => region.row === row.id).map((region) => {
-                const coverage = Math.round(region.coverage * 100);
+              {scanState.coverageRegions.map((region) => {
+                const coverage = Math.round((Number(region.coverage) || 0) * 100);
                 const coverageClass = coverage >= 70 ? 'coverage-high' : coverage >= 35 ? 'coverage-medium' : 'coverage-low';
                 const statusClass = region.status === 'INFERABLE' ? 'coverage-inferable' : region.skipped ? 'coverage-skipped' : '';
-                return <span className={`coverage-cell ${coverageClass} ${statusClass} ${targetRegion?.id === region.id ? 'coverage-target' : ''}`} key={region.id} title={`${row.label}, sector ${region.column + 1}: ${coverage}% coverage (${region.status || 'UNSEEN'})`} aria-label={`${row.label}, sector ${region.column + 1}, ${coverage}% coverage, ${region.status || 'UNSEEN'}`} />;
+                return <span className={`coverage-cell ${coverageClass} ${statusClass} ${targetRegion?.id === region.id ? 'coverage-target' : ''}`} key={region.id} title={`${region.label || targetDescription(region)}: ${coverage}% coverage (${region.status || 'UNSEEN'})`} aria-label={`${region.label || targetDescription(region)}, ${coverage}% coverage, ${region.status || 'UNSEEN'}`} />;
               })}
             </div>
           </div>
-        ))}
+        )}
       </div>
       <div className="coverage-legend" aria-hidden="true"><span><i className="coverage-key coverage-key-high" />Enough</span><span><i className="coverage-key coverage-key-medium" />Needs angle</span><span><i className="coverage-key coverage-key-low" />Needs coverage</span></div>
     </section>
@@ -3484,5 +3787,16 @@ function TelemetryValue({ label, value }) {
   return <div className="telemetry-value"><span>{label}</span><strong>{value}</strong></div>;
 }
 
-export { createInitialScanState, scannerMotionConfig, MOTION_STATES };
+export {
+  createInitialScanState,
+  scannerMotionConfig,
+  MOTION_STATES,
+  SCANNER_PHASES,
+  calculateInitialMappingReadiness,
+  deriveTargetStatuses,
+  generateObservedTargets,
+  updateFeatureTracks,
+  mappingReadinessConfig,
+  observedTargetConfig,
+};
 export default App;
