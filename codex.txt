@@ -1,0 +1,745 @@
+Stop working on individual targets such as `left_ceiling`.
+
+New finding from real-device testing:
+
+**The scanner does not successfully recognize ANY requested scan target.**
+
+It is not just left ceiling.
+
+I can point the phone directly at requested areas, move through different viewpoints, and the scanner still does not register useful views.
+
+Therefore assume the bug is in the common target-recognition pipeline.
+
+Do NOT:
+
+* tune motion thresholds
+* lower region thresholds
+* add AI
+* add more guidance messages
+* redesign coverage
+* work on reconstruction
+
+First make the scanner capable of answering this basic question reliably:
+
+> Is the currently requested target actually visible in this camera frame?
+
+# GOAL
+
+Build a temporary diagnostic mode that proves each layer works separately.
+
+We need to verify:
+
+```text
+camera frame
+↓
+camera orientation
+↓
+screen coordinate system
+↓
+target definition
+↓
+target projection
+↓
+target visibility
+↓
+frame association
+↓
+first useful observation
+```
+
+Until this works, all higher-level adaptive guidance is meaningless.
+
+# 1. Disable Complex Target Completion Temporarily in Debug Mode
+
+Add a diagnostic mode:
+
+```text
+?scannerTargetDebug=1
+```
+
+In this mode:
+
+DO NOT require:
+
+* 3 views
+* parallax
+* translation
+* viewpoint diversity
+* reconstruction confidence
+
+We are only testing whether the scanner recognizes a target as visible.
+
+Normal production logic should remain intact.
+
+# 2. Create a Known Simple Test Target
+
+Before testing room semantics, create a simple display-space target.
+
+For example:
+
+```text
+TOP LEFT
+```
+
+defined as:
+
+```ts
+{
+    xMin: 0.0,
+    xMax: 0.4,
+    yMin: 0.0,
+    yMax: 0.4
+}
+```
+
+in normalized DISPLAY coordinates.
+
+Draw a large visible rectangle over that exact region.
+
+Example:
+
+```text
+┌─────────────────────────────┐
+│████████████                 │
+│█ TEST TARGET █              │
+│████████████                 │
+│                             │
+│           CAMERA            │
+│                             │
+└─────────────────────────────┘
+```
+
+This target does NOT depend on:
+
+* room reconstruction
+* semantic recognition
+* camera pose
+* world coordinates
+
+It is purely a screen-space test.
+
+# 3. Verify Camera Frames Are Actually Being Processed
+
+Display live counters:
+
+```text
+camera frames received:
+frames evaluated per second:
+last frame timestamp:
+```
+
+Expected:
+
+```text
+Camera frames received: increasing continuously
+FPS evaluated: > 0
+```
+
+If these values do not increase, fix frame capture before anything else.
+
+# 4. Verify Accepted Frames
+
+Display:
+
+```text
+frames evaluated:
+frames accepted:
+frames rejected:
+```
+
+If:
+
+```text
+evaluated > 0
+accepted = 0
+```
+
+then target recognition cannot work.
+
+In debug mode, show exact frame rejection reasons.
+
+# 5. Verify the Coordinate System Independently
+
+Draw these regions directly over the preview:
+
+```text
+┌───────────┬───────────┐
+│ TOP LEFT  │ TOP RIGHT │
+├───────────┼───────────┤
+│BOT LEFT   │BOT RIGHT  │
+└───────────┴───────────┘
+```
+
+These labels must correspond exactly to what the USER sees.
+
+If the camera was previously inverted/mirrored, make sure display coordinates account for that.
+
+# 6. Add Live Orientation Debug
+
+Show:
+
+```text
+pitch:
+yaw:
+roll:
+
+screen orientation:
+camera facing:
+preview mirrored:
+preview rotation:
+```
+
+Then verify physically:
+
+```text
+point upward
+→ pitch direction changes correctly
+
+point downward
+→ opposite direction
+
+turn left
+→ yaw changes in expected direction
+
+turn right
+→ opposite direction
+```
+
+Do not continue until these are confirmed.
+
+# 7. Test a Pure Orientation Target
+
+Create a temporary target:
+
+```text
+LOOK_UP_TEST
+```
+
+Rule:
+
+```ts
+if (normalizedPitch indicates phone is looking upward) {
+    testTargetVisible = true;
+}
+```
+
+Show:
+
+```text
+LOOK_UP_TEST:
+VISIBLE / NOT VISIBLE
+```
+
+When I physically point upward, this MUST switch to:
+
+```text
+VISIBLE
+```
+
+If not, fix orientation normalization.
+
+# 8. Test a Pure Screen-Space Target
+
+Create:
+
+```text
+TOP_LEFT_SCREEN_TEST
+```
+
+This should NOT depend on device orientation.
+
+Draw the target on screen.
+
+For any accepted frame, report:
+
+```text
+test region exists: YES
+frame overlaps test region: YES
+```
+
+Since the region is literally part of the frame, this should always succeed.
+
+If this fails, screen-region calculations are broken.
+
+# 9. Test Feature Detection Inside the Region
+
+For the `TOP_LEFT_SCREEN_TEST`, count detected features inside the box.
+
+Display:
+
+```text
+total frame features:
+features inside target:
+```
+
+Draw the detected feature points.
+
+Example:
+
+```text
+•  •
+   •   •
+•     •
+```
+
+If:
+
+```text
+total features = 300
+features inside target = 0
+```
+
+despite visible texture in that box, coordinate conversion is broken.
+
+Fix that before proceeding.
+
+# 10. Verify First Observation Independently
+
+Once:
+
+```text
+frame accepted = true
+target visible = true
+features in target > minimum
+```
+
+the diagnostic target MUST register:
+
+```text
+0 → 1 observation
+```
+
+No parallax.
+No previous view.
+No translation requirement.
+
+The first observation is the baseline.
+
+Add a unit test specifically proving this.
+
+# 11. Trace the Production Target Pipeline
+
+Once diagnostic targets work, test the real target.
+
+For every real target log:
+
+```text
+TARGET DEBUG
+
+target id:
+target type:
+
+definition source:
+SCREEN_SPACE
+CAMERA_RELATIVE
+WORLD_SPACE
+
+target center:
+target bounds:
+
+projected screen center:
+projected screen bounds:
+
+currently visible:
+YES / NO
+
+if NO:
+WHY?
+```
+
+Possible visibility failure reasons must be explicit:
+
+```text
+OUTSIDE_FRUSTUM
+INVALID_TARGET_COORDINATES
+INVALID_PROJECTION
+MISSING_WORLD_POSITION
+MISSING_CAMERA_POSE
+BEHIND_CAMERA
+DISPLAY_TRANSFORM_ERROR
+SEMANTIC_REGION_NOT_FOUND
+UNKNOWN
+```
+
+Never just return `false`.
+
+# 12. Detect Invalid Target Geometry
+
+If targets currently have values such as:
+
+```text
+NaN
+Infinity
+undefined
+null
+```
+
+for:
+
+```text
+x
+y
+z
+screenX
+screenY
+bounds
+normal
+```
+
+flag them immediately.
+
+Add development assertions.
+
+Example:
+
+```ts
+if (!isFiniteTarget(target)) {
+    console.error(
+        "INVALID SCAN TARGET",
+        target
+    );
+}
+```
+
+Do not silently treat invalid geometry as "not visible."
+
+# 13. Check for Coordinate Range Mismatches
+
+Explicitly inspect whether one subsystem uses:
+
+```text
+0–1
+```
+
+while another uses:
+
+```text
+0–100
+```
+
+or:
+
+```text
+0–cameraWidth
+```
+
+or:
+
+```text
+-1 to +1
+```
+
+This is a very plausible reason EVERY target fails.
+
+Document each coordinate system.
+
+Examples:
+
+```text
+camera pixel coordinates:
+0..1920, 0..1080
+
+normalized image coordinates:
+0..1
+
+Three.js NDC:
+-1..1
+
+CSS display coordinates:
+0..elementWidth
+```
+
+Never compare them without conversion.
+
+# 14. Check CSS Cropping
+
+This is important.
+
+If the video uses:
+
+```css
+object-fit: cover;
+```
+
+the visible camera preview may be CROPPED compared with the raw camera frame.
+
+Example:
+
+```text
+RAW CAMERA
+
+┌───────────────────────────────┐
+│                               │
+└───────────────────────────────┘
+
+MOBILE DISPLAY
+
+      ┌─────────────┐
+      │ visible     │
+      │ cropped     │
+      │ area        │
+      └─────────────┘
+```
+
+If target projection uses raw-frame coordinates while overlay uses the cropped display, EVERYTHING can appear misaligned.
+
+Calculate the actual `object-fit: cover` transformation:
+
+```text
+scale
+cropX
+cropY
+displayWidth
+displayHeight
+```
+
+and use it in `cameraToDisplay()`.
+
+This is a HIGH-PRIORITY check.
+
+# 15. Check Video Dimensions
+
+Log:
+
+```text
+video.videoWidth
+video.videoHeight
+
+preview.clientWidth
+preview.clientHeight
+
+devicePixelRatio
+```
+
+Example:
+
+```text
+Camera:
+1920 × 1080
+
+Displayed:
+390 × 844
+```
+
+These are dramatically different aspect ratios.
+
+If the mapping assumes they are identical, target recognition/projection will be wrong.
+
+Implement proper aspect-ratio mapping.
+
+# 16. Create ONE Canonical Conversion Layer
+
+Implement or verify functions such as:
+
+```ts
+rawCameraToNormalized()
+normalizedToDisplay()
+displayToNormalized()
+normalizedToNDC()
+```
+
+Do NOT have separate random formulas throughout `App.js`.
+
+All target rendering and hit/visibility calculations should use the canonical conversion layer.
+
+# 17. Add a Visual Feature Debug Mode
+
+When target debugging is enabled, overlay:
+
+* detected feature points
+* active target rectangle
+* target center
+* camera center
+* projected target
+* accepted frame indicator
+
+Example:
+
+```text
+TARGET: wall_01_upper_left
+
+┌──────────────────────────┐
+│   ┌───────────────┐      │
+│   │ •  •    •     │      │
+│   │    TARGET •   │      │
+│   │ •       •     │      │
+│   └───────────────┘      │
+│                          │
+│            +             │
+└──────────────────────────┘
+
+Visible: YES
+Features: 9
+Frame accepted: YES
+```
+
+This should make the bug visually obvious.
+
+# 18. Do Not Resume 3-View Logic Until First Recognition Works
+
+We need this sequence to work FIRST:
+
+```text
+requested target
+↓
+user points at it
+↓
+targetVisible = true
+↓
+accepted frame overlaps target
+↓
+first observation = 1
+```
+
+Only after that works should:
+
+```text
+1/3
+→ 2/3
+→ 3/3
+```
+
+be tested.
+
+# 19. Automated Tests
+
+Add focused tests for:
+
+### Frame processing
+
+```text
+camera frame received
+→ evaluated counter increments
+```
+
+### Screen regions
+
+```text
+top-left normalized point
+→ TOP_LEFT
+```
+
+### Mirroring
+
+```text
+cameraToDisplay() handles current preview transform
+```
+
+### Cover cropping
+
+Test raw aspect ratio vs portrait preview with `object-fit: cover`.
+
+### First observation
+
+```text
+accepted frame
++
+visible target
++
+features
+→ observation count = 1
+```
+
+### Invalid geometry
+
+```text
+NaN target coordinate
+→ explicit INVALID_TARGET error
+```
+
+not silently:
+
+```text
+visible = false
+```
+
+# 20. Work Fast
+
+Start with:
+
+```text
+src/App.js
+src/scannerMotion.js
+```
+
+and the direct camera/target helper modules only.
+
+Do NOT inspect the entire repository.
+
+Do NOT modify Three.js simulator code.
+
+Do NOT modify backend reconstruction.
+
+Do NOT add AI.
+
+Do NOT change styling except debug overlays.
+
+Run only focused tests while finding the bug.
+
+Run the complete tests once afterward.
+
+# SUCCESS TEST
+
+I should be able to open:
+
+```text
+?scannerTargetDebug=1
+```
+
+and see:
+
+```text
+Frames: 438
+Accepted: 62
+
+Camera:
+1920x1080
+
+Display:
+390x844
+
+Mirrored: false
+Rotation: 90°
+
+Target:
+left_ceiling
+
+Target visible:
+YES
+
+Target features:
+17
+
+First observation:
+REGISTERED
+
+Useful views:
+1/3
+```
+
+If the camera visibly points at the requested region but:
+
+```text
+targetVisible = false
+```
+
+the debug overlay must show the exact reason.
+
+DO NOT continue adding scanner features until this fundamental target-recognition test passes.
+
+# FINAL RESPONSE
+
+After fixing, report only:
+
+1. root cause
+2. whether frames were being processed
+3. whether frames were being accepted
+4. whether raw-camera/display dimensions differed
+5. whether `object-fit: cover` caused coordinate mismatch
+6. whether mirroring/rotation caused mismatch
+7. whether target geometry was valid
+8. why target visibility previously returned false
+9. files changed
+10. targeted test results
+
+Fix the common recognition pipeline, not an individual room region.

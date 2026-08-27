@@ -1,5 +1,5 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
-import App, { canManuallyFinishScan, calculateScanProgress, calculateScanReadiness, createGuidanceController, createInitialScanState, determineNextAction, isTargetStalled, targetViewConfig, updateCoverageFromFrame } from './App';
+import App, { canManuallyFinishScan, calculateScanProgress, calculateScanReadiness, countFeaturesInRegion, createCameraDisplayTransform, createGuidanceController, createInitialScanState, determineNextAction, isTargetStalled, normalizedToDisplay, recordFrameEvaluation, targetViewConfig, updateCoverageFromFrame, validateTargetGeometry } from './App';
 
 test('renders the SmartScan starting state', () => {
   render(<App />);
@@ -279,6 +279,60 @@ test('stalled target watchdog waits for a sustained period and meaningful local 
   expect(isTargetStalled(watchdog, target, 10999)).toBe(false);
   expect(isTargetStalled(watchdog, { ...target, coverage: 0.25 }, 11000)).toBe(false);
   expect(isTargetStalled(watchdog, target, 11000)).toBe(true);
+});
+
+test('frame evaluation diagnostics count processed camera samples', () => {
+  const initial = createInitialScanState();
+  const state = recordFrameEvaluation(initial, {
+    frameDimensions: { width: 1920, height: 1080 },
+    displayDimensions: { width: 390, height: 844 },
+    featurePointsDisplay: [{ x: 0.1, y: 0.1 }],
+  }, 2000, 1000);
+
+  expect(state.cameraFramesReceived).toBe(1);
+  expect(state.framesEvaluated).toBe(1);
+  expect(state.evaluationFps).toBe(1);
+  expect(state.lastFrameTimestamp).toBe(2000);
+  expect(state.cameraFrameDimensions).toEqual({ width: 1920, height: 1080 });
+});
+
+test('canonical camera/display conversion accounts for cover cropping and mirroring', () => {
+  const cover = createCameraDisplayTransform({ rawWidth: 1920, rawHeight: 1080, displayWidth: 390, displayHeight: 844 });
+  expect(cover.cropX).toBeGreaterThan(0);
+  expect(normalizedToDisplay({ x: 0.5, y: 0.5 }, cover)).toEqual({ x: 0.5, y: 0.5 });
+
+  const mirrored = createCameraDisplayTransform({ rawWidth: 100, rawHeight: 100, displayWidth: 100, displayHeight: 100, mirrored: true });
+  expect(normalizedToDisplay({ x: 0.1, y: 0.2 }, mirrored)).toEqual({ x: 0.9, y: 0.2 });
+});
+
+test('screen-space diagnostic target recognizes its first accepted observation', () => {
+  const analysis = {
+    qualityScore: 0.82,
+    featureCount: 120,
+    trackedFeatureCount: 100,
+    featureTrackingQuality: 0.8,
+    motionBlur: false,
+    poorLighting: false,
+    sceneChange: 0,
+    featurePointsDisplay: [{ x: 0.2, y: 0.2 }, { x: 0.7, y: 0.7 }],
+  };
+  const state = updateCoverageFromFrame(
+    createInitialScanState(),
+    { heading: 0, pitch: 0 },
+    { x: 0, y: 0, z: 0 },
+    analysis,
+    0,
+    { accepted: true, observedAt: 1000 },
+  );
+
+  expect(countFeaturesInRegion(analysis.featurePointsDisplay, { x: 0, y: 0, width: 0.4, height: 0.4 })).toBe(1);
+  expect(state.diagnosticTarget.visible).toBe(true);
+  expect(state.diagnosticTarget.featuresInsideTarget).toBe(1);
+  expect(state.diagnosticTarget.firstObservationStatus).toBe('REGISTERED');
+});
+
+test('invalid target geometry reports an explicit diagnostic error', () => {
+  expect(validateTargetGeometry({ id: 'bad', yaw: Number.NaN, pitch: 0 })).toEqual({ valid: false, reason: 'INVALID_TARGET_COORDINATES' });
 });
 
 test('repeated low-texture observations become inferable from strong neighboring cells', () => {

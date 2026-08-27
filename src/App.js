@@ -16,7 +16,16 @@ function scannerDebugEnabled() {
   }
 }
 
-const SCANNER_DEBUG = scannerDebugEnabled();
+function scannerTargetDebugEnabled() {
+  try {
+    return new URLSearchParams(window.location.search).get('scannerTargetDebug') === '1';
+  } catch (error) {
+    return false;
+  }
+}
+
+const SCANNER_TARGET_DEBUG = scannerTargetDebugEnabled();
+const SCANNER_DEBUG = scannerDebugEnabled() || SCANNER_TARGET_DEBUG;
 
 /* Legacy fixed-route guidance is intentionally disabled. Adaptive guidance below uses live scan state.
 const GUIDANCE_STEPS = [
@@ -145,6 +154,222 @@ const COVERAGE_ROWS = [
   { id: 'middle', label: 'Walls', pitch: 0 },
   { id: 'floor', label: 'Floor', pitch: -0.52 },
 ];
+
+export const DIAGNOSTIC_SCREEN_TARGET = Object.freeze({
+  id: 'TOP_LEFT_SCREEN_TEST',
+  xMin: 0,
+  xMax: 0.4,
+  yMin: 0,
+  yMax: 0.4,
+});
+
+function finiteOrNull(value) {
+  return Number.isFinite(Number(value)) ? Number(value) : null;
+}
+
+function normalizedPointInBounds(point, bounds) {
+  return Boolean(point)
+    && Boolean(bounds)
+    && Number.isFinite(Number(point.x))
+    && Number.isFinite(Number(point.y))
+    && Number(point.x) >= Number(bounds.xMin ?? bounds.x ?? 0)
+    && Number(point.x) <= Number(bounds.xMax ?? ((bounds.x || 0) + (bounds.width || 0)))
+    && Number(point.y) >= Number(bounds.yMin ?? bounds.y ?? 0)
+    && Number(point.y) <= Number(bounds.yMax ?? ((bounds.y || 0) + (bounds.height || 0)));
+}
+
+export function createCameraDisplayTransform({
+  rawWidth = 1,
+  rawHeight = 1,
+  displayWidth = rawWidth,
+  displayHeight = rawHeight,
+  mirrored = false,
+  rotation = 0,
+} = {}) {
+  const width = Math.max(1, Number(rawWidth) || 1);
+  const height = Math.max(1, Number(rawHeight) || 1);
+  const outputWidth = Math.max(1, Number(displayWidth) || 1);
+  const outputHeight = Math.max(1, Number(displayHeight) || 1);
+  const normalizedRotation = ((Math.round(Number(rotation) || 0) % 360) + 360) % 360;
+  const rotated = normalizedRotation === 90 || normalizedRotation === 270;
+  const orientedWidth = rotated ? height : width;
+  const orientedHeight = rotated ? width : height;
+  const scale = Math.max(outputWidth / orientedWidth, outputHeight / orientedHeight);
+  const renderedWidth = orientedWidth * scale;
+  const renderedHeight = orientedHeight * scale;
+  return {
+    rawWidth: width,
+    rawHeight: height,
+    displayWidth: outputWidth,
+    displayHeight: outputHeight,
+    displayAspect: outputWidth / outputHeight,
+    rawAspect: width / height,
+    scale,
+    renderedWidth,
+    renderedHeight,
+    cropX: (renderedWidth - outputWidth) / 2,
+    cropY: (renderedHeight - outputHeight) / 2,
+    mirrored: Boolean(mirrored),
+    rotation: normalizedRotation,
+    coordinateSystems: {
+      rawPixels: `0..${width} x 0..${height}`,
+      normalizedImage: '0..1 x 0..1',
+      displayPixels: `0..${outputWidth} x 0..${outputHeight}`,
+      displayNormalized: '0..1 x 0..1',
+      ndc: '-1..1 x -1..1',
+    },
+  };
+}
+
+export function rawCameraToNormalized(point, { rawWidth = 1, rawHeight = 1 } = {}) {
+  const width = Math.max(1, Number(rawWidth) || 1);
+  const height = Math.max(1, Number(rawHeight) || 1);
+  return { x: Number(point?.x || 0) / width, y: Number(point?.y || 0) / height };
+}
+
+function rotateNormalizedPoint(point, rotation) {
+  if (rotation === 90) return { x: 1 - point.y, y: point.x };
+  if (rotation === 180) return { x: 1 - point.x, y: 1 - point.y };
+  if (rotation === 270) return { x: point.y, y: 1 - point.x };
+  return { x: point.x, y: point.y };
+}
+
+function unrotateNormalizedPoint(point, rotation) {
+  if (rotation === 90) return { x: point.y, y: 1 - point.x };
+  if (rotation === 180) return { x: 1 - point.x, y: 1 - point.y };
+  if (rotation === 270) return { x: 1 - point.y, y: point.x };
+  return { x: point.x, y: point.y };
+}
+
+export function normalizedToDisplay(point, transform) {
+  const safeTransform = transform || createCameraDisplayTransform();
+  let oriented = rotateNormalizedPoint({ x: Number(point?.x) || 0, y: Number(point?.y) || 0 }, safeTransform.rotation);
+  if (safeTransform.mirrored) oriented = { x: 1 - oriented.x, y: oriented.y };
+  return {
+    x: ((oriented.x * safeTransform.renderedWidth) - safeTransform.cropX) / safeTransform.displayWidth,
+    y: ((oriented.y * safeTransform.renderedHeight) - safeTransform.cropY) / safeTransform.displayHeight,
+  };
+}
+
+export function displayToNormalized(point, transform) {
+  const safeTransform = transform || createCameraDisplayTransform();
+  let oriented = {
+    x: ((Number(point?.x) || 0) * safeTransform.displayWidth + safeTransform.cropX) / safeTransform.renderedWidth,
+    y: ((Number(point?.y) || 0) * safeTransform.displayHeight + safeTransform.cropY) / safeTransform.renderedHeight,
+  };
+  if (safeTransform.mirrored) oriented = { x: 1 - oriented.x, y: oriented.y };
+  return unrotateNormalizedPoint(oriented, safeTransform.rotation);
+}
+
+export function normalizedToNDC(point) {
+  return { x: ((Number(point?.x) || 0) * 2) - 1, y: 1 - ((Number(point?.y) || 0) * 2) };
+}
+
+function cameraDisplayTransformFor(video, displayElement) {
+  const displayRect = displayElement?.getBoundingClientRect?.() || {
+    width: video?.clientWidth || video?.videoWidth || 1,
+    height: video?.clientHeight || video?.videoHeight || 1,
+  };
+  let mirrored = false;
+  let rotation = 0;
+  if (video && typeof window !== 'undefined' && window.getComputedStyle) {
+    const computed = window.getComputedStyle(video);
+    const transform = computed.transform;
+    if (transform && transform !== 'none') {
+      const values = transform.match(/matrix\((-?[^)]+)\)/)?.[1]?.split(',').map(Number);
+      if (values?.length >= 4) {
+        mirrored = values[0] < 0;
+        rotation = Math.round((Math.atan2(values[1], values[0]) * 180) / Math.PI);
+      }
+    }
+  }
+  return createCameraDisplayTransform({
+    rawWidth: video?.videoWidth || 1,
+    rawHeight: video?.videoHeight || 1,
+    displayWidth: displayRect.width || 1,
+    displayHeight: displayRect.height || 1,
+    mirrored,
+    rotation,
+  });
+}
+
+function screenOrientationLabel() {
+  if (typeof window === 'undefined') return 'unknown';
+  const angle = Number(window.screen?.orientation?.angle ?? window.orientation);
+  const type = window.screen?.orientation?.type;
+  if (Number.isFinite(angle)) return `${type || 'screen'} (${angle}°)`;
+  return type || 'unknown';
+}
+
+function screenTargetGeometry(target = DIAGNOSTIC_SCREEN_TARGET) {
+  const valid = [target?.xMin, target?.xMax, target?.yMin, target?.yMax]
+    .every((value) => Number.isFinite(Number(value)));
+  if (!valid || target.xMin < 0 || target.yMin < 0 || target.xMax > 1 || target.yMax > 1 || target.xMin >= target.xMax || target.yMin >= target.yMax) {
+    return { valid: false, reason: 'INVALID_TARGET_COORDINATES' };
+  }
+  return {
+    valid: true,
+    bounds: {
+      x: target.xMin,
+      y: target.yMin,
+      width: target.xMax - target.xMin,
+      height: target.yMax - target.yMin,
+    },
+    center: { x: (target.xMin + target.xMax) / 2, y: (target.yMin + target.yMax) / 2 },
+  };
+}
+
+export function countFeaturesInRegion(featurePoints, bounds) {
+  return (Array.isArray(featurePoints) ? featurePoints : []).filter((point) => normalizedPointInBounds(point, bounds)).length;
+}
+
+function diagnosticTargetForFrame(analysis, orientation, accepted, previousDiagnostic = null) {
+  const geometry = screenTargetGeometry();
+  const bounds = geometry.bounds || { x: 0, y: 0, width: 0.4, height: 0.4 };
+  const visible = geometry.valid;
+  const featurePoints = analysis?.featurePointsDisplay || [];
+  const featuresInsideTarget = countFeaturesInRegion(featurePoints, bounds);
+  const orientationPitchValue = finiteOrNull(orientation?.pitch);
+  const orientationAvailable = orientationPitchValue !== null;
+  const lookUpVisible = orientationAvailable && orientationPitchValue >= 0.2;
+  const firstObservationRegistered = Boolean(previousDiagnostic?.firstObservationRegistered)
+    || Boolean(accepted && visible && featuresInsideTarget > 0);
+  return {
+    id: DIAGNOSTIC_SCREEN_TARGET.id,
+    definitionSource: 'SCREEN_SPACE',
+    bounds,
+    center: geometry.center,
+    visible,
+    overlap: visible ? 1 : 0,
+    featuresInsideTarget,
+    totalFeatures: featurePoints.length,
+    frameAccepted: Boolean(accepted),
+    firstObservationRegistered,
+    firstObservationStatus: firstObservationRegistered ? 'REGISTERED' : 'WAITING',
+    lookUpTest: {
+      id: 'LOOK_UP_TEST',
+      visible: lookUpVisible,
+      reason: !orientationAvailable ? 'MISSING_ORIENTATION' : lookUpVisible ? null : 'PITCH_NOT_UPWARD',
+      normalizedPitch: orientationPitchValue,
+    },
+  };
+}
+
+export function recordFrameEvaluation(previousState, analysis, observedAt = Date.now(), scanStartedAt = observedAt) {
+  const framesEvaluated = (previousState.framesEvaluated || 0) + 1;
+  const elapsedSeconds = Math.max(0.001, (Number(observedAt) - Number(scanStartedAt)) / 1000);
+  return {
+    ...previousState,
+    framesEvaluated,
+    cameraFramesReceived: (previousState.cameraFramesReceived || 0) + 1,
+    lastFrameTimestamp: observedAt,
+    evaluationFps: framesEvaluated / elapsedSeconds,
+    cameraFrameDimensions: analysis?.frameDimensions || previousState.cameraFrameDimensions,
+    displayDimensions: analysis?.displayDimensions || previousState.displayDimensions,
+    displayTransform: analysis?.displayTransform || previousState.displayTransform,
+    featurePointsDisplay: analysis?.featurePointsDisplay || previousState.featurePointsDisplay || [],
+  };
+}
 
 export const scannerQualityConfig = Object.freeze({
   acceptableFrameScore: 0.28,
@@ -306,6 +531,18 @@ function createInitialScanState() {
     reconstructionConfidence: 0,
     visibleRegionIds: [],
     sceneUnderstanding: null,
+    diagnosticTarget: diagnosticTargetForFrame(null, { pitch: null }, false),
+    featurePointsDisplay: [],
+    cameraFramesReceived: 0,
+    evaluationFps: 0,
+    lastFrameTimestamp: 0,
+    cameraFrameDimensions: { width: 0, height: 0 },
+    displayDimensions: { width: 0, height: 0 },
+    displayTransform: null,
+    cameraFacing: 'unknown',
+    screenOrientation: 'unknown',
+    previewMirrored: false,
+    previewRotation: 0,
     activeTargetId: null,
     lastTargetViewDecision: null,
     skippedRegionIds: [],
@@ -371,12 +608,69 @@ function coverageRowBounds(row) {
   return { y: 0.4, height: 0.3 };
 }
 
-function projectCoverageRegions(regions, orientation) {
+export function validateTargetGeometry(target) {
+  if (!target || typeof target !== 'object') return { valid: false, reason: 'INVALID_TARGET_COORDINATES' };
+  const requiredNumbers = ['yaw', 'pitch'];
+  if (requiredNumbers.some((key) => !Number.isFinite(Number(target[key])))) {
+    return { valid: false, reason: 'INVALID_TARGET_COORDINATES' };
+  }
+  const vectors = ['estimatedWorldCenter', 'estimatedNormal'];
+  for (const key of vectors) {
+    if (target[key] && ['x', 'y', 'z'].some((axis) => !Number.isFinite(Number(target[key][axis])))) {
+      return { valid: false, reason: 'INVALID_TARGET_COORDINATES' };
+    }
+  }
+  if (target.screenBounds && ['x', 'y', 'width', 'height'].some((key) => !Number.isFinite(Number(target.screenBounds[key])))) {
+    return { valid: false, reason: 'INVALID_TARGET_COORDINATES' };
+  }
+  return { valid: true, reason: null };
+}
+
+function displayBoundsForNormalizedBounds(bounds, transform) {
+  if (!transform) return bounds;
+  const corners = [
+    normalizedToDisplay({ x: bounds.x, y: bounds.y }, transform),
+    normalizedToDisplay({ x: bounds.x + bounds.width, y: bounds.y }, transform),
+    normalizedToDisplay({ x: bounds.x, y: bounds.y + bounds.height }, transform),
+    normalizedToDisplay({ x: bounds.x + bounds.width, y: bounds.y + bounds.height }, transform),
+  ];
+  const minX = Math.min(...corners.map((point) => point.x));
+  const maxX = Math.max(...corners.map((point) => point.x));
+  const minY = Math.min(...corners.map((point) => point.y));
+  const maxY = Math.max(...corners.map((point) => point.y));
+  return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+}
+
+function normalizedBoundsOverlap(bounds) {
+  if (!bounds || bounds.width <= 0 || bounds.height <= 0) return 0;
+  const intersectionWidth = Math.max(0, Math.min(1, bounds.x + bounds.width) - Math.max(0, bounds.x));
+  const intersectionHeight = Math.max(0, Math.min(1, bounds.y + bounds.height) - Math.max(0, bounds.y));
+  return clamp((intersectionWidth * intersectionHeight) / (bounds.width * bounds.height), 0, 1);
+}
+
+function projectCoverageRegions(regions, orientation, displayTransform = null) {
   const heading = Number.isFinite(Number(orientation?.heading))
     ? Number(orientation.heading)
     : Number.isFinite(Number(orientation?.alpha)) ? Number(orientation.alpha) : 0;
   const pitch = Number(orientation?.pitch) || 0;
   return regions.map((region) => {
+    const geometry = validateTargetGeometry(region);
+    if (!geometry.valid) {
+      if (SCANNER_DEBUG) {
+        // eslint-disable-next-line no-console
+        console.error('INVALID SCAN TARGET', region);
+      }
+      return {
+        ...region,
+        definitionSource: 'CAMERA_RELATIVE',
+        currentlyVisible: false,
+        screenBounds: null,
+        screenOverlap: 0,
+        visibilityScore: 0,
+        screenPosition: null,
+        visibilityReason: geometry.reason,
+      };
+    }
     const yawDelta = normalizedAngleDelta(heading, region.yaw);
     const pitchDelta = region.pitch - pitch;
     const xCenter = clamp(0.5 + (yawDelta / COVERAGE_HORIZONTAL_FOV_DEGREES), 0.02, 0.98);
@@ -386,27 +680,32 @@ function projectCoverageRegions(regions, orientation) {
     const height = rowBounds.height * 0.78;
     const horizontalVisible = Math.abs(yawDelta) <= (COVERAGE_HORIZONTAL_FOV_DEGREES / 2) + 8;
     const verticalVisible = Math.abs(pitchDelta) <= (COVERAGE_VERTICAL_FOV / 2) + 0.12;
-    const screenBounds = {
-      x: clamp(xCenter - (width / 2), 0, 1 - width),
-      y: clamp(yCenter - (height / 2), 0, 1 - height),
+    const rawScreenBounds = {
+      x: xCenter - (width / 2),
+      y: yCenter - (height / 2),
       width,
       height,
     };
+    const screenBounds = displayBoundsForNormalizedBounds(rawScreenBounds, displayTransform);
     const visibleScore = clamp(
       (1 - (Math.abs(yawDelta) / ((COVERAGE_HORIZONTAL_FOV_DEGREES / 2) + 8))) * 0.55
       + (1 - (Math.abs(pitchDelta) / ((COVERAGE_VERTICAL_FOV / 2) + 0.12))) * 0.45,
       0,
       1,
     );
+    const rawVisible = geometry.valid && horizontalVisible && verticalVisible;
+    const screenOverlap = rawVisible ? normalizedBoundsOverlap(screenBounds) : 0;
     return {
       ...region,
-      currentlyVisible: horizontalVisible && verticalVisible,
+      definitionSource: 'CAMERA_RELATIVE',
+      currentlyVisible: rawVisible && screenOverlap > 0,
       screenBounds,
       // This is a normalized estimate of how much of the projected target is
       // inside the usable camera frustum, not a pixel measurement.
-      screenOverlap: horizontalVisible && verticalVisible ? visibleScore : 0,
+      screenOverlap,
       visibilityScore: visibleScore,
-      screenPosition: { x: xCenter, y: yCenter },
+      screenPosition: displayTransform ? normalizedToDisplay({ x: xCenter, y: yCenter }, displayTransform) : { x: xCenter, y: yCenter },
+      visibilityReason: !geometry.valid ? geometry.reason : rawVisible && screenOverlap > 0 ? null : 'OUTSIDE_FRUSTUM',
     };
   });
 }
@@ -453,6 +752,9 @@ function targetAngleDelta(previousView, nextView) {
 
 function regionFeatureDensity(region, analysis) {
   const globalDensity = clamp((Number(analysis?.featureCount) || 0) / 850, 0, 1);
+  if (Array.isArray(analysis?.featurePointsDisplay) && region?.screenBounds) {
+    return clamp((countFeaturesInRegion(analysis.featurePointsDisplay, region.screenBounds) / 40) * 0.7 + (globalDensity * 0.3), 0, 1);
+  }
   const grid = analysis?.sceneUnderstanding?.grid;
   if (!Array.isArray(grid) || !region.screenBounds) return globalDensity;
   const centerX = region.screenBounds.x + (region.screenBounds.width / 2);
@@ -475,7 +777,9 @@ function targetViewMetrics(targetRegion, analysis, pose, orientation, previousVi
   const parallax = clamp(rawParallaxMeters / 0.45, 0, 1);
   const screenOverlap = clamp(Number(targetRegion?.screenOverlap ?? targetRegion?.visibilityScore) || 0, 0, 1);
   const targetFeatureDensity = regionFeatureDensity(targetRegion, analysis);
-  const targetFeatureCount = Math.round(targetFeatureDensity * 850);
+  const targetFeatureCount = Array.isArray(analysis?.featurePointsDisplay) && targetRegion?.screenBounds
+    ? countFeaturesInRegion(analysis.featurePointsDisplay, targetRegion.screenBounds)
+    : Math.round(targetFeatureDensity * 850);
   const targetMatchedFeatureCount = Math.round((Number(analysis?.trackedFeatureCount) || 0) * screenOverlap);
   // sceneChange is the existing normalized feature-displacement proxy from
   // the frame analyzer. It supplements pose when browser translation is noisy.
@@ -518,6 +822,12 @@ export function qualifyTargetView({ targetRegion, activeTargetId, analysis, pose
   const result = {
     targetRegionId: activeTargetId || targetRegion?.id || null,
     targetType: targetRegion?.semanticType || null,
+    definitionSource: targetRegion?.definitionSource || 'CAMERA_RELATIVE',
+    targetCenter: targetRegion?.estimatedWorldCenter || null,
+    targetBounds: targetRegion?.screenBounds || null,
+    projectedScreenCenter: targetRegion?.screenPosition || null,
+    projectedScreenBounds: targetRegion?.screenBounds || null,
+    visibilityReason: targetRegion?.visibilityReason || null,
     visible: Boolean(targetRegion?.currentlyVisible),
     qualified: false,
     reason: 'UNKNOWN',
@@ -1008,6 +1318,7 @@ function blobToDataUrl(blob) {
 function matchLocalFeatures(currentGray, previousGray, width, height) {
   let detected = 0;
   let tracked = 0;
+  const points = [];
   for (let y = 7; y < height - 7; y += 8) {
     for (let x = 7; x < width - 7; x += 8) {
       const index = y * width + x;
@@ -1015,6 +1326,7 @@ function matchLocalFeatures(currentGray, previousGray, width, height) {
       const vertical = Math.abs(currentGray[index + (2 * width)] - currentGray[index - (2 * width)]);
       if (horizontal + vertical < 46) continue;
       detected += 1;
+      points.push({ x: x / width, y: y / height });
       if (!previousGray) continue;
       let bestError = Number.POSITIVE_INFINITY;
       for (let offsetY = -4; offsetY <= 4; offsetY += 2) {
@@ -1033,10 +1345,10 @@ function matchLocalFeatures(currentGray, previousGray, width, height) {
       if (bestError < 34) tracked += 1;
     }
   }
-  return { detected, tracked };
+  return { detected, tracked, points };
 }
 
-function analyzeVideoFrame(video, canvas, previousGray) {
+function analyzeVideoFrame(video, canvas, previousGray, displayElement) {
   if (!video || video.readyState < 2 || video.videoWidth === 0 || video.videoHeight === 0) return null;
   const width = 192;
   const height = Math.max(108, Math.round((video.videoHeight / video.videoWidth) * width));
@@ -1095,6 +1407,9 @@ function analyzeVideoFrame(video, canvas, previousGray) {
   const exposureScore = clamp(1 - (Math.abs(brightness - 0.48) / 0.48), 0, 1);
   const sceneChange = temporalSamples > 0 ? clamp(temporalDifference / temporalSamples / 0.12, 0, 1) : 1;
   const featureStats = matchLocalFeatures(gray, previousGray, width, height);
+  const displayTransform = cameraDisplayTransformFor(video, displayElement);
+  const featurePoints = featureStats.points;
+  const featurePointsDisplay = featurePoints.map((point) => normalizedToDisplay(point, displayTransform));
   const featureCount = previousGray ? featureStats.tracked : featureStats.detected;
   const featureTrackingQuality = previousGray
     ? clamp(((featureStats.tracked / Math.max(1, featureStats.detected)) * 0.55) + ((featureStats.tracked / 850) * 0.45), 0, 1)
@@ -1109,6 +1424,11 @@ function analyzeVideoFrame(video, canvas, previousGray) {
     featureCount,
     detectedFeatureCount: featureStats.detected,
     trackedFeatureCount: featureStats.tracked,
+    featurePoints,
+    featurePointsDisplay,
+    frameDimensions: { width: video.videoWidth, height: video.videoHeight },
+    displayDimensions: { width: displayTransform.displayWidth, height: displayTransform.displayHeight },
+    displayTransform,
     featureTrackingQuality,
     sharpness,
     brightness,
@@ -1191,7 +1511,7 @@ function updateCoverageFromFrameLegacy(previousState, orientation, pose, analysi
 export function updateCoverageFromFrame(previousState, orientation, pose, analysis, parallaxDistance, options = {}) {
   if (!analysis) return previousState;
   const frameOrientation = orientationForFrame(orientation, pose, previousState);
-  const projectedRegions = projectCoverageRegions(previousState.coverageRegions, frameOrientation);
+  const projectedRegions = projectCoverageRegions(previousState.coverageRegions, frameOrientation, analysis.displayTransform);
   const activeTargetId = options.activeTargetId || previousState.activeTargetId || null;
   const activeTarget = activeTargetId
     ? projectedRegions.find((region) => region.id === activeTargetId) || null
@@ -1265,6 +1585,25 @@ export function updateCoverageFromFrame(previousState, orientation, pose, analys
     }
   }
 
+  if (SCANNER_TARGET_DEBUG && activeTargetId) {
+    // Diagnostic mode intentionally logs every evaluation so visibility can
+    // be verified independently from keyframe quality and completion logic.
+    // eslint-disable-next-line no-console
+    console.log('TARGET DEBUG', {
+      targetId: activeTargetId,
+      targetType: activeTarget?.semanticType || null,
+      definitionSource: activeTarget?.definitionSource || 'CAMERA_RELATIVE',
+      targetCenter: activeTarget?.estimatedWorldCenter || null,
+      targetBounds: activeTarget?.screenBounds || null,
+      projectedScreenCenter: activeTarget?.screenPosition || null,
+      projectedScreenBounds: activeTarget?.screenBounds || null,
+      currentlyVisible: activeTarget?.currentlyVisible ? 'YES' : 'NO',
+      visibilityReason: activeTarget?.visibilityReason || 'UNKNOWN',
+      targetIdMatches: activeTarget?.id === activeTargetId,
+      frameAccepted: usableObservation,
+    });
+  }
+
   // An accepted frame can still contribute to general room coverage when it
   // sees a different region. It must never increment the active target's view
   // count unless that canonical target passed the visibility/novelty checks.
@@ -1306,6 +1645,7 @@ export function updateCoverageFromFrame(previousState, orientation, pose, analys
   const summary = summarizeCoverage(regions);
   const observedSectors = new Set(regions.filter((region) => region.uniqueViewAngles >= 2 && region.parallaxScore >= 0.18).map((region) => region.column));
   const viewpointDiversity = observedSectors.size / COVERAGE_COLUMNS;
+  const diagnosticTarget = diagnosticTargetForFrame(analysis, frameOrientation, usableObservation, previousState.diagnosticTarget);
   const featureQuality = clamp((analysis.featureCount / 850) * 0.3, 0, 0.3);
   const trackingQuality = clamp((analysis.featureTrackingQuality * 0.55) + (analysis.qualityScore * 0.45) + featureQuality, 0, 1);
   const nextState = {
@@ -1327,6 +1667,11 @@ export function updateCoverageFromFrame(previousState, orientation, pose, analys
       ? { method: 'deterministic-spatial-gradient', ...analysis.sceneUnderstanding }
       : null,
     coverageRegions: regions,
+    diagnosticTarget,
+    featurePointsDisplay: analysis.featurePointsDisplay || [],
+    cameraFrameDimensions: analysis.frameDimensions || previousState.cameraFrameDimensions,
+    displayDimensions: analysis.displayDimensions || previousState.displayDimensions,
+    displayTransform: analysis.displayTransform || previousState.displayTransform,
     activeTargetId,
     lastTargetViewDecision: targetViewDecision,
     visibleRegionIds: regions.filter((region) => region.currentlyVisible).map((region) => region.id),
@@ -1359,6 +1704,7 @@ function loadGLTFAsset(url, onLoad, onError) {
 
 function App() {
   const videoRef = useRef(null);
+  const cameraFrameRef = useRef(null);
   const streamRef = useRef(null);
   const scanStartedAtRef = useRef(null);
   const scanSessionIdRef = useRef(null);
@@ -1501,6 +1847,11 @@ function App() {
         audio: false,
       });
       streamRef.current = stream;
+      const facingMode = stream.getVideoTracks?.()[0]?.getSettings?.()?.facingMode;
+      if (facingMode) {
+        scanStateRef.current = { ...scanStateRef.current, cameraFacing: facingMode };
+        setScanState(scanStateRef.current);
+      }
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
       }
@@ -1545,7 +1896,7 @@ function App() {
     const now = Date.now();
     if (now - lastCaptureAtRef.current < scannerQualityConfig.captureIntervalMs || !video || video.readyState < 2 || video.videoWidth === 0) return false;
     const analysisCanvas = analysisCanvasRef.current || document.createElement('canvas');
-    const analysis = providedAnalysis || analyzeVideoFrame(video, analysisCanvas, previousFrameGrayRef.current);
+    const analysis = providedAnalysis || analyzeVideoFrame(video, analysisCanvas, previousFrameGrayRef.current, cameraFrameRef.current);
     if (!analysis) return false;
     previousFrameGrayRef.current = analysis.gray;
     const previous = lastAcceptedFrameRef.current;
@@ -1856,13 +2207,13 @@ function App() {
         const video = videoRef.current;
         const canvas = analysisCanvasRef.current || document.createElement('canvas');
         analysisCanvasRef.current = canvas;
-        let analysis = analyzeVideoFrame(video, canvas, previousFrameGrayRef.current);
+        let analysis = analyzeVideoFrame(video, canvas, previousFrameGrayRef.current, cameraFrameRef.current);
         // A rejected frame must not become the only bridge to the next frame.
         // Probe the last accepted keyframe as a lightweight relocalization
         // attempt before deciding that tracking is truly gone.
         const acceptedReferenceGray = lastAcceptedFrameRef.current?.analysis?.gray;
         if (analysis && analysis.featureTrackingQuality < 0.22 && acceptedReferenceGray) {
-          const relocalizedAnalysis = analyzeVideoFrame(video, canvas, acceptedReferenceGray);
+          const relocalizedAnalysis = analyzeVideoFrame(video, canvas, acceptedReferenceGray, cameraFrameRef.current);
           if (relocalizedAnalysis && relocalizedAnalysis.featureTrackingQuality > analysis.featureTrackingQuality) {
             analysis = relocalizedAnalysis;
           }
@@ -1876,7 +2227,10 @@ function App() {
            const watchdog = guidanceWatchdogRef.current;
            const watchedTarget = watchdog.targetId ? nextState.coverageRegions.find((region) => region.id === watchdog.targetId) : null;
            nextState.targetStalled = isTargetStalled(watchdog, watchedTarget, now);
-           nextState.framesEvaluated = (scanStateRef.current.framesEvaluated || 0) + 1;
+           Object.assign(nextState, recordFrameEvaluation(nextState, analysis, now, scanStartedAtRef.current || now));
+           nextState.screenOrientation = screenOrientationLabel();
+           nextState.previewMirrored = Boolean(analysis.displayTransform?.mirrored);
+           nextState.previewRotation = Number(analysis.displayTransform?.rotation) || 0;
            nextState.movementSpeed = pathRef.current.velocity;
            nextState.rotationOnly = rotationOnlyRef.current;
            const motionSnapshot = motionTrackerRef.current.updateTrackingQuality({
@@ -2295,10 +2649,31 @@ function App() {
         />
       ) : <div className={`workspace ${isScanning ? 'workspace-scanning' : ''}`}>
         <section className="camera-column" aria-label="Camera preview">
-          <div className="camera-frame">
+          <div className={`camera-frame ${SCANNER_TARGET_DEBUG ? 'camera-frame-target-debug' : ''}`} ref={cameraFrameRef}>
             <video ref={videoRef} className={`camera-video ${cameraState === 'live' ? 'camera-video-live' : ''}`} autoPlay muted playsInline />
             <div className="room-fallback" aria-hidden={cameraState === 'live'}><span>LIVE CAMERA REQUIRED</span></div>
             <div className="camera-shade" />
+            {SCANNER_TARGET_DEBUG && (
+              <>
+                <div className="target-debug-quadrants" aria-hidden="true">
+                  <span>TOP LEFT</span><span>TOP RIGHT</span><span>BOTTOM LEFT</span><span>BOTTOM RIGHT</span>
+                </div>
+                <div
+                  className="diagnostic-screen-target"
+                  style={{ left: '0%', top: '0%', width: '40%', height: '40%' }}
+                  aria-label="Top left screen diagnostic target"
+                >
+                  <strong>TEST TARGET</strong>
+                  <small>TOP LEFT</small>
+                </div>
+                <div className="diagnostic-feature-layer" aria-hidden="true">
+                  {(scanState.featurePointsDisplay || []).slice(0, 300).map((point, index) => (
+                    <i key={`${point.x}-${point.y}-${index}`} style={{ left: `${point.x * 100}%`, top: `${point.y * 100}%` }} />
+                  ))}
+                </div>
+                <div className="diagnostic-camera-center" aria-hidden="true">+</div>
+              </>
+            )}
             <div className="camera-meta camera-meta-top">
               <span className="recording-label"><span className="status-dot status-dot-recording" /> {isScanning ? 'LIVE CAPTURE' : 'CAMERA PREVIEW'}</span>
               <span className="camera-mode">{cameraState === 'live' ? 'LIVE CAMERA' : cameraState === 'fallback' ? 'HTTPS REQUIRED' : 'CAMERA OFF'}</span>
@@ -2313,7 +2688,7 @@ function App() {
               <span className="reticle-cross reticle-cross-horizontal" />
               <span className="reticle-cross reticle-cross-vertical" />
             </div>
-            {isScanning && activeTarget && targetScreenBounds && activeTarget.currentlyVisible && (
+            {isScanning && !SCANNER_TARGET_DEBUG && activeTarget && targetScreenBounds && activeTarget.currentlyVisible && (
               <div
                 className="spatial-target-overlay"
                 style={{
@@ -2342,6 +2717,60 @@ function App() {
             </div>
             {SCANNER_DEBUG && isScanning && (
               <aside className="scanner-debug-overlay" aria-label="Scanner motion debug">
+                {SCANNER_TARGET_DEBUG && (
+                  <>
+                    <div className="scanner-debug-section scanner-debug-section-first">Target recognition diagnostics</div>
+                    <div className="scanner-debug-grid">
+                      <span>Camera frames received</span><b>{scanState.cameraFramesReceived}</b>
+                      <span>FPS evaluated</span><b>{Number(scanState.evaluationFps || 0).toFixed(1)}</b>
+                      <span>Last frame timestamp</span><b>{scanState.lastFrameTimestamp || '—'}</b>
+                      <span>Camera</span><b>{scanState.cameraFrameDimensions.width ? `${scanState.cameraFrameDimensions.width}×${scanState.cameraFrameDimensions.height}` : '—'}</b>
+                      <span>Display</span><b>{scanState.displayDimensions.width ? `${Math.round(scanState.displayDimensions.width)}×${Math.round(scanState.displayDimensions.height)}` : '—'}</b>
+                      <span>Device pixel ratio</span><b>{typeof window !== 'undefined' ? window.devicePixelRatio || 1 : '—'}</b>
+                      <span>Mirrored / rotation</span><b>{scanState.previewMirrored ? 'true' : 'false'} / {scanState.previewRotation}°</b>
+                      <span>Screen orientation</span><b>{scanState.screenOrientation}</b>
+                      <span>Camera facing</span><b>{scanState.cameraFacing}</b>
+                      <span>Frames evaluated</span><b>{scanState.framesEvaluated}</b>
+                      <span>Frames accepted</span><b>{scanState.acceptedFrames}</b>
+                      <span>Frames rejected</span><b>{scanState.rejectedFrames}</b>
+                    </div>
+                    <div className="scanner-debug-section">Orientation</div>
+                    <div className="scanner-debug-grid">
+                      <span>Pitch</span><b>{scanState.currentOrientation?.pitch === null ? '—' : Number(scanState.currentOrientation?.pitch || 0).toFixed(3)}</b>
+                      <span>Yaw</span><b>{scanState.currentOrientation?.heading === null ? '—' : `${Number(scanState.currentOrientation.heading).toFixed(1)}°`}</b>
+                      <span>Roll</span><b>{scanState.currentOrientation?.gamma === null ? '—' : `${Number(scanState.currentOrientation.gamma).toFixed(1)}°`}</b>
+                    </div>
+                    <div className="scanner-debug-section">Screen target</div>
+                    <div className="scanner-debug-grid">
+                      <span>Test region exists</span><b>YES</b>
+                      <span>Frame overlaps test region</span><b>{scanState.diagnosticTarget.visible ? 'YES' : 'NO'}</b>
+                      <span>Target visible</span><b>{scanState.diagnosticTarget.visible ? 'YES' : 'NO'}</b>
+                      <span>Total frame features</span><b>{scanState.diagnosticTarget.totalFeatures}</b>
+                      <span>Features inside target</span><b>{scanState.diagnosticTarget.featuresInsideTarget}</b>
+                      <span>Frame accepted</span><b>{scanState.diagnosticTarget.frameAccepted ? 'YES' : 'NO'}</b>
+                      <span>First observation</span><b>{scanState.diagnosticTarget.firstObservationStatus}</b>
+                    </div>
+                    <div className="scanner-debug-section">LOOK_UP_TEST</div>
+                    <div className="scanner-debug-grid">
+                      <span>Visible</span><b>{scanState.diagnosticTarget.lookUpTest.visible ? 'YES' : 'NOT VISIBLE'}</b>
+                      <span>Reason</span><b>{scanState.diagnosticTarget.lookUpTest.reason || '—'}</b>
+                      <span>Normalized pitch</span><b>{scanState.diagnosticTarget.lookUpTest.normalizedPitch === null ? '—' : Number(scanState.diagnosticTarget.lookUpTest.normalizedPitch).toFixed(3)}</b>
+                    </div>
+                    {activeTarget && (
+                      <>
+                        <div className="scanner-debug-section">Production target projection</div>
+                        <div className="scanner-debug-grid">
+                          <span>Target ID</span><b>{activeTarget.id}</b>
+                          <span>Type / source</span><b>{activeTarget.semanticType} / {activeTarget.definitionSource || 'CAMERA_RELATIVE'}</b>
+                          <span>Projected center</span><b>{activeTarget.screenPosition ? `${activeTarget.screenPosition.x.toFixed(3)}, ${activeTarget.screenPosition.y.toFixed(3)}` : '—'}</b>
+                          <span>Projected bounds</span><b>{activeTarget.screenBounds ? `${activeTarget.screenBounds.x.toFixed(3)},${activeTarget.screenBounds.y.toFixed(3)} ${activeTarget.screenBounds.width.toFixed(3)}×${activeTarget.screenBounds.height.toFixed(3)}` : '—'}</b>
+                          <span>Currently visible</span><b>{activeTarget.currentlyVisible ? 'YES' : 'NO'}</b>
+                          <span>Visibility reason</span><b>{activeTarget.visibilityReason || '—'}</b>
+                        </div>
+                      </>
+                    )}
+                  </>
+                )}
                 <div className="scanner-debug-heading">
                   <span>Motion debug</span>
                   <strong>{motionTelemetry.motionState}</strong>
