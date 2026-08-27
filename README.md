@@ -5,30 +5,34 @@ BuildWise SmartScan is a web-first room capture and customization prototype.
 ## Web workflow
 
 1. Open the site over HTTPS on a mobile phone. Camera and motion permissions do not work from an insecure phone URL.
-2. Tap **Start scan** and follow the guided movement checkpoints.
-3. The mobile browser captures real JPEG keyframes and records heading, timestamps, and an estimated local movement path.
-4. Finish the scan, open the 3D room viewer, or export the scan as a JSON session.
-5. Open the site on a desktop browser and use **Load scan** to import that JSON session. The captured frames, room footprint, and customization controls are then available on desktop.
+2. Tap **Start scan** and walk through the room while the camera is running.
+3. The browser analyzes frame sharpness, exposure, visual detail, scene change, orientation, motion, and camera translation. It saves overlapping keyframes only when they add usable coverage.
+4. Follow the live next-best-view instruction and coverage map. Guidance changes when the scanner detects low coverage, weak lighting, blur, excessive speed, rotation without translation, or a need for more parallax.
+5. Finish when the measured coverage and viewpoint diversity are sufficient. Use **Build real 3D room** to send the frames to the reconstruction worker, or export the JSON session for processing elsewhere.
 
-The website also works as a desktop review/customization tool without a camera. Desktop users can load a scan exported from a phone.
+The website also works as a desktop review/customization tool without a camera. Desktop users can load a scan exported from a phone or an API result containing `room.glb`/`meshPLY`.
+
+## Real photogrammetry backend
+
+The `backend/` directory contains a FastAPI worker boundary for actual reconstruction. It runs COLMAP feature extraction, matching, structure-from-motion, dense multi-view stereo, Open3D mesh reconstruction, and GLB export. Start it with the instructions in [`backend/README.md`](backend/README.md), then set `REACT_APP_RECONSTRUCTION_API` when the API is not served from the same origin.
 
 ## Native iOS reconstruction workflow
 
 The native iOS target uses ARKit scene reconstruction on LiDAR-equipped devices. It writes a classified room mesh as ASCII PLY inside the manifest, including wall, floor, ceiling, table, seat, window, and door surface groups. On iOS 17 and newer it also runs Vision image classification on useful frames and exports furniture observations with confidence and approximate camera positions.
 
-Importing that manifest in the website renders the real mesh when `meshPLY` is present. The viewer falls back to the browser-estimated room when the session only contains web camera frames.
+Importing that manifest in the website renders the real mesh when `meshPLY` is present. A browser-only session without `meshPLY` is intentionally not turned into a fake room: the viewer reports that a native LiDAR scan is required.
 
 ## What is real today
 
 - Camera frames come from `getUserMedia`, not the placeholder room illustration.
-- Movement and heading signals advance guidance when the browser grants sensor access.
-- Checkpoint progress is manual when sensors are unavailable; a timer does not fake scan progress.
-- Scan sessions contain embedded images, poses, timestamps, and a version number, so they can move between phone and desktop without a backend.
-- The 3D room viewer can render an imported classified mesh, review captured frames, visualize the estimated path, preview furniture assets, change room surface materials, and show a camera overlay.
+- Orientation and motion signals are recorded when the browser grants sensor access; camera analysis still runs when sensors are unavailable.
+- Adaptive guidance is driven by measured frame quality, image change, observed view sectors, camera movement, and parallax—not a fixed four-wall route or a timer.
+- Scan sessions contain embedded images, synchronized poses/orientation/motion, quality metrics, coverage summaries, timestamps, and a version number.
+- The 3D room viewer renders only the imported classified mesh, visualizes the tracking path, and previews material changes on the scanned wall, floor, and ceiling surfaces.
 
 ## Important limitation
 
-Web browsers do not expose ARKit's room-mesh reconstruction across all mobile devices. Use the native iOS target on a LiDAR-equipped iPhone or iPad for the real mesh path. Non-LiDAR devices still produce a useful camera and tracking package, but exact geometry and detailed furniture meshes require depth capture or a reconstruction service.
+Web browsers do not expose ARKit's room-mesh reconstruction across all mobile devices. Use the native iOS target on a LiDAR-equipped iPhone or iPad for the real mesh path. Non-LiDAR devices can still produce camera and tracking metadata, but those sessions are not presented as a 3D room. Vision furniture observations are metadata only; they do not create or add furniture to the simulator.
 
 ## Run locally
 
@@ -44,4 +48,4 @@ npm test -- --watchAll=false --runInBand
 npm run build
 ```
 
-The earlier native ARKit proof of feasibility remains under `ios/BuildWiseSmartScan`, but the primary product flow is now the web capture/import/customization path.
+The native ARKit path remains under `ios/BuildWiseSmartScan` for devices that support LiDAR scene reconstruction. The browser path is camera-first and can feed the real COLMAP pipeline without pretending that keyframes are already a 3D room.

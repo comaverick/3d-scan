@@ -2,10 +2,13 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import * as THREE from 'three';
 import './App.css';
 
+const RECONSTRUCTION_API = process.env.REACT_APP_RECONSTRUCTION_API || '';
+
+/* Legacy fixed-route guidance is intentionally disabled. Adaptive guidance below uses live scan state.
 const GUIDANCE_STEPS = [
   {
     kind: 'origin',
-    direction: '↑',
+    direction: '^',
     label: 'STARTING VIEW',
     eyebrow: 'Set your starting view',
     title: 'Face the open side of the room',
@@ -29,7 +32,7 @@ const GUIDANCE_STEPS = [
   },
   {
     kind: 'turn',
-    direction: '↻',
+    direction: '>',
     label: 'NEXT WALL',
     eyebrow: 'Change direction',
     title: 'Turn toward the next wall',
@@ -42,7 +45,7 @@ const GUIDANCE_STEPS = [
   },
   {
     kind: 'surface',
-    direction: '→',
+    direction: '>',
     label: 'WALL PASS',
     eyebrow: 'Capture this side',
     title: 'Sweep across the wall',
@@ -55,7 +58,7 @@ const GUIDANCE_STEPS = [
   },
   {
     kind: 'movement',
-    direction: '←',
+    direction: '<',
     label: 'ROOM PASS',
     eyebrow: 'Follow the room edge',
     title: 'Move along the open side',
@@ -81,12 +84,12 @@ const GUIDANCE_STEPS = [
   },
   {
     kind: 'return',
-    direction: '↺',
+    direction: '<',
     label: 'CLOSE LOOP',
     eyebrow: 'Align the scan',
     title: 'Return to the starting view',
     instruction: 'Walk back to your starting point and face the original direction.',
-    helper: 'Closing the loop helps the simulator connect the captured views.',
+    helper: 'Closing the loop helps the native scanner align the room mesh.',
     target: 'Movement cues',
     progressUnit: 'movement cues',
     requiredPulses: 4,
@@ -98,8 +101,8 @@ const GUIDANCE_STEPS = [
     label: 'SCAN READY',
     eyebrow: 'Review your room',
     title: 'Your room scan is ready',
-    instruction: 'Open the simulator to review the captured views and place furniture.',
-    helper: 'If a wall or corner is missing, return to scanning and capture that area before customizing.',
+    instruction: 'Open the simulator to inspect the real room mesh.',
+    helper: 'If a wall or corner is missing, return to the native LiDAR scan and capture that area again.',
     target: 'Ready',
     coverage: 100,
   },
@@ -117,25 +120,177 @@ const TELEMETRY = [
   { x: '0.02', y: '1.42', z: '-0.18', yaw: '267', speed: '0.16', quality: 'Good' },
   { x: '0.01', y: '1.42', z: '-0.02', yaw: '2', speed: '0.01', quality: 'Locked' },
 ];
+*/
 
-const INITIAL_OBJECTS = [
-  { name: 'Bed', kind: 'bed', coverage: 0, confidence: 'preset' },
-  { name: 'Desk', kind: 'desk', coverage: 0, confidence: 'preset' },
-  { name: 'Chair', kind: 'chair', coverage: 0, confidence: 'preset' },
-  { name: 'Window', kind: 'window', coverage: 0, confidence: 'preset' },
+const COVERAGE_COLUMNS = 12;
+const COVERAGE_ROWS = [
+  { id: 'ceiling', label: 'Ceiling', pitch: 0.62 },
+  { id: 'upper', label: 'Upper walls', pitch: 0.28 },
+  { id: 'middle', label: 'Walls', pitch: 0 },
+  { id: 'floor', label: 'Floor', pitch: -0.52 },
 ];
+
+const EMPTY_POSE = { x: '0.00', y: '0.00', z: '0.00', yaw: '—', speed: '0.00', quality: 'Waiting' };
+
+function createCoverageRegions() {
+  return COVERAGE_ROWS.flatMap((row) => Array.from({ length: COVERAGE_COLUMNS }, (_, column) => ({
+    id: `${row.id}-${column}`,
+    label: row.label,
+    row: row.id,
+    column,
+    yaw: (column / COVERAGE_COLUMNS) * 360,
+    pitch: row.pitch,
+    coverage: 0,
+    observations: 0,
+    parallax: 0,
+  })));
+}
+
+function createInitialScanState() {
+  const regions = createCoverageRegions();
+  return {
+    cameraPose: EMPTY_POSE,
+    currentOrientation: { alpha: null, beta: null, gamma: null, heading: null, pitch: 0 },
+    trackedFeatureCount: 0,
+    detectedFeatureCount: 0,
+    trackingQuality: 0,
+    frameQuality: 0,
+    sharpness: 0,
+    brightness: 0,
+    movementSpeed: 0,
+    rotationOnly: false,
+    motionBlur: false,
+    poorLighting: false,
+    estimatedRoomBounds: null,
+    detectedPlanes: [],
+    detectedObjects: [],
+    coverageRegions: regions,
+    lowCoverageRegions: regions,
+    floorCoverage: 0,
+    wallCoverage: 0,
+    ceilingCoverage: 0,
+    totalCoverage: 0,
+    viewpointDiversity: 0,
+    acceptedFrames: 0,
+    rejectedFrames: 0,
+    lastCaptureAt: 0,
+  };
+}
+
+function angleDistance(first, second) {
+  return Math.abs((((Number(first) - Number(second)) + 540) % 360) - 180);
+}
+
+function normalizedAngleDelta(first, second) {
+  return ((((Number(second) - Number(first)) + 540) % 360) - 180);
+}
+
+function poseDistance(first, second) {
+  if (!first || !second) return 0;
+  return Math.sqrt(
+    ((Number(first.x) || 0) - (Number(second.x) || 0)) ** 2
+    + ((Number(first.y) || 0) - (Number(second.y) || 0)) ** 2
+    + ((Number(first.z) || 0) - (Number(second.z) || 0)) ** 2,
+  );
+}
+
+function trackingQualityLabel(value) {
+  if (value >= 0.78) return 'Excellent';
+  if (value >= 0.55) return 'Good';
+  if (value >= 0.3) return 'Weak';
+  return 'Lost';
+}
+
+function orientationPitch(beta) {
+  if (!Number.isFinite(Number(beta))) return 0;
+  return clamp((90 - Number(beta)) / 90, -1, 1);
+}
+
+function nearestCoverageRegion(regions, orientation) {
+  const heading = Number.isFinite(Number(orientation?.heading))
+    ? Number(orientation.heading)
+    : Number.isFinite(Number(orientation?.alpha)) ? Number(orientation.alpha) : 0;
+  const pitch = Number(orientation?.pitch) || 0;
+  return regions.reduce((nearest, region) => {
+    const yawDistance = angleDistance(region.yaw, heading) / 180;
+    const pitchDistance = Math.abs(region.pitch - pitch);
+    const score = yawDistance + pitchDistance;
+    return !nearest || score < nearest.score ? { region, score } : nearest;
+  }, null)?.region;
+}
+
+function summarizeCoverage(regions) {
+  const average = (items) => items.length > 0 ? items.reduce((sum, region) => sum + region.coverage, 0) / items.length : 0;
+  const floor = regions.filter((region) => region.row === 'floor');
+  const ceiling = regions.filter((region) => region.row === 'ceiling');
+  const walls = regions.filter((region) => region.row === 'upper' || region.row === 'middle');
+  const totalCoverage = average(regions);
+  const lowCoverageRegions = [...regions]
+    .map((region) => ({ ...region, priority: (1 - region.coverage) + (region.coverage > 0.15 && region.parallax < 0.35 ? 0.28 : 0) }))
+    .sort((first, second) => second.priority - first.priority);
+  return {
+    floorCoverage: average(floor),
+    wallCoverage: average(walls),
+    ceilingCoverage: average(ceiling),
+    totalCoverage,
+    lowCoverageRegions,
+  };
+}
+
+function determineNextAction(scanState) {
+  const quality = Number(scanState?.trackingQuality) || 0;
+  const frameQuality = Number(scanState?.frameQuality) || 0;
+  const currentOrientation = scanState?.currentOrientation || {};
+  const targetRegion = scanState?.lowCoverageRegions?.[0];
+  const currentHeading = Number.isFinite(Number(currentOrientation.heading)) ? Number(currentOrientation.heading) : null;
+  const targetHeading = targetRegion ? Number(targetRegion.yaw) : null;
+  const yawDelta = currentHeading === null || targetHeading === null ? 0 : normalizedAngleDelta(currentHeading, targetHeading);
+
+  if (scanState?.trackingQuality === 0 && scanState?.acceptedFrames === 0) {
+    return { type: 'START_SCAN', direction: '◎', label: 'READY TO SCAN', eyebrow: 'Build coverage from your movement', title: 'Aim at the room and start moving', instruction: 'Keep the camera level, move slowly, and let the scanner choose the next best view.', helper: 'The coverage map updates from measured camera frames, motion, and orientation.', target: 'Waiting for camera', priority: 1, confidence: 1 };
+  }
+  if (quality < 0.28) {
+    return { type: 'RETURN_TO_TRACKED_AREA', direction: '↺', label: 'TRACKING LOST', eyebrow: 'Recover visual tracking', title: 'Return toward the last tracked area', instruction: 'Move slowly back toward the last stable view and keep textured room edges in frame.', helper: 'The current image has too few reliable visual features for a safe pose estimate.', target: `${scanState.trackedFeatureCount || 0} visual features`, priority: 1, confidence: 0.92 };
+  }
+  if (scanState?.poorLighting) {
+    return { type: 'IMPROVE_LIGHTING', direction: '☼', label: 'LOW LIGHT', eyebrow: 'Improve frame quality', title: 'Add light before moving on', instruction: 'This area is too dark for reliable feature matching. Increase the room lighting.', helper: 'Dark frames are rejected so they do not weaken reconstruction.', target: `${Math.round((scanState.brightness || 0) * 100)}% brightness`, priority: 0.96, confidence: 0.9 };
+  }
+  if (scanState?.motionBlur || frameQuality < 0.3) {
+    return { type: 'SLOW_DOWN', direction: '⏸', label: 'LOW QUALITY', eyebrow: 'Stabilize the camera', title: 'Slow down so the room can be tracked', instruction: 'Hold the phone steadier for a moment, then continue with overlapping views.', helper: 'Blurry or poorly exposed frames are rejected instead of being uploaded.', target: `${Math.round(frameQuality * 100)}% frame quality`, priority: 0.95, confidence: 0.88 };
+  }
+  if (Number(scanState?.movementSpeed) > 0.85) {
+    return { type: 'SLOW_DOWN', direction: '⏸', label: 'TOO FAST', eyebrow: 'Protect tracking quality', title: 'Slow down your movement', instruction: 'Move more slowly so adjacent frames overlap and the camera motion can be estimated.', helper: 'Fast motion reduces overlap and increases blur.', target: `${Number(scanState.movementSpeed).toFixed(2)} m/s`, priority: 0.9, confidence: 0.9 };
+  }
+  if (scanState?.rotationOnly) {
+    return { type: 'MOVE_SIDEWAYS', direction: '↔', label: 'NEED PARALLAX', eyebrow: 'Create depth from movement', title: 'Move sideways while scanning', instruction: 'Rotation alone cannot estimate reliable depth here. Take a few steps sideways and keep this area visible.', helper: 'The scanner detected orientation change without enough camera translation.', target: 'Translation needed', priority: 0.86, confidence: 0.86 };
+  }
+  if (scanState?.totalCoverage >= 0.86 && scanState?.viewpointDiversity >= 0.62 && scanState?.acceptedFrames >= 12) {
+    return { type: 'SCAN_COMPLETE', direction: '✓', label: 'SCAN READY', eyebrow: 'Coverage is sufficient', title: 'The room has enough measured coverage', instruction: 'You can finish now, or continue to improve areas marked yellow on the coverage map.', helper: 'Completion is based on coverage, viewpoint diversity, image quality, and tracking.', target: `${Math.round(scanState.totalCoverage * 100)}% coverage`, priority: 0.4, confidence: 0.84 };
+  }
+  if (!targetRegion) {
+    return { type: 'SCAN_LOW_COVERAGE_REGION', direction: '◎', label: 'SCAN AREA', eyebrow: 'Build overlapping views', title: 'Continue moving through the room', instruction: 'Keep walking slowly and collect overlapping views from different positions.', helper: 'The next view is selected from the current coverage map.', target: `${Math.round((scanState?.totalCoverage || 0) * 100)}% coverage`, priority: 0.5, confidence: 0.6 };
+  }
+  if (targetRegion.parallax < 0.35 && targetRegion.coverage > 0.15) {
+    return { type: 'MOVE_SIDEWAYS', direction: '↔', label: 'MORE ANGLES NEEDED', eyebrow: `Improve ${targetRegion.label.toLowerCase()} depth`, title: 'Move sideways around this area', instruction: 'This section has been seen, but not from enough angles. Translate the camera instead of rotating in place.', helper: 'Additional parallax makes the recovered geometry more reliable.', target: `${Math.round(targetRegion.coverage * 100)}% local coverage`, priority: targetRegion.priority, confidence: 0.82, targetRegion };
+  }
+  if (targetRegion.row === 'floor' && (currentOrientation.pitch || 0) > -0.25) {
+    return { type: 'LOOK_DOWN', direction: '↓', label: 'FLOOR GAP', eyebrow: 'Capture the missing surface', title: 'Point slightly downward', instruction: 'Angle the camera toward the floor while continuing forward slowly.', helper: 'The floor coverage is lower than the other observed regions.', target: `${Math.round((scanState.floorCoverage || 0) * 100)}% floor coverage`, priority: targetRegion.priority, confidence: 0.86, targetRegion };
+  }
+  if (targetRegion.row === 'ceiling' && (currentOrientation.pitch || 0) < 0.25) {
+    return { type: 'LOOK_UP', direction: '↑', label: 'CEILING GAP', eyebrow: 'Capture the upper connection', title: 'Point slightly upward', instruction: 'Angle the camera toward the ceiling-wall connection while moving slowly.', helper: 'The ceiling coverage is lower than the other observed regions.', target: `${Math.round((scanState.ceilingCoverage || 0) * 100)}% ceiling coverage`, priority: targetRegion.priority, confidence: 0.86, targetRegion };
+  }
+  if (Math.abs(yawDelta) > 20) {
+    const turnDirection = yawDelta > 0 ? 'right' : 'left';
+    return { type: yawDelta > 0 ? 'MOVE_RIGHT' : 'MOVE_LEFT', direction: yawDelta > 0 ? '→' : '←', label: 'LOW COVERAGE AREA', eyebrow: 'Follow the coverage map', title: `Move toward the ${turnDirection}`, instruction: `Move toward the ${turnDirection} into the unscanned view sector, keeping the current area overlapping the next frame.`, helper: `That sector has ${Math.round(targetRegion.coverage * 100)}% measured coverage and needs more overlap.`, target: `${Math.round(targetRegion.coverage * 100)}% local coverage`, priority: targetRegion.priority, confidence: 0.78, targetRegion };
+  }
+  return { type: 'SCAN_LOW_COVERAGE_REGION', direction: '◎', label: 'LOW COVERAGE AREA', eyebrow: 'Hold overlap and translate', title: `Move through the ${targetRegion.label.toLowerCase()}`, instruction: 'Continue moving slowly through this area so the next frames overlap the geometry already seen.', helper: `The coverage map marks this sector as the next best view.`, target: `${Math.round(targetRegion.coverage * 100)}% local coverage`, priority: targetRegion.priority, confidence: 0.76, targetRegion };
+}
 
 function readHeading(event) {
   const compassHeading = Number(event.webkitCompassHeading);
   const alphaHeading = Number(event.alpha);
   const heading = Number.isFinite(compassHeading) ? compassHeading : alphaHeading;
   return Number.isFinite(heading) ? (heading + 360) % 360 : null;
-}
-
-function headingDelta(start, current) {
-  if (start === null || current === null) return 0;
-  const rawDelta = ((current - start + 540) % 360) - 180;
-  return rawDelta;
 }
 
 function motionMagnitude(event) {
@@ -173,8 +328,149 @@ function blobToDataUrl(blob) {
   });
 }
 
-function frameSource(frame) {
-  return frame?.previewUrl || (typeof frame?.image === 'string' ? frame.image : '');
+function matchLocalFeatures(currentGray, previousGray, width, height) {
+  let detected = 0;
+  let tracked = 0;
+  for (let y = 7; y < height - 7; y += 8) {
+    for (let x = 7; x < width - 7; x += 8) {
+      const index = y * width + x;
+      const horizontal = Math.abs(currentGray[index + 2] - currentGray[index - 2]);
+      const vertical = Math.abs(currentGray[index + (2 * width)] - currentGray[index - (2 * width)]);
+      if (horizontal + vertical < 46) continue;
+      detected += 1;
+      if (!previousGray) continue;
+      let bestError = Number.POSITIVE_INFINITY;
+      for (let offsetY = -4; offsetY <= 4; offsetY += 2) {
+        for (let offsetX = -4; offsetX <= 4; offsetX += 2) {
+          let error = 0;
+          for (let patchY = -2; patchY <= 2; patchY += 2) {
+            for (let patchX = -2; patchX <= 2; patchX += 2) {
+              const currentValue = currentGray[(y + patchY) * width + (x + patchX)];
+              const previousValue = previousGray[(y + offsetY + patchY) * width + (x + offsetX + patchX)];
+              error += Math.abs(currentValue - previousValue);
+            }
+          }
+          bestError = Math.min(bestError, error / 9);
+        }
+      }
+      if (bestError < 34) tracked += 1;
+    }
+  }
+  return { detected, tracked };
+}
+
+function analyzeVideoFrame(video, canvas, previousGray) {
+  if (!video || video.readyState < 2 || video.videoWidth === 0 || video.videoHeight === 0) return null;
+  const width = 192;
+  const height = Math.max(108, Math.round((video.videoHeight / video.videoWidth) * width));
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext('2d', { willReadFrequently: true });
+  if (!context) return null;
+  context.drawImage(video, 0, 0, width, height);
+  const pixels = context.getImageData(0, 0, width, height).data;
+  const gray = new Uint8Array(width * height);
+  let brightnessTotal = 0;
+  let brightnessSquares = 0;
+  let edgeCount = 0;
+  let gradientEnergy = 0;
+  let temporalDifference = previousGray ? 0 : 1;
+  let temporalSamples = 0;
+
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const pixelIndex = (y * width + x) * 4;
+      const value = Math.round((pixels[pixelIndex] * 0.299) + (pixels[pixelIndex + 1] * 0.587) + (pixels[pixelIndex + 2] * 0.114));
+      const grayIndex = y * width + x;
+      gray[grayIndex] = value;
+      brightnessTotal += value;
+      brightnessSquares += value * value;
+      if (previousGray && grayIndex % 3 === 0) {
+        temporalDifference += Math.abs(value - previousGray[grayIndex]) / 255;
+        temporalSamples += 1;
+      }
+      if (x > 0) {
+        const horizontalGradient = value - gray[grayIndex - 1];
+        gradientEnergy += horizontalGradient * horizontalGradient;
+        if (Math.abs(horizontalGradient) > 18) edgeCount += 1;
+      }
+      if (y > 0) {
+        const verticalGradient = value - gray[grayIndex - width];
+        gradientEnergy += verticalGradient * verticalGradient;
+        if (Math.abs(verticalGradient) > 18) edgeCount += 1;
+      }
+    }
+  }
+
+  const pixelCount = width * height;
+  const brightness = brightnessTotal / pixelCount / 255;
+  const variance = Math.max(0, (brightnessSquares / pixelCount) - ((brightnessTotal / pixelCount) ** 2));
+  const edgeDensity = edgeCount / Math.max(1, (width - 1) * height + width * (height - 1));
+  const meanGradientEnergy = gradientEnergy / Math.max(1, (width - 1) * height + width * (height - 1));
+  const detailScore = clamp(edgeDensity / 0.16, 0, 1);
+  const sharpness = clamp(meanGradientEnergy / 1100, 0, 1);
+  const exposureScore = clamp(1 - (Math.abs(brightness - 0.48) / 0.48), 0, 1);
+  const sceneChange = temporalSamples > 0 ? clamp(temporalDifference / temporalSamples / 0.12, 0, 1) : 1;
+  const featureStats = matchLocalFeatures(gray, previousGray, width, height);
+  const featureCount = previousGray ? featureStats.tracked : featureStats.detected;
+  const qualityScore = clamp((sharpness * 0.42) + (detailScore * 0.38) + (exposureScore * 0.2), 0, 1);
+  return {
+    qualityScore,
+    featureCount,
+    detectedFeatureCount: featureStats.detected,
+    trackedFeatureCount: featureStats.tracked,
+    sharpness,
+    brightness,
+    variance,
+    sceneChange,
+    motionBlur: sharpness < 0.16,
+    poorLighting: brightness < 0.12 || brightness > 0.94,
+    gray,
+  };
+}
+
+function updateCoverageFromFrame(previousState, orientation, pose, analysis, parallaxDistance) {
+  const regions = previousState.coverageRegions.map((region) => ({ ...region }));
+  const targetRegion = nearestCoverageRegion(regions, orientation);
+  const usableObservation = analysis.qualityScore >= 0.28 && !analysis.motionBlur && !analysis.poorLighting;
+  if (targetRegion && usableObservation) {
+    const region = regions.find((candidate) => candidate.id === targetRegion.id);
+    const parallax = clamp(parallaxDistance / 0.5, 0, 1);
+    const observationGain = clamp((analysis.qualityScore * 0.1) + (analysis.sceneChange * 0.04) + (parallax * 0.06), 0.01, 0.2);
+    region.coverage = clamp(region.coverage + observationGain, 0, 1);
+    region.observations += 1;
+    region.parallax = Math.max(region.parallax, parallax);
+  }
+  const featureQuality = clamp((analysis.featureCount / 850) * 0.35, 0, 0.35);
+  const trackingQuality = clamp((analysis.qualityScore * 0.65) + featureQuality, 0, 1);
+  const summary = summarizeCoverage(regions);
+  const viewpointDiversity = regions.filter((region) => region.observations >= 2 && region.parallax >= 0.25).length / Math.max(1, regions.length);
+  return {
+    ...previousState,
+    cameraPose: pose,
+    currentOrientation: orientation,
+    trackedFeatureCount: analysis.featureCount,
+    detectedFeatureCount: analysis.detectedFeatureCount,
+    trackingQuality,
+    frameQuality: analysis.qualityScore,
+    sharpness: analysis.sharpness,
+    brightness: analysis.brightness,
+    motionBlur: analysis.motionBlur,
+    poorLighting: analysis.poorLighting,
+    coverageRegions: regions,
+    lowCoverageRegions: summary.lowCoverageRegions,
+    floorCoverage: summary.floorCoverage,
+    wallCoverage: summary.wallCoverage,
+    ceilingCoverage: summary.ceilingCoverage,
+    totalCoverage: summary.totalCoverage,
+    viewpointDiversity,
+  };
+}
+
+function loadGLTFAsset(url, onLoad, onError) {
+  import('three/examples/jsm/loaders/GLTFLoader.js')
+    .then(({ GLTFLoader }) => new GLTFLoader().load(url, onLoad, undefined, onError))
+    .catch(onError);
 }
 
 function App() {
@@ -182,75 +478,56 @@ function App() {
   const streamRef = useRef(null);
   const scanStartedAtRef = useRef(null);
   const scanSessionIdRef = useRef(null);
-  const pathRef = useRef({ x: 0, y: 1.42, z: 0, velocity: 0, lastMotionAt: null });
-  const lastTelemetryRef = useRef(TELEMETRY[0]);
+  const pathRef = useRef({ x: 0, y: 0, z: 0, velocity: 0, lastMotionAt: null });
+  const lastTelemetryRef = useRef(EMPTY_POSE);
   const lastCaptureAtRef = useRef(0);
+  const analysisCanvasRef = useRef(null);
+  const previousFrameGrayRef = useRef(null);
+  const lastAcceptedFrameRef = useRef(null);
+  const lastCoveragePoseRef = useRef(null);
+  const lastTranslationAtRef = useRef(0);
+  const rotationOnlyRef = useRef(false);
+  const latestMotionRef = useRef({ acceleration: null, rotationRate: null });
   const [isScanning, setIsScanning] = useState(false);
+  const [isPaused, setIsPaused] = useState(false);
   const [isFinished, setIsFinished] = useState(false);
   const [viewMode, setViewMode] = useState('scan');
-  const [stepIndex, setStepIndex] = useState(0);
-  const [stepProgress, setStepProgress] = useState(0);
   const [cameraState, setCameraState] = useState('idle');
   const [sensorState, setSensorState] = useState('idle');
   const [framesCaptured, setFramesCaptured] = useState(0);
   const [roomSession, setRoomSession] = useState(null);
   const [isExporting, setIsExporting] = useState(false);
+  const [isReconstructing, setIsReconstructing] = useState(false);
+  const [reconstructionState, setReconstructionState] = useState(null);
   const [importError, setImportError] = useState('');
-  const [objects, setObjects] = useState(INITIAL_OBJECTS);
+  const [objects, setObjects] = useState([]);
   const [lastEvent, setLastEvent] = useState('Ready when you are.');
-  const [liveTelemetry, setLiveTelemetry] = useState(TELEMETRY[0]);
-  const orientationRef = useRef({ heading: null });
-  const stepStartHeadingRef = useRef(null);
-  const lastCapturedHeadingRef = useRef(null);
-  const motionRef = useRef({ pulses: 0, lastMotionAt: 0 });
-  const transitionLockRef = useRef(false);
+  const [liveTelemetry, setLiveTelemetry] = useState(EMPTY_POSE);
+  const [scanState, setScanState] = useState(() => createInitialScanState());
+  const scanStateRef = useRef(scanState);
+  const orientationRef = useRef({ alpha: null, beta: null, gamma: null, heading: null, pitch: 0 });
   const frameStoreRef = useRef([]);
   const captureFrameRef = useRef(null);
-  const advanceGuidanceRef = useRef(null);
-
-  const step = GUIDANCE_STEPS[stepIndex];
-  const telemetry = sensorState === 'live' || isFinished ? liveTelemetry : TELEMETRY[stepIndex];
-  const nextStep = GUIDANCE_STEPS[Math.min(stepIndex + 1, FINAL_SCAN_STEP_INDEX)];
-  const stepCoverage = step.coverage || 0;
-  const nextStepCoverage = nextStep.coverage ?? 100;
-  const roomCoverage = isFinished
-    ? 100
-    : Math.round(stepCoverage + ((isScanning ? stepProgress : 0) * (nextStepCoverage - stepCoverage)));
-  const canFinish = isFinished || (stepIndex === FINAL_SCAN_STEP_INDEX && framesCaptured >= 3);
+  const scanInstruction = useMemo(() => determineNextAction(scanState), [scanState]);
+  const telemetry = liveTelemetry;
+  const roomCoverage = Math.round((isFinished ? 1 : scanState.totalCoverage) * 100);
+  const canFinish = isFinished || (
+    scanState.acceptedFrames >= 12
+    && scanState.totalCoverage >= 0.65
+    && scanState.viewpointDiversity >= 0.3
+    && scanState.trackingQuality >= 0.3
+  );
 
   const finishHint = useMemo(() => {
-    if (isFinished) return 'Scan complete. Review the captured room in the simulator.';
-    if (stepIndex < FINAL_SCAN_STEP_INDEX) return 'Follow the direction card to close the room loop.';
-    if (framesCaptured < 3) return 'Capture at least 3 useful views before finishing.';
-    return 'The scan is ready. Finish it to open the room simulator.';
-  }, [framesCaptured, isFinished, stepIndex]);
+    if (isFinished) return 'Scan complete. Review the real room mesh in the simulator.';
+    if (scanState.acceptedFrames < 12) return `${12 - scanState.acceptedFrames} more high-quality viewpoints are needed before finishing.`;
+    if (scanState.totalCoverage < 0.65) return `Coverage is ${Math.round(scanState.totalCoverage * 100)}%. Follow the highlighted low-coverage region.`;
+    if (scanState.viewpointDiversity < 0.3) return 'Move between positions to add parallax before finishing.';
+    return 'Measured coverage is sufficient. Finish when the room is fully visible.';
+  }, [isFinished, scanState]);
 
-  const instructionText = useMemo(() => {
-    if (!isScanning || sensorState === 'live' || stepIndex === FINAL_SCAN_STEP_INDEX) {
-      return step.instruction;
-    }
-    return `${step.instruction} When ready, tap Mark checkpoint.`;
-  }, [isScanning, sensorState, step, stepIndex]);
-
-  const liveMetric = useMemo(() => {
-    if (!isScanning || stepIndex === 0 || stepIndex === FINAL_SCAN_STEP_INDEX) {
-      return step.target;
-    }
-
-    if (step.kind === 'turn') {
-      return `${Math.round((step.turnDegrees || 90) * stepProgress)} deg`;
-    }
-
-    if (step.requiredPulses) {
-      return `${Math.round(step.requiredPulses * stepProgress)} / ${step.requiredPulses} ${step.progressUnit || 'cues'}`;
-    }
-
-    return step.target;
-  }, [isScanning, step, stepIndex, stepProgress]);
-
-  useEffect(() => {
-    transitionLockRef.current = false;
-  }, [stepIndex]);
+  const instructionText = scanInstruction.instruction;
+  const liveMetric = scanInstruction.target;
 
   useEffect(() => {
     return () => {
@@ -285,10 +562,6 @@ function App() {
       streamRef.current = stream;
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
-        videoRef.current.onloadeddata = () => {
-          captureUsefulFrame();
-          videoRef.current.onloadeddata = null;
-        };
       }
       setCameraState('live');
       return true;
@@ -326,36 +599,82 @@ function App() {
     }
   };
 
-  const captureUsefulFrame = () => {
+  const captureUsefulFrame = (providedAnalysis) => {
     const video = videoRef.current;
     const now = Date.now();
-    if (now - lastCaptureAtRef.current < 700) return;
-    if (video && video.readyState >= 2 && video.videoWidth > 0) {
-      const canvas = document.createElement('canvas');
-      canvas.width = 640;
-      canvas.height = Math.round((video.videoHeight / video.videoWidth) * 640);
-      const context = canvas.getContext('2d');
-      if (!context) return;
-      context.drawImage(video, 0, 0, canvas.width, canvas.height);
-      canvas.toBlob((blob) => {
-        if (!blob) return;
-        const previewUrl = URL.createObjectURL(blob);
-        frameStoreRef.current.push({
-          frameId: frameStoreRef.current.length + 1,
-          capturedAt: now,
-          pose: { ...lastTelemetryRef.current },
-          step: stepIndex,
-          image: blob,
-          previewUrl,
-        });
-        lastCaptureAtRef.current = now;
-        setFramesCaptured(frameStoreRef.current.length);
-      }, 'image/jpeg', 0.82);
+    if (now - lastCaptureAtRef.current < 750 || !video || video.readyState < 2 || video.videoWidth === 0) return false;
+    const analysisCanvas = analysisCanvasRef.current || document.createElement('canvas');
+    const analysis = providedAnalysis || analyzeVideoFrame(video, analysisCanvas, previousFrameGrayRef.current);
+    if (!analysis) return false;
+    previousFrameGrayRef.current = analysis.gray;
+    const previous = lastAcceptedFrameRef.current;
+    const pose = { ...lastTelemetryRef.current };
+    const orientationSnapshot = { ...orientationRef.current };
+    const motionSnapshot = { ...latestMotionRef.current };
+    const translationSinceLast = previous ? poseDistance(previous.pose, pose) : 1;
+    const headingChange = previous ? angleDistance(previous.orientation?.heading, orientationRef.current.heading) : 360;
+    const targetRegion = nearestCoverageRegion(scanStateRef.current.coverageRegions, orientationRef.current);
+    const isDuplicate = previous
+      && translationSinceLast < 0.08
+      && headingChange < 8
+      && analysis.sceneChange < 0.16
+      && targetRegion?.coverage > 0.72;
+    if (analysis.qualityScore < 0.28 || analysis.motionBlur || analysis.poorLighting || isDuplicate) {
+      scanStateRef.current = {
+        ...scanStateRef.current,
+        frameQuality: analysis.qualityScore,
+        sharpness: analysis.sharpness,
+        brightness: analysis.brightness,
+        motionBlur: analysis.motionBlur,
+        poorLighting: analysis.poorLighting,
+        rejectedFrames: scanStateRef.current.rejectedFrames + (isDuplicate || analysis.qualityScore < 0.28 ? 1 : 0),
+      };
+      setScanState(scanStateRef.current);
+      return false;
     }
+    const canvas = document.createElement('canvas');
+    canvas.width = 640;
+    canvas.height = Math.max(360, Math.round((video.videoHeight / video.videoWidth) * 640));
+    const context = canvas.getContext('2d');
+    if (!context) return false;
+    context.drawImage(video, 0, 0, canvas.width, canvas.height);
+    lastAcceptedFrameRef.current = {
+      capturedAt: now,
+      pose,
+      orientation: orientationSnapshot,
+      analysis,
+    };
+    lastCaptureAtRef.current = now;
+    canvas.toBlob((blob) => {
+      if (!blob) return;
+      const previewUrl = URL.createObjectURL(blob);
+      frameStoreRef.current.push({
+        frameId: frameStoreRef.current.length + 1,
+        capturedAt: now,
+        orientation: orientationSnapshot,
+        motion: motionSnapshot,
+        estimatedPose: pose,
+        pose,
+        qualityScore: analysis.qualityScore,
+        qualityMetrics: {
+          sharpness: analysis.sharpness,
+          brightness: analysis.brightness,
+          featureCount: analysis.featureCount,
+          sceneChange: analysis.sceneChange,
+        },
+        image: blob,
+        previewUrl,
+      });
+      setFramesCaptured(frameStoreRef.current.length);
+      const nextState = { ...scanStateRef.current, acceptedFrames: frameStoreRef.current.length, lastCaptureAt: now };
+      scanStateRef.current = nextState;
+      setScanState(nextState);
+    }, 'image/jpeg', 0.86);
+    return true;
   };
   captureFrameRef.current = captureUsefulFrame;
 
-  const updateLiveTelemetry = (heading = orientationRef.current.heading, speed = pathRef.current.velocity, quality = 'Live') => {
+  const updateLiveTelemetry = (heading = orientationRef.current.heading, speed = pathRef.current.velocity, quality = trackingQualityLabel(scanStateRef.current.trackingQuality)) => {
     const nextTelemetry = {
       x: pathRef.current.x.toFixed(2),
       y: pathRef.current.y.toFixed(2),
@@ -377,73 +696,56 @@ function App() {
     setViewMode('scan');
     setRoomSession(null);
     setImportError('');
-    setStepIndex(1);
-    setStepProgress(0);
+    setReconstructionState(null);
+    setIsPaused(false);
     setFramesCaptured(0);
     frameStoreRef.current = [];
-    setObjects(INITIAL_OBJECTS.map((object) => ({ ...object })));
-    setLiveTelemetry(TELEMETRY[1]);
-    orientationRef.current = { heading: null };
-    stepStartHeadingRef.current = null;
-    lastCapturedHeadingRef.current = null;
-    motionRef.current = { pulses: 0, lastMotionAt: 0 };
-    transitionLockRef.current = false;
+    setObjects([]);
+    setLiveTelemetry(EMPTY_POSE);
+    const initialScanState = createInitialScanState();
+    scanStateRef.current = initialScanState;
+    setScanState(initialScanState);
+    orientationRef.current = { alpha: null, beta: null, gamma: null, heading: null, pitch: 0 };
+    previousFrameGrayRef.current = null;
+    lastAcceptedFrameRef.current = null;
+    lastCoveragePoseRef.current = null;
+    lastTranslationAtRef.current = 0;
+    rotationOnlyRef.current = false;
+    latestMotionRef.current = { acceleration: null, rotationRate: null };
     scanStartedAtRef.current = Date.now();
     scanSessionIdRef.current = createSessionId();
-    pathRef.current = { x: 0, y: 1.42, z: 0, velocity: 0, lastMotionAt: null };
+    pathRef.current = { x: 0, y: 0, z: 0, velocity: 0, lastMotionAt: null };
     lastCaptureAtRef.current = 0;
-    lastTelemetryRef.current = TELEMETRY[1];
+    lastTelemetryRef.current = EMPTY_POSE;
 
     const [cameraReady, sensorsReady] = await Promise.all([enableCamera(), enableSensors()]);
     if (cameraReady && sensorsReady) {
       setLastEvent('Camera and motion sensors are live. Guidance is active.');
     } else if (cameraReady) {
-      setLastEvent('Camera is live. Use the checkpoint button if motion sensors are unavailable.');
+      setLastEvent('Camera is live. Move through the room; the coverage map will choose the next view.');
     } else {
-      setLastEvent('Camera unavailable. Use HTTPS on your phone, or continue in demo mode.');
+      setLastEvent('Camera unavailable. Use HTTPS on your phone to start a real camera scan.');
     }
   };
 
-  const advanceGuidance = (source = 'Checkpoint marked') => {
-    if (!isScanning || stepIndex >= FINAL_SCAN_STEP_INDEX || transitionLockRef.current) return;
-    transitionLockRef.current = true;
-    const nextIndex = stepIndex + 1;
-    setStepIndex(nextIndex);
-    setStepProgress(0);
-    captureUsefulFrame();
-    motionRef.current.pulses = 0;
-    stepStartHeadingRef.current = orientationRef.current.heading;
-    setLastEvent(`${source}. Next, ${GUIDANCE_STEPS[nextIndex].instruction}`);
-  };
-  advanceGuidanceRef.current = advanceGuidance;
-
   useEffect(() => {
-    if (!isScanning || sensorState !== 'live' || stepIndex === FINAL_SCAN_STEP_INDEX) return undefined;
+    if (!isScanning || isPaused) return undefined;
 
     const handleOrientation = (event) => {
       const heading = readHeading(event);
-      if (heading === null) return;
-
-      orientationRef.current.heading = heading;
+      const nextOrientation = {
+        alpha: Number.isFinite(Number(event.alpha)) ? Number(event.alpha) : null,
+        beta: Number.isFinite(Number(event.beta)) ? Number(event.beta) : null,
+        gamma: Number.isFinite(Number(event.gamma)) ? Number(event.gamma) : null,
+        heading,
+        pitch: orientationPitch(event.beta),
+      };
+      const previousHeading = orientationRef.current.heading;
+      if (heading !== null && previousHeading !== null && angleDistance(previousHeading, heading) > 8 && Date.now() - lastTranslationAtRef.current > 850) {
+        rotationOnlyRef.current = true;
+      }
+      orientationRef.current = nextOrientation;
       updateLiveTelemetry(heading, pathRef.current.velocity);
-
-      if (stepStartHeadingRef.current === null) {
-        stepStartHeadingRef.current = heading;
-      }
-
-      if (lastCapturedHeadingRef.current === null || Math.abs(headingDelta(lastCapturedHeadingRef.current, heading)) >= 10) {
-        captureFrameRef.current?.();
-        lastCapturedHeadingRef.current = heading;
-      }
-
-      if (step.kind === 'turn') {
-        const turnAmount = Math.abs(headingDelta(stepStartHeadingRef.current ?? heading, heading));
-        const requiredTurn = step.turnDegrees || 75;
-        setStepProgress(Math.min(1, turnAmount / requiredTurn));
-        if (turnAmount >= requiredTurn) {
-          advanceGuidanceRef.current?.('Turn detected');
-        }
-      }
     };
 
     const handleMotion = (event) => {
@@ -464,19 +766,23 @@ function App() {
       pathRef.current.z -= Math.cos(headingRadians) * distance;
       pathRef.current.velocity = nextVelocity;
       pathRef.current.lastMotionAt = now;
-      updateLiveTelemetry(orientationRef.current.heading, nextVelocity);
-
-      if (!isMoving) return;
-      if (now - motionRef.current.lastMotionAt < 350) return;
-      motionRef.current.lastMotionAt = now;
-      motionRef.current.pulses += 1;
-      captureFrameRef.current?.();
-
-      const requiredPulses = step.requiredPulses || 4;
-      setStepProgress(Math.min(1, motionRef.current.pulses / requiredPulses));
-      if (step.kind !== 'turn' && motionRef.current.pulses >= requiredPulses) {
-        advanceGuidanceRef.current?.('Movement detected');
+      latestMotionRef.current = {
+        acceleration: {
+          x: Number(event.acceleration?.x ?? event.accelerationIncludingGravity?.x) || 0,
+          y: Number(event.acceleration?.y ?? event.accelerationIncludingGravity?.y) || 0,
+          z: Number(event.acceleration?.z ?? event.accelerationIncludingGravity?.z) || 0,
+        },
+        rotationRate: event.rotationRate ? {
+          alpha: Number(event.rotationRate.alpha) || 0,
+          beta: Number(event.rotationRate.beta) || 0,
+          gamma: Number(event.rotationRate.gamma) || 0,
+        } : null,
+      };
+      if (isMoving) {
+        lastTranslationAtRef.current = now;
+        rotationOnlyRef.current = false;
       }
+      updateLiveTelemetry(orientationRef.current.heading, nextVelocity);
     };
 
     window.addEventListener('deviceorientation', handleOrientation, true);
@@ -485,7 +791,47 @@ function App() {
       window.removeEventListener('deviceorientation', handleOrientation, true);
       window.removeEventListener('devicemotion', handleMotion, true);
     };
-  }, [isScanning, sensorState, stepIndex, step.kind, step.requiredPulses, step.turnDegrees]);
+  }, [isScanning, isPaused]);
+
+  useEffect(() => {
+    if (!isScanning || isPaused || cameraState !== 'live') return undefined;
+    let animationFrame = 0;
+    let previousAnalysisAt = 0;
+    const scanLoop = (timestamp) => {
+      if (timestamp - previousAnalysisAt >= 220) {
+        previousAnalysisAt = timestamp;
+        const video = videoRef.current;
+        const canvas = analysisCanvasRef.current || document.createElement('canvas');
+        analysisCanvasRef.current = canvas;
+        const analysis = analyzeVideoFrame(video, canvas, previousFrameGrayRef.current);
+        if (analysis) {
+          previousFrameGrayRef.current = analysis.gray;
+          const pose = { ...lastTelemetryRef.current };
+          const parallaxDistance = lastCoveragePoseRef.current ? poseDistance(lastCoveragePoseRef.current, pose) : 0;
+          const nextState = updateCoverageFromFrame(scanStateRef.current, orientationRef.current, pose, analysis, parallaxDistance);
+          nextState.movementSpeed = pathRef.current.velocity;
+          nextState.rotationOnly = rotationOnlyRef.current;
+          scanStateRef.current = nextState;
+          setScanState(nextState);
+          lastCoveragePoseRef.current = pose;
+
+          const previous = lastAcceptedFrameRef.current;
+          const movementSinceCapture = previous ? poseDistance(previous.pose, pose) : 1;
+          const headingSinceCapture = previous ? angleDistance(previous.orientation?.heading, orientationRef.current.heading) : 360;
+          const target = nearestCoverageRegion(nextState.coverageRegions, orientationRef.current);
+          const shouldCapture = !previous
+            || movementSinceCapture >= 0.12
+            || headingSinceCapture >= 12
+            || analysis.sceneChange >= 0.28
+            || target?.coverage < 0.56;
+          if (shouldCapture) captureFrameRef.current?.(analysis);
+        }
+      }
+      animationFrame = window.requestAnimationFrame(scanLoop);
+    };
+    animationFrame = window.requestAnimationFrame(scanLoop);
+    return () => window.cancelAnimationFrame(animationFrame);
+  }, [cameraState, isPaused, isScanning]);
 
   const finishScan = () => {
     if (!canFinish) return;
@@ -495,11 +841,21 @@ function App() {
       pose: { ...frame.pose },
     }));
     const session = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       sessionId: scanSessionIdRef.current || createSessionId(),
       createdAt: new Date(scanStartedAtRef.current || finishedAt).toISOString(),
       durationSeconds: Math.max(0, (finishedAt - (scanStartedAtRef.current || finishedAt)) / 1000),
-      coordinateSystem: 'browser-estimated local path; yaw from DeviceOrientation',
+      coordinateSystem: 'browser-estimated local path; synchronized DeviceOrientation and DeviceMotion when available',
+      scanState: {
+        trackedFeatureCount: scanState.trackedFeatureCount,
+        trackingQuality: scanState.trackingQuality,
+        floorCoverage: scanState.floorCoverage,
+        wallCoverage: scanState.wallCoverage,
+        ceilingCoverage: scanState.ceilingCoverage,
+        totalCoverage: scanState.totalCoverage,
+        viewpointDiversity: scanState.viewpointDiversity,
+        coverageRegions: scanState.coverageRegions,
+      },
       frames,
       objects: objects.map((object) => ({ ...object })),
     };
@@ -508,9 +864,8 @@ function App() {
     setRoomSession(session);
     setViewMode('customize');
     setSensorState('idle');
-    setStepIndex(FINAL_SCAN_STEP_INDEX);
-    setStepProgress(1);
-    setLastEvent('Scan saved in this browser. Export it to use it on desktop.');
+    setIsPaused(false);
+    setLastEvent('Scan saved with measured keyframes, image quality, motion, and coverage metadata.');
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
@@ -526,7 +881,11 @@ function App() {
         frameId: frame.frameId,
         capturedAt: frame.capturedAt,
         pose: frame.pose,
-        step: frame.step,
+        estimatedPose: frame.estimatedPose,
+        orientation: frame.orientation,
+        motion: frame.motion,
+        qualityScore: frame.qualityScore,
+        qualityMetrics: frame.qualityMetrics,
         image: await blobToDataUrl(frame.image),
       })));
       const payload = JSON.stringify({ ...roomSession, frames }, null, 2);
@@ -544,6 +903,70 @@ function App() {
       setImportError('The scan could not be exported. Try again on the device that captured it.');
     } finally {
       setIsExporting(false);
+    }
+  };
+
+  const reconstructRoom = async () => {
+    if (!roomSession || isReconstructing || roomSession.meshPLY || roomSession.glbUrl) return;
+    setIsReconstructing(true);
+    setImportError('');
+    setReconstructionState({ status: 'uploading', message: 'Preparing measured camera frames for reconstruction.' });
+    try {
+      const createResponse = await fetch(`${RECONSTRUCTION_API}/api/scans`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: roomSession.sessionId, device: { userAgent: navigator.userAgent } }),
+      });
+      if (!createResponse.ok) throw new Error('The reconstruction service is not available.');
+      const createdScan = await createResponse.json();
+      const uploadableFrames = [];
+      for (const frame of roomSession.frames) {
+        if (frame.image instanceof Blob) {
+          uploadableFrames.push({ frame, blob: frame.image });
+        } else if (typeof frame.image === 'string' && frame.image) {
+          const imageResponse = await fetch(frame.image);
+          if (imageResponse.ok) uploadableFrames.push({ frame, blob: await imageResponse.blob() });
+        }
+      }
+      if (uploadableFrames.length < 3) throw new Error('At least three locally stored camera frames are required for reconstruction.');
+      const formData = new FormData();
+      formData.append('metadata', JSON.stringify(uploadableFrames.map(({ frame }) => ({
+        frameId: frame.frameId,
+        capturedAt: frame.capturedAt,
+        orientation: frame.orientation,
+        motion: frame.motion,
+        estimatedPose: frame.estimatedPose || frame.pose,
+        qualityScore: frame.qualityScore,
+        qualityMetrics: frame.qualityMetrics,
+      }))));
+      uploadableFrames.forEach(({ frame, blob }) => formData.append('files', blob, `frame-${frame.frameId}.jpg`));
+      const uploadResponse = await fetch(`${RECONSTRUCTION_API}/api/scans/${createdScan.scanId}/frames`, { method: 'POST', body: formData });
+      if (!uploadResponse.ok) throw new Error('The reconstruction service rejected the camera frames.');
+
+      const startResponse = await fetch(`${RECONSTRUCTION_API}/api/scans/${createdScan.scanId}/reconstruct`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      if (!startResponse.ok) throw new Error('The reconstruction worker could not be started.');
+
+      let status = await (await fetch(`${RECONSTRUCTION_API}/api/scans/${createdScan.scanId}`)).json();
+      while (!['complete', 'error'].includes(status.status)) {
+        setReconstructionState(status);
+        await new Promise((resolve) => window.setTimeout(resolve, 1800));
+        status = await (await fetch(`${RECONSTRUCTION_API}/api/scans/${createdScan.scanId}`)).json();
+      }
+      if (status.status === 'error') throw new Error(status.message || 'The reconstruction worker failed.');
+      const glbUrl = `${RECONSTRUCTION_API}/api/scans/${createdScan.scanId}/room.glb`;
+      const metadataUrl = `${RECONSTRUCTION_API}/api/scans/${createdScan.scanId}/metadata.json`;
+      setRoomSession((current) => ({ ...current, reconstruction: status.result, glbUrl, metadataUrl }));
+      setReconstructionState({ ...status, assetUrl: glbUrl });
+      setLastEvent('Real room mesh reconstructed from the uploaded camera frames.');
+    } catch (error) {
+      setReconstructionState({ status: 'error', message: error.message || 'Reconstruction could not be completed.' });
+      setImportError(error.message || 'The real room reconstruction could not be completed.');
+    } finally {
+      setIsReconstructing(false);
     }
   };
 
@@ -568,7 +991,11 @@ function App() {
           speed: '0.00',
           quality: 'ARKit tracked',
         },
-        step: frame.step || 0,
+        estimatedPose: frame.estimatedPose || frame.pose,
+        orientation: frame.orientation,
+        motion: frame.motion,
+        qualityScore: Number(frame.qualityScore) || 0,
+        qualityMetrics: frame.qualityMetrics,
         image: frame.image || '',
         previewUrl: frame.image || '',
       }));
@@ -586,12 +1013,18 @@ function App() {
       setViewMode('customize');
       setCameraState('idle');
       setSensorState('idle');
-      setStepIndex(FINAL_SCAN_STEP_INDEX);
-      setStepProgress(1);
+      setIsPaused(false);
       const lastFrame = frames[frames.length - 1];
-      lastTelemetryRef.current = lastFrame.pose;
-      setLiveTelemetry(lastFrame.pose);
-      setLastEvent(`Loaded ${frames.length} captured frames from ${file.name}.`);
+      lastTelemetryRef.current = lastFrame?.pose || EMPTY_POSE;
+      setLiveTelemetry(lastFrame?.pose || EMPTY_POSE);
+      const importedScanState = {
+        ...createInitialScanState(),
+        acceptedFrames: frames.length,
+        ...(payload.scanState || {}),
+      };
+      scanStateRef.current = importedScanState;
+      setScanState(importedScanState);
+      setLastEvent(`Loaded ${frames.length} measured keyframes from ${file.name}.`);
       setImportError('');
     } catch (error) {
       setImportError('That file is not a valid BuildWise SmartScan session.');
@@ -609,23 +1042,24 @@ function App() {
     setIsScanning(false);
     setIsFinished(false);
     setViewMode('scan');
-    setStepIndex(0);
-    setStepProgress(0);
+    setIsPaused(false);
     setFramesCaptured(0);
     frameStoreRef.current = [];
-    setObjects(INITIAL_OBJECTS.map((object) => ({ ...object })));
+    setObjects([]);
     setLastEvent('Ready when you are.');
     setCameraState('idle');
     setSensorState('idle');
-    setLiveTelemetry(TELEMETRY[0]);
+    const initialScanState = createInitialScanState();
+    scanStateRef.current = initialScanState;
+    setScanState(initialScanState);
+    setLiveTelemetry(EMPTY_POSE);
     setRoomSession(null);
     setImportError('');
-    transitionLockRef.current = false;
-    lastCapturedHeadingRef.current = null;
+    setReconstructionState(null);
     scanStartedAtRef.current = null;
     scanSessionIdRef.current = null;
-    pathRef.current = { x: 0, y: 1.42, z: 0, velocity: 0, lastMotionAt: null };
-    lastTelemetryRef.current = TELEMETRY[0];
+    pathRef.current = { x: 0, y: 0, z: 0, velocity: 0, lastMotionAt: null };
+    lastTelemetryRef.current = EMPTY_POSE;
   };
 
   return (
@@ -662,23 +1096,23 @@ function App() {
       </header>
 
       {viewMode === 'customize' && roomSession ? (
-        <RoomCustomizer session={roomSession} objects={objects} onExport={exportScan} isExporting={isExporting} />
+        <RoomCustomizer
+          session={roomSession}
+          onExport={exportScan}
+          isExporting={isExporting}
+          onReconstruct={reconstructRoom}
+          isReconstructing={isReconstructing}
+          reconstructionState={reconstructionState}
+        />
       ) : <div className={`workspace ${isScanning ? 'workspace-scanning' : ''}`}>
         <section className="camera-column" aria-label="Camera preview">
           <div className="camera-frame">
             <video ref={videoRef} className={`camera-video ${cameraState === 'live' ? 'camera-video-live' : ''}`} autoPlay muted playsInline />
-            <div className="room-fallback" aria-hidden={cameraState === 'live'}>
-              <div className="fallback-window" />
-              <div className="fallback-wall fallback-wall-left" />
-              <div className="fallback-wall fallback-wall-right" />
-              <div className="fallback-floor" />
-              <div className="fallback-bed"><span>BED</span></div>
-              <div className="fallback-desk"><span>DESK</span></div>
-            </div>
+            <div className="room-fallback" aria-hidden={cameraState === 'live'}><span>LIVE CAMERA REQUIRED</span></div>
             <div className="camera-shade" />
             <div className="camera-meta camera-meta-top">
               <span className="recording-label"><span className="status-dot status-dot-recording" /> {isScanning ? 'LIVE CAPTURE' : 'CAMERA PREVIEW'}</span>
-              <span className="camera-mode">{cameraState === 'live' ? 'LIVE CAMERA' : cameraState === 'fallback' ? 'HTTPS REQUIRED' : 'DEMO VIEW'}</span>
+              <span className="camera-mode">{cameraState === 'live' ? 'LIVE CAMERA' : cameraState === 'fallback' ? 'HTTPS REQUIRED' : 'CAMERA OFF'}</span>
             </div>
             {cameraState === 'requesting' && <div className="camera-notice">Requesting camera access...</div>}
             {cameraState === 'fallback' && <div className="camera-notice camera-notice-warning">Open this page over HTTPS to use the phone camera.</div>}
@@ -690,11 +1124,9 @@ function App() {
               <span className="reticle-cross reticle-cross-horizontal" />
               <span className="reticle-cross reticle-cross-vertical" />
             </div>
-            <div className="object-tag object-tag-bed"><span className="tag-corner" />Frame anchor <b>LIVE</b></div>
-            <div className="object-tag object-tag-window"><span className="tag-corner" />Room image <b>CAPTURE</b></div>
             <div className="camera-meta camera-meta-bottom">
-              <span>Frame quality <b>{cameraState === 'live' ? 'Good' : 'Simulated'}</b></span>
-              <span>Capture threshold <b>15 cm</b></span>
+              <span>Frame quality <b>{cameraState === 'live' ? `${Math.round(scanState.frameQuality * 100)}%` : '—'}</b></span>
+              <span>Accepted viewpoints <b>{scanState.acceptedFrames}</b></span>
             </div>
           </div>
 
@@ -704,8 +1136,8 @@ function App() {
                 <p className="section-label">Live pose</p>
                 <h2>Position tracking</h2>
               </div>
-              <span className={`tracking-badge ${sensorState === 'live' ? 'tracking-badge-live' : telemetry.quality === 'Locked' ? 'tracking-badge-locked' : ''}`}>
-                <span className="status-dot status-dot-small" /> {sensorState === 'live' ? 'Live sensors' : sensorState === 'unavailable' ? 'Camera only' : telemetry.quality}
+              <span className={`tracking-badge ${scanState.trackingQuality >= 0.55 ? 'tracking-badge-live' : scanState.trackingQuality > 0 ? 'tracking-badge-locked' : ''}`}>
+                <span className="status-dot status-dot-small" /> Tracking: {trackingQualityLabel(scanState.trackingQuality)}
               </span>
             </div>
             <div className="telemetry-grid">
@@ -725,7 +1157,7 @@ function App() {
               <p className="section-label">AI-assisted guided spatial scanning</p>
               <h1>{isFinished ? 'Ready to review your room.' : 'Scan the room with your phone.'}</h1>
             </div>
-            <span className="phase-chip">Phase 01</span>
+            <span className="phase-chip">Adaptive scan</span>
           </div>
 
           <section className="progress-panel" aria-label="Room scan capture progress">
@@ -735,65 +1167,43 @@ function App() {
             </div>
             <div className="progress-track" aria-hidden="true"><span style={{ width: `${roomCoverage}%` }} /></div>
             <div className="progress-footing">
-              <span>{isFinished ? 'Ready to review' : stepIndex === FINAL_SCAN_STEP_INDEX ? 'Loop closed' : 'Following the room path'}</span>
-              <span>{framesCaptured} useful frames</span>
+              <span>{isFinished ? 'Ready to review' : 'Following measured coverage'}</span>
+              <span>{scanState.lowCoverageRegions.filter((region) => region.coverage < 0.45).length} low-coverage areas</span>
             </div>
           </section>
 
-          <section className={`instruction-panel ${isFinished ? 'instruction-panel-complete' : ''}`} aria-live="polite">
+          <CoverageMap scanState={scanState} targetRegion={scanInstruction.targetRegion} />
+
+          <section className={`instruction-panel ${isFinished || scanInstruction.type === 'SCAN_COMPLETE' ? 'instruction-panel-complete' : ''}`} aria-live="polite">
             <div className="instruction-topline">
-              <span className="instruction-label">{step.label}</span>
-              <span className="instruction-step">{stepIndex === 0 ? 'Ready' : isFinished ? 'Done' : `${Math.min(stepIndex, FINAL_SCAN_STEP_INDEX - 1)} / ${FINAL_SCAN_STEP_INDEX - 1}`}</span>
+              <span className="instruction-label">{scanInstruction.label}</span>
+              <span className="instruction-step">{isFinished ? 'Done' : `Confidence ${Math.round((scanInstruction.confidence || 0) * 100)}%`}</span>
             </div>
             <div className="instruction-content">
-              <div className="direction-glyph" aria-hidden="true">{step.direction}</div>
+              <div className="direction-glyph" aria-hidden="true">{scanInstruction.direction}</div>
               <div>
-                <p className="section-label">{step.eyebrow}</p>
-                <h2>{step.title}</h2>
+                <p className="section-label">{scanInstruction.eyebrow}</p>
+                <h2>{scanInstruction.title}</h2>
                 <p className="instruction-copy">{instructionText}</p>
               </div>
             </div>
             <div className="instruction-meter-row">
               <span>{isFinished ? 'Scan quality' : 'Current target'}</span>
-              <strong>{isFinished ? 'Ready' : liveMetric}</strong>
+              <strong>{isFinished ? `${Math.round(scanState.trackingQuality * 100)}% tracking` : liveMetric}</strong>
             </div>
-            <div className="instruction-meter"><span style={{ width: `${isFinished ? 100 : stepProgress * 100}%` }} /></div>
-            <p className="instruction-helper">{step.helper}{stepIndex === FINAL_SCAN_STEP_INDEX && !canFinish ? ` ${finishHint}` : ''}</p>
+            <div className="instruction-meter"><span style={{ width: `${isFinished ? 100 : Math.round((scanInstruction.targetRegion?.coverage || scanState.totalCoverage) * 100)}%` }} /></div>
+            <p className="instruction-helper">{scanInstruction.helper} {!canFinish && finishHint}</p>
           </section>
 
           <div className="event-line"><span className="event-pulse" />{lastEvent}</div>
-
-          <section className="objects-panel" aria-label="Room asset presets">
-            <div className="panel-heading-row">
-              <div>
-                <p className="section-label">Room assets</p>
-                <h2>Customization presets</h2>
-              </div>
-              <span className="object-count">{objects.length} ready</span>
-            </div>
-            <div className="object-list">
-              {objects.map((object) => (
-                <div className="object-row" key={object.name}>
-                  <span className={`object-icon object-icon-${object.kind}`} aria-hidden="true">{object.name.slice(0, 1)}</span>
-                  <div className="object-name-wrap"><strong>{object.name}</strong><span>Ready to place</span></div>
-                  <div className="object-progress-wrap"><span>3D</span><div className="object-progress"><i style={{ width: '100%' }} /></div></div>
-                </div>
-              ))}
-            </div>
-          </section>
 
           <div className="control-actions">
             {!isScanning && !isFinished && (
               <button className="primary-button" type="button" onClick={startScan}>Start scan <span aria-hidden="true">↗</span></button>
             )}
-            {isScanning && stepIndex < FINAL_SCAN_STEP_INDEX && (
-              <button className="primary-button" type="button" onClick={advanceGuidance}>
-                Mark checkpoint <span className="checkpoint-arrow" aria-hidden="true">-&gt;</span>
-              </button>
-            )}
-            {isScanning && stepIndex === FINAL_SCAN_STEP_INDEX && (
-              <button className="primary-button" type="button" onClick={finishScan} disabled={!canFinish} title={finishHint}>
-                Finish scan <span aria-hidden="true">-&gt;</span>
+            {isScanning && (
+              <button className="primary-button" type="button" onClick={() => setIsPaused((paused) => !paused)}>
+                {isPaused ? 'Resume scan' : 'Pause scan'} <span aria-hidden="true">{isPaused ? '▶' : 'Ⅱ'}</span>
               </button>
             )}
             {isFinished && roomSession && (
@@ -801,7 +1211,7 @@ function App() {
                 Open room simulator <span aria-hidden="true">-&gt;</span>
               </button>
             )}
-            {!isFinished && stepIndex < FINAL_SCAN_STEP_INDEX && (
+            {isScanning && (
               <button className="secondary-button" type="button" onClick={finishScan} disabled={!canFinish} title={finishHint}>
                 Finish scan
               </button>
@@ -814,9 +1224,9 @@ function App() {
           </div>
           {importError && <p className="action-note action-note-error">{importError}</p>}
           {!isScanning && !isFinished && <p className="action-note">Camera and movement tracking begin after you start.</p>}
-          {isScanning && <p className="action-note">{sensorState === 'live' ? 'Move as instructed. Turn and movement signals can advance the checkpoint automatically.' : 'Motion sensors are unavailable. Complete each instruction, then mark the checkpoint manually.'}</p>}
+          {isScanning && <p className="action-note">{sensorState === 'live' ? 'Camera, orientation, motion, and visual-quality measurements are active.' : 'Camera analysis is active. Motion sensors are unavailable, so pose confidence will be lower.'}</p>}
           {isScanning && <p className="action-note action-note-guidance">{finishHint}</p>}
-          {isFinished && <p className="action-note action-note-success">Your scan is now available in the 3D room viewer and can be loaded on desktop.</p>}
+          {isFinished && <p className="action-note action-note-success">Your measured keyframes are saved. A real 3D mesh appears only after importing a reconstruction result or a native LiDAR session.</p>}
         </aside>
       </div>}
     </main>
@@ -922,7 +1332,7 @@ function assetsFromSessionPayload(payload) {
   if (summary.table) classifiedAssets.push({ name: 'Table (ARKit)', kind: 'desk', coverage: 0, confidence: 'ARKit mesh class' });
   if (summary.seat) classifiedAssets.push({ name: 'Seat (ARKit)', kind: 'chair', coverage: 0, confidence: 'ARKit mesh class' });
   if (summary.window) classifiedAssets.push({ name: 'Window (ARKit)', kind: 'window', coverage: 0, confidence: 'ARKit mesh class' });
-  return classifiedAssets.length > 0 ? classifiedAssets : INITIAL_OBJECTS.map((object) => ({ ...object }));
+  return classifiedAssets;
 }
 
 function disposeRoomScene(scene) {
@@ -937,11 +1347,14 @@ function disposeRoomScene(scene) {
   });
 }
 
-function RoomScene({ session, objects, selectedAssetName, assetScale, assetColor, assetPosition, activeFrameIndex, surfaceColors }) {
+function RoomScene({ session, surfaceColors }) {
   const viewportRef = useRef(null);
   const canvasRef = useRef(null);
   const arSessionRef = useRef(null);
   const enterARRef = useRef(null);
+  const hasMeshPayload = typeof session?.meshPLY === 'string' && session.meshPLY.startsWith('ply');
+  const hasGlbPayload = typeof session?.glbUrl === 'string' && session.glbUrl.length > 0;
+  const hasRenderableAsset = hasMeshPayload || hasGlbPayload;
   const [arSupport, setArSupport] = useState('checking');
   const [arActive, setArActive] = useState(false);
   const [arError, setArError] = useState('');
@@ -981,7 +1394,7 @@ function RoomScene({ session, objects, selectedAssetName, assetScale, assetColor
     try {
       renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true, powerPreference: 'high-performance' });
     } catch (error) {
-      setSceneError('This browser cannot render the 3D room. Your captured views are still available below.');
+      setSceneError('This browser cannot render the real 3D room mesh.');
       return undefined;
     }
     setSceneError('');
@@ -992,8 +1405,9 @@ function RoomScene({ session, objects, selectedAssetName, assetScale, assetColor
 
     const dimensions = roomDimensions(session);
     const scanMeshGeometry = parsePLYGeometry(session.meshPLY);
-    let { pathPoints, minX, maxX, minZ, maxZ } = dimensions;
-    let { width, depth, height } = dimensions;
+    const hasGlb = typeof session.glbUrl === 'string' && session.glbUrl.length > 0;
+    const { pathPoints } = dimensions;
+    let { width, depth } = dimensions;
     let roomOffset = new THREE.Vector3();
     if (scanMeshGeometry) {
       scanMeshGeometry.computeBoundingBox();
@@ -1002,21 +1416,16 @@ function RoomScene({ session, objects, selectedAssetName, assetScale, assetColor
       const center = bounds.getCenter(new THREE.Vector3());
       width = clamp(size.x, 3.5, 12);
       depth = clamp(size.z, 3.5, 12);
-      height = clamp(size.y, 2.3, 4.2);
       roomOffset = new THREE.Vector3(-center.x, -bounds.min.y, -center.z);
     }
     const room = new THREE.Group();
     room.position.copy(roomOffset);
     scene.add(room);
 
-    const addBox = (parent, size, position, material, castShadow = true, receiveShadow = true) => {
-      const mesh = new THREE.Mesh(new THREE.BoxGeometry(...size), material);
-      mesh.position.set(...position);
-      mesh.castShadow = castShadow;
-      mesh.receiveShadow = receiveShadow;
-      parent.add(mesh);
-      return mesh;
-    };
+    if (!scanMeshGeometry && !hasGlb) {
+      setSceneError('This session has no real room mesh. Use the native iOS LiDAR scanner to build the 3D simulator.');
+      return () => renderer.dispose();
+    }
 
     scene.add(new THREE.HemisphereLight('#f4e9d5', '#2b302d', 2.1));
     const keyLight = new THREE.DirectionalLight('#ffe9c4', 2.8);
@@ -1053,31 +1462,22 @@ function RoomScene({ session, objects, selectedAssetName, assetScale, assetColor
       scanMesh.receiveShadow = true;
       room.add(scanMesh);
     } else {
-      const floorMaterial = new THREE.MeshStandardMaterial({ color: materialColor('floor'), roughness: 0.88, metalness: 0.02 });
-      addBox(room, [width, 0.12, depth], [0, -0.06, 0], floorMaterial, false, true);
-      const wallMaterial = new THREE.MeshStandardMaterial({ color: materialColor('wall'), roughness: 0.92, metalness: 0 });
-      addBox(room, [width, height, 0.12], [0, height / 2, -depth / 2], wallMaterial, false, true);
-      addBox(room, [0.12, height, depth], [-width / 2, height / 2, 0], wallMaterial, false, true);
-      addBox(room, [0.12, height, depth], [width / 2, height / 2, 0], wallMaterial, false, true);
+      loadGLTFAsset(session.glbUrl, (gltf) => {
+        if (disposed) {
+          disposeRoomScene(gltf.scene);
+          return;
+        }
+        const bounds = new THREE.Box3().setFromObject(gltf.scene);
+        const center = bounds.getCenter(new THREE.Vector3());
+        room.position.set(-center.x, -bounds.min.y, -center.z);
+        room.add(gltf.scene);
+        setSceneError('');
+      }, () => {
+        if (!disposed) setSceneError('The measured GLB could not be loaded. The reconstruction result is still available for download.');
+      });
     }
 
-    const gridSize = Math.max(width, depth);
-    const grid = new THREE.GridHelper(gridSize, Math.round(gridSize * 2), '#b9b29e', '#7c8379');
-    grid.position.y = 0.012;
-    grid.scale.set(width / gridSize, 1, depth / gridSize);
-    grid.material.transparent = true;
-    grid.material.opacity = 0.22;
-    room.add(grid);
-
-    const pathRangeX = Math.max(maxX - minX, 0.5);
-    const pathRangeZ = Math.max(maxZ - minZ, 0.5);
-    const toRoomPoint = scanMeshGeometry
-      ? (point) => new THREE.Vector3(point.x, 0.08, point.z)
-      : (point) => new THREE.Vector3(
-        (((point.x - minX) / pathRangeX) - 0.5) * (width - 0.7),
-        0.08,
-        (((point.z - minZ) / pathRangeZ) - 0.5) * (depth - 0.7),
-      );
+    const toRoomPoint = (point) => new THREE.Vector3(point.x, 0.08, point.z);
     const roomPath = pathPoints.map(toRoomPoint);
     if (roomPath.length > 1) {
       const pathLine = new THREE.Line(
@@ -1091,98 +1491,6 @@ function RoomScene({ session, objects, selectedAssetName, assetScale, assetColor
       const node = new THREE.Mesh(new THREE.SphereGeometry(0.055, 12, 8), pathNodeMaterial);
       node.position.copy(point);
       room.add(node);
-    });
-
-    const captureSlots = [
-      { x: 0, y: 1.55, z: -depth / 2 + 0.08, rotationY: 0, width: Math.min(width * 0.68, 4.2) },
-      { x: -width / 2 + 0.08, y: 1.5, z: 0, rotationY: Math.PI / 2, width: Math.min(depth * 0.62, 3.6) },
-      { x: width / 2 - 0.08, y: 1.5, z: 0, rotationY: -Math.PI / 2, width: Math.min(depth * 0.62, 3.6) },
-      { x: 0, y: 1.55, z: depth / 2 - 0.08, rotationY: Math.PI, width: Math.min(width * 0.68, 4.2) },
-    ];
-    const textureLoader = new THREE.TextureLoader();
-    const capturedFrames = (session.frames || []).filter((frame) => frameSource(frame)).slice(0, captureSlots.length);
-    capturedFrames.forEach((frame, index) => {
-      const slot = captureSlots[index];
-      const texture = textureLoader.load(frameSource(frame), (loadedTexture) => {
-        if (disposed) {
-          loadedTexture.dispose();
-          return;
-        }
-        loadedTexture.colorSpace = THREE.SRGBColorSpace;
-        const imageAspect = loadedTexture.image?.width && loadedTexture.image?.height
-          ? loadedTexture.image.width / loadedTexture.image.height
-          : 1.5;
-        const panelHeight = Math.min(slot.width / imageAspect, 1.75);
-        const panelMaterial = new THREE.MeshBasicMaterial({ map: loadedTexture, transparent: true, opacity: 0.9, side: THREE.DoubleSide });
-        const panel = new THREE.Mesh(new THREE.PlaneGeometry(slot.width, panelHeight), panelMaterial);
-        panel.position.set(slot.x, slot.y, slot.z);
-        panel.rotation.y = slot.rotationY;
-        room.add(panel);
-
-        const borderMaterial = new THREE.LineBasicMaterial({ color: index === activeFrameIndex ? '#ffc27c' : '#e3ddce', transparent: true, opacity: index === activeFrameIndex ? 0.95 : 0.42 });
-        const border = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.PlaneGeometry(slot.width + 0.05, panelHeight + 0.05)), borderMaterial);
-        border.position.copy(panel.position);
-        border.rotation.copy(panel.rotation);
-        room.add(border);
-      });
-      texture.colorSpace = THREE.SRGBColorSpace;
-    });
-
-    const roomObjects = objects?.length ? objects : INITIAL_OBJECTS;
-    const defaultSlots = [
-      { x: -width * 0.24, z: -depth * 0.22 },
-      { x: width * 0.2, z: -depth * 0.22 },
-      { x: width * 0.2, z: depth * 0.2 },
-      { x: -width * 0.22, z: depth * 0.2 },
-    ];
-    const selectedX = clamp(((assetPosition.x / 100) - 0.5) * (width - 1), -width / 2 + 0.5, width / 2 - 0.5);
-    const selectedZ = clamp(((assetPosition.y / 100) - 0.5) * (depth - 1), -depth / 2 + 0.5, depth / 2 - 0.5);
-    const furnitureColors = ['#b39a80', '#7d8d88', '#a7a08c', '#78929a'];
-    roomObjects.forEach((object, index) => {
-      const isSelected = object.name === selectedAssetName;
-      const slot = defaultSlots[index % defaultSlots.length];
-      const furniture = new THREE.Group();
-      const material = new THREE.MeshStandardMaterial({ color: isSelected ? assetColor : furnitureColors[index % furnitureColors.length], roughness: 0.72, metalness: 0.04, emissive: isSelected ? assetColor : '#000000', emissiveIntensity: isSelected ? 0.14 : 0 });
-      const addPart = (size, position, partMaterial = material, castShadow = true, receiveShadow = true) => addBox(furniture, size, position, partMaterial, castShadow, receiveShadow);
-
-      if (object.kind === 'bed') {
-        addPart([2.15, 0.28, 1.18], [0, 0.28, 0]);
-        addPart([2.04, 0.22, 1.08], [0, 0.53, 0], new THREE.MeshStandardMaterial({ color: isSelected ? assetColor : '#c7c0ad', roughness: 0.96 }));
-        addPart([0.42, 0.12, 0.74], [-0.65, 0.73, -0.08], new THREE.MeshStandardMaterial({ color: '#e3ddce', roughness: 0.98 }));
-      } else if (object.kind === 'desk') {
-        addPart([1.55, 0.14, 0.68], [0, 0.94, 0]);
-        [-0.62, 0.62].forEach((x) => addPart([0.1, 0.92, 0.1], [x, 0.46, -0.24]));
-        [-0.62, 0.62].forEach((x) => addPart([0.1, 0.92, 0.1], [x, 0.46, 0.24]));
-      } else if (object.kind === 'chair') {
-        addPart([0.72, 0.14, 0.72], [0, 0.68, 0]);
-        addPart([0.72, 0.9, 0.12], [0, 1.08, -0.3]);
-        [-0.26, 0.26].forEach((x) => addPart([0.09, 0.66, 0.09], [x, 0.33, -0.24]));
-        [-0.26, 0.26].forEach((x) => addPart([0.09, 0.66, 0.09], [x, 0.33, 0.24]));
-      } else if (object.kind === 'window') {
-        const glassMaterial = new THREE.MeshStandardMaterial({ color: '#a6ccd0', roughness: 0.18, metalness: 0.12, transparent: true, opacity: 0.78 });
-        addPart([1.55, 1.15, 0.08], [0, 1.65, 0], glassMaterial, false, false);
-        addPart([1.7, 0.1, 0.12], [0, 2.25, 0]);
-        addPart([1.7, 0.1, 0.12], [0, 1.05, 0]);
-        addPart([0.1, 1.2, 0.12], [-0.8, 1.65, 0]);
-        addPart([0.1, 1.2, 0.12], [0.8, 1.65, 0]);
-      } else {
-        addPart([1.1, 0.8, 0.8], [0, 0.4, 0]);
-        addPart([0.92, 0.18, 0.72], [0, 0.88, 0], new THREE.MeshStandardMaterial({ color: '#c7c0ad', roughness: 0.96 }));
-      }
-
-      const detectedSlot = Number.isFinite(Number(object.position?.x)) && Number.isFinite(Number(object.position?.z))
-        ? { x: Number(object.position.x), z: Number(object.position.z) }
-        : slot;
-      furniture.position.set(isSelected ? selectedX : detectedSlot.x, 0, isSelected ? selectedZ : detectedSlot.z);
-      furniture.scale.setScalar(isSelected ? assetScale : 0.92);
-      if (object.kind === 'window') furniture.position.z = isSelected ? selectedZ : -depth / 2 + 0.16;
-      if (isSelected) {
-        const selectionRing = new THREE.Mesh(new THREE.RingGeometry(0.46, 0.5, 32), new THREE.MeshBasicMaterial({ color: '#ffc27c', transparent: true, opacity: 0.75, side: THREE.DoubleSide }));
-        selectionRing.rotation.x = -Math.PI / 2;
-        selectionRing.position.y = 0.015;
-        furniture.add(selectionRing);
-      }
-      room.add(furniture);
     });
 
     const orbit = { azimuth: 0, elevation: 0.2, distance: Math.max(width, depth) * 0.92 };
@@ -1280,80 +1588,36 @@ function RoomScene({ session, objects, selectedAssetName, assetScale, assetColor
       disposeRoomScene(scene);
       renderer.dispose();
     };
-  }, [session, objects, selectedAssetName, assetScale, assetColor, assetPosition, activeFrameIndex, surfaceColors, arSupport]);
+  }, [session, surfaceColors, arSupport]);
 
   const enterAR = () => enterARRef.current?.();
   const exitAR = () => arSessionRef.current?.end();
 
   return (
     <div className={`room-scene-viewport ${arActive ? 'room-scene-viewport-ar' : ''}`} ref={viewportRef}>
-      <canvas className="room-scene-canvas" ref={canvasRef} aria-label="Interactive 3D room built from the scan path and captured views" />
+      <canvas className="room-scene-canvas" ref={canvasRef} aria-label="Interactive 3D room mesh captured from the real room" />
       {sceneError && <p className="room-scene-empty">{sceneError}</p>}
       <div className="room-scene-toolbar">
-        <span>{arActive ? 'Move your phone to view the room in AR.' : 'Drag to look around. Scroll to zoom.'}</span>
-        {arSupport === 'supported' && !arActive && <button type="button" className="scene-ar-button" onClick={enterAR}>Enter AR</button>}
+        <span>{sceneError ? 'A real mesh is required for this viewer.' : arActive ? 'Move your phone to view the room in AR.' : 'Drag to look around. Scroll to zoom.'}</span>
+        {hasRenderableAsset && arSupport === 'supported' && !arActive && <button type="button" className="scene-ar-button" onClick={enterAR}>Enter AR</button>}
         {arActive && <button type="button" className="scene-ar-button" onClick={exitAR}>Exit AR</button>}
         {arSupport === 'checking' && <span className="scene-capability">Checking AR...</span>}
-        {arSupport === 'unavailable' && <span className="scene-capability">3D room</span>}
+        {arSupport === 'unavailable' && <span className="scene-capability">Real mesh viewer</span>}
       </div>
       {arError && <p className="room-scene-error">{arError}</p>}
     </div>
   );
 }
 
-function RoomCustomizer({ session, objects, onExport, isExporting }) {
-  const previewVideoRef = useRef(null);
-  const previewStreamRef = useRef(null);
-  const [activeFrameIndex, setActiveFrameIndex] = useState(0);
-  const [selectedAssetName, setSelectedAssetName] = useState(objects[0]?.name || 'Bed');
-  const [assetColor, setAssetColor] = useState('#d8b08a');
-  const [assetScale, setAssetScale] = useState(1);
-  const [assetPosition, setAssetPosition] = useState({ x: 53, y: 57 });
+function RoomCustomizer({ session, onExport, isExporting, onReconstruct, isReconstructing, reconstructionState }) {
   const [surfaceColors, setSurfaceColors] = useState({ wall: '#737a71', floor: '#59615a', ceiling: '#9a9c92' });
-  const [isCameraPreview, setIsCameraPreview] = useState(false);
-  const [previewError, setPreviewError] = useState('');
-
-  useEffect(() => {
-    return () => {
-      if (previewStreamRef.current) {
-        previewStreamRef.current.getTracks().forEach((track) => track.stop());
-      }
-    };
-  }, []);
-
-  const selectedAsset = objects.find((object) => object.name === selectedAssetName) || objects[0];
-
-  const updateAssetPosition = (axis, value) => {
-    setAssetPosition((current) => ({ ...current, [axis]: Number(value) }));
-  };
+  const hasLiDARMesh = typeof session.meshPLY === 'string' && session.meshPLY.startsWith('ply');
+  const hasRealMesh = hasLiDARMesh || Boolean(session.glbUrl);
+  const canEditSurfaces = hasLiDARMesh;
+  const meshLabel = hasLiDARMesh ? 'LiDAR mesh' : session.glbUrl ? 'Photogrammetry GLB' : 'Mesh required';
 
   const updateSurfaceColor = (surface, color) => {
     setSurfaceColors((current) => ({ ...current, [surface]: color }));
-  };
-
-  const toggleCameraPreview = async () => {
-    if (isCameraPreview) {
-      previewStreamRef.current?.getTracks().forEach((track) => track.stop());
-      previewStreamRef.current = null;
-      setIsCameraPreview(false);
-      return;
-    }
-    if (!navigator.mediaDevices?.getUserMedia || !window.isSecureContext) {
-      setPreviewError('Camera preview needs a secure website and a browser camera.');
-      return;
-    }
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 } },
-        audio: false,
-      });
-      previewStreamRef.current = stream;
-      if (previewVideoRef.current) previewVideoRef.current.srcObject = stream;
-      setPreviewError('');
-      setIsCameraPreview(true);
-    } catch (error) {
-      setPreviewError('Camera preview permission was not available on this browser.');
-    }
   };
 
   const pathPoints = session.frames.map((frame) => ({
@@ -1377,12 +1641,13 @@ function RoomCustomizer({ session, objects, onExport, isExporting }) {
     <div className="customizer-workspace">
       <div className="customizer-header">
         <div>
-          <p className="section-label">Scanned room simulator</p>
-          <h1>Walk through your scanned room.</h1>
-          <p className="customizer-intro">Explore the estimated room in 3D, review captured views, or place furniture.</p>
+          <p className="section-label">Real room simulator</p>
+          <h1>Inspect the real room mesh.</h1>
+          <p className="customizer-intro">Orbit the captured geometry, then preview paint and flooring changes on the actual scanned surfaces.</p>
         </div>
         <div className="customizer-header-actions">
-          <span className="session-chip">{session.frames.length} keyframes</span>
+          <span className="session-chip">{meshLabel}</span>
+          {session.glbUrl && <a className="secondary-button download-button" href={session.glbUrl} download="room.glb">Download room.glb</a>}
           <button className="secondary-button" type="button" onClick={onExport} disabled={isExporting}>
             {isExporting ? 'Preparing...' : 'Export session'}
           </button>
@@ -1391,40 +1656,13 @@ function RoomCustomizer({ session, objects, onExport, isExporting }) {
 
       <div className="customizer-grid">
         <section className="customizer-stage-panel" aria-label="Scanned room simulator">
-          <div className={`customizer-stage ${isCameraPreview ? 'customizer-stage-camera' : ''}`}>
-            {isCameraPreview ? (
-              <video ref={previewVideoRef} className="customizer-camera" autoPlay muted playsInline />
-            ) : (
-              <RoomScene
-                session={session}
-                objects={objects}
-                selectedAssetName={selectedAssetName}
-                assetScale={assetScale}
-                assetColor={assetColor}
-                assetPosition={assetPosition}
-                activeFrameIndex={activeFrameIndex}
-                surfaceColors={surfaceColors}
-              />
-            )}
+          <div className="customizer-stage">
+            <RoomScene session={session} surfaceColors={surfaceColors} />
             <div className="customizer-stage-shade" />
             <div className="customizer-stage-meta">
-              <span>{isCameraPreview ? 'CAMERA OVERLAY' : session.meshPLY ? 'LIDAR ROOM MESH' : 'ESTIMATED ROOM'}</span>
-              <span>{selectedAsset?.name || 'Room asset'} / PLACED</span>
+              <span>{hasRealMesh ? 'REAL ROOM MESH' : 'MESH REQUIRED'}</span>
+              <span>{hasLiDARMesh ? 'ARKit geometry' : session.glbUrl ? 'COLMAP geometry' : 'No synthetic room'}</span>
             </div>
-          </div>
-
-          <div className="frame-strip" aria-label="Captured room frames">
-            {session.frames.map((frame, index) => (
-              <button
-                className={`frame-thumb ${index === activeFrameIndex ? 'frame-thumb-active' : ''}`}
-                type="button"
-                key={frame.frameId || index}
-                onClick={() => setActiveFrameIndex(index)}
-                aria-label={`Show room frame ${index + 1}`}
-              >
-                {frameSource(frame) ? <img src={frameSource(frame)} alt="" /> : <span>{index + 1}</span>}
-              </button>
-            ))}
           </div>
         </section>
 
@@ -1432,78 +1670,75 @@ function RoomCustomizer({ session, objects, onExport, isExporting }) {
           <div className="customizer-control-heading">
             <div>
               <p className="section-label">Simulator controls</p>
-              <h2>Room assets</h2>
+              <h2>Surface materials</h2>
             </div>
-            <span className="tracking-badge tracking-badge-live">{session.meshPLY ? 'LiDAR mesh' : 'Estimated room'}</span>
-          </div>
-
-          <div className="asset-picker">
-            {objects.map((object) => (
-              <button
-                className={`asset-choice ${selectedAssetName === object.name ? 'asset-choice-active' : ''}`}
-                type="button"
-                key={object.name}
-                onClick={() => setSelectedAssetName(object.name)}
-              >
-                <span className={`object-icon object-icon-${object.kind}`} aria-hidden="true">{object.name.slice(0, 1)}</span>
-                <span>{object.name}</span>
-              </button>
-            ))}
-          </div>
-
-          <label className="customizer-slider-label" htmlFor="asset-scale">
-            <span>Asset size</span><strong>{assetScale.toFixed(1)}x</strong>
-          </label>
-          <input id="asset-scale" className="customizer-slider" type="range" min="0.6" max="1.6" step="0.1" value={assetScale} onChange={(event) => setAssetScale(Number(event.target.value))} />
-
-          <div className="color-picker-label"><span>Material tone</span><strong>{assetColor.toUpperCase()}</strong></div>
-          <div className="color-picker">
-            {['#d8b08a', '#8c9caa', '#c7c1ae', '#6b735f', '#b86e55'].map((color) => (
-              <button className={`color-swatch ${assetColor === color ? 'color-swatch-active' : ''}`} style={{ backgroundColor: color }} type="button" key={color} onClick={() => setAssetColor(color)} aria-label={`Use ${color} material`} />
-            ))}
+            <span className="tracking-badge tracking-badge-live">{meshLabel}</span>
           </div>
 
           <div className="surface-materials">
-            <div className="customizer-slider-label"><span>Room surfaces</span><strong>EDITABLE</strong></div>
+            <div className="customizer-slider-label"><span>Scanned surfaces</span><strong>{canEditSurfaces ? 'EDITABLE' : 'READ ONLY'}</strong></div>
             {Object.entries(surfaceColors).map(([surface, color]) => (
               <div className="surface-material-row" key={surface}>
                 <span>{surface.charAt(0).toUpperCase() + surface.slice(1)}</span>
                 <div className="color-picker">
                   {['#737a71', '#59615a', '#a5a091', '#8b7465', '#6f8f8e'].map((swatch) => (
-                    <button className={`color-swatch ${color === swatch ? 'color-swatch-active' : ''}`} style={{ backgroundColor: swatch }} type="button" key={swatch} onClick={() => updateSurfaceColor(surface, swatch)} aria-label={`Set ${surface} to ${swatch}`} />
+                    <button className={`color-swatch ${color === swatch ? 'color-swatch-active' : ''}`} style={{ backgroundColor: swatch }} type="button" key={swatch} onClick={() => updateSurfaceColor(surface, swatch)} aria-label={`Set ${surface} to ${swatch}`} disabled={!canEditSurfaces} />
                   ))}
                 </div>
               </div>
             ))}
           </div>
-
-          <label className="customizer-slider-label" htmlFor="asset-position-x">
-            <span>Horizontal placement</span><strong>{Math.round(assetPosition.x)}%</strong>
-          </label>
-          <input id="asset-position-x" className="customizer-slider" type="range" min="15" max="85" step="1" value={assetPosition.x} onChange={(event) => updateAssetPosition('x', event.target.value)} />
-
-          <label className="customizer-slider-label" htmlFor="asset-position-y">
-            <span>Depth placement</span><strong>{Math.round(assetPosition.y)}%</strong>
-          </label>
-          <input id="asset-position-y" className="customizer-slider" type="range" min="18" max="82" step="1" value={assetPosition.y} onChange={(event) => updateAssetPosition('y', event.target.value)} />
+          {session.glbUrl && !session.meshPLY && <p className="action-note">This photogrammetry mesh keeps measured color. Wall/floor selection will be enabled when semantic surface segmentation is added.</p>}
 
           <div className="room-map-panel">
-            <div className="panel-heading-row"><div><p className="section-label">Captured path</p><h2>Room footprint</h2></div><span className="object-count">{session.meshPLY ? 'LiDAR mesh' : 'Estimated'}</span></div>
-            <svg className="room-map" viewBox="0 0 100 100" role="img" aria-label="Estimated room scan path">
+            <div className="panel-heading-row"><div><p className="section-label">Tracking trace</p><h2>Camera path</h2></div><span className="object-count">{hasRealMesh ? 'ARKit' : 'Browser path'}</span></div>
+            <svg className="room-map" viewBox="0 0 100 100" role="img" aria-label="Room tracking path used to capture the scan">
               <rect x="8" y="8" width="84" height="84" rx="2" />
               <polyline points={pathPolyline} />
               {pathPoints.length > 0 && <circle cx={lastPathCoordinate?.[0]} cy={lastPathCoordinate?.[1]} r="3" />}
             </svg>
           </div>
-
-          <button className="primary-button customizer-camera-button" type="button" onClick={toggleCameraPreview}>
-            {isCameraPreview ? 'Close camera overlay' : 'Preview with camera'} <span aria-hidden="true">-&gt;</span>
-          </button>
-          {previewError && <p className="action-note action-note-error">{previewError}</p>}
-          <p className="customizer-disclaimer">This room is built from your movement path and captured views. Precise wall geometry needs depth capture or a reconstruction service; AR needs a WebXR-capable browser.</p>
+          {!hasRealMesh && (
+            <div className="reconstruction-action">
+              <button className="primary-button" type="button" onClick={onReconstruct} disabled={isReconstructing || session.frames.filter((frame) => frame.image).length < 3}>
+                {isReconstructing ? 'Reconstructing measured mesh...' : 'Build real 3D room'} <span aria-hidden="true">-&gt;</span>
+              </button>
+              {reconstructionState && <p className={`action-note ${reconstructionState.status === 'error' ? 'action-note-error' : 'action-note-guidance'}`}>{reconstructionState.message}</p>}
+            </div>
+          )}
+          <p className="customizer-disclaimer">Only a native iOS LiDAR session supplies real room geometry here. Browser camera sessions do not become a 3D room, and this simulator will not invent walls, furniture, or image panels.</p>
         </aside>
       </div>
     </div>
+  );
+}
+
+function CoverageMap({ scanState, targetRegion }) {
+  return (
+    <section className="coverage-panel" aria-label="Measured scan coverage">
+      <div className="coverage-panel-heading">
+        <div>
+          <p className="section-label">Live coverage map</p>
+          <h2>Observed view sectors</h2>
+        </div>
+        <span className="tracking-badge">{Math.round((scanState.totalCoverage || 0) * 100)}%</span>
+      </div>
+      <div className="coverage-map" role="img" aria-label="Coverage by camera orientation and vertical surface band">
+        {COVERAGE_ROWS.map((row) => (
+          <div className="coverage-map-row" key={row.id}>
+            <span className="coverage-map-label">{row.label}</span>
+            <div className="coverage-map-cells">
+              {scanState.coverageRegions.filter((region) => region.row === row.id).map((region) => {
+                const coverage = Math.round(region.coverage * 100);
+                const coverageClass = coverage >= 70 ? 'coverage-high' : coverage >= 35 ? 'coverage-medium' : 'coverage-low';
+                return <span className={`coverage-cell ${coverageClass} ${targetRegion?.id === region.id ? 'coverage-target' : ''}`} key={region.id} title={`${row.label}, sector ${region.column + 1}: ${coverage}% coverage`} aria-label={`${row.label}, sector ${region.column + 1}, ${coverage}% coverage`} />;
+              })}
+            </div>
+          </div>
+        ))}
+      </div>
+      <div className="coverage-legend" aria-hidden="true"><span><i className="coverage-key coverage-key-high" />Enough</span><span><i className="coverage-key coverage-key-medium" />Needs angle</span><span><i className="coverage-key coverage-key-low" />Needs coverage</span></div>
+    </section>
   );
 }
 
@@ -1511,4 +1746,5 @@ function TelemetryValue({ label, value }) {
   return <div className="telemetry-value"><span>{label}</span><strong>{value}</strong></div>;
 }
 
+export { createInitialScanState, determineNextAction, updateCoverageFromFrame };
 export default App;
