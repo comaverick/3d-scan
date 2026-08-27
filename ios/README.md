@@ -1,6 +1,6 @@
 # BuildWise SmartScan iOS scanner
 
-This is the native scanner core for the SmartScan proof of feasibility. It uses `ARWorldTrackingConfiguration` and the RGB camera only. It deliberately does not enable LiDAR-only scene reconstruction, so the movement guidance works on ordinary ARKit-compatible iPhones.
+This is the native scanner core for the SmartScan room reconstruction path. It uses `ARWorldTrackingConfiguration` and enables classified LiDAR mesh reconstruction when the device supports it. Ordinary ARKit-compatible iPhones keep the RGB camera and world-tracking fallback.
 
 ## Run it
 
@@ -19,6 +19,6 @@ This is the native scanner core for the SmartScan proof of feasibility. It uses 
 - **Move left** advances after 0.65 m in the initial left direction.
 - **Return to start** advances when the camera is within 0.25 m of the origin.
 
-When the loop closes, tap **Finish Scan** to open the review card. Each useful frame is written as a JPEG under the app's `Documents/ScanSessions/<session-id>/` directory, alongside a versioned `manifest.json` containing the ARKit world-space origin, frame poses, timestamps, yaw, coverage, and scan duration. The review card can share the manifest and captured images through the iOS share sheet. Files are also exposed through the Files app because document sharing is enabled.
+When the loop closes, tap **Finish Scan** to open the review card. Each useful frame is written as a JPEG under the app's `Documents/ScanSessions/<session-id>/` directory, alongside a versioned `manifest.json` containing the ARKit world-space origin, frame poses, timestamps, yaw, coverage, and scan duration. On LiDAR devices the manifest also contains an ASCII PLY room mesh with per-face classification, a surface summary, and Vision furniture observations from iOS 17+. The review card can share the manifest and captured images through the iOS share sheet. Files are also exposed through the Files app because document sharing is enabled.
 
-ARKit gives reliable relative movement and heading, but room dimensions and final geometry still need the backend reconstruction phase. This target is the guided scanner and capture handoff, not the final mesh generator.
+The native target now produces the actual room mesh locally on LiDAR hardware. The website can render that mesh and apply different wall, floor, and ceiling materials. Detailed, object-level furniture meshes still need a dedicated reconstruction model; Vision observations are exported so that model can replace the placeholder furniture with fitted assets later.

@@ -553,18 +553,26 @@ function App() {
     if (!file) return;
     try {
       const payload = JSON.parse(await file.text());
-      if (!Array.isArray(payload.frames) || payload.frames.length === 0) {
+      const hasMesh = typeof payload.meshPLY === 'string' && payload.meshPLY.startsWith('ply');
+      if ((!Array.isArray(payload.frames) || payload.frames.length === 0) && !hasMesh) {
         throw new Error('No frames in scan session');
       }
-      const frames = payload.frames.filter((frame) => typeof frame.image === 'string').map((frame, index) => ({
-        frameId: frame.frameId || index + 1,
-        capturedAt: frame.capturedAt || Date.now(),
-        pose: frame.pose || TELEMETRY[0],
+      const frames = (Array.isArray(payload.frames) ? payload.frames : []).map((frame, index) => ({
+        frameId: frame.frameId || frame.id || index + 1,
+        capturedAt: frame.capturedAt || frame.timestamp || Date.now(),
+        pose: frame.pose || {
+          x: Number(frame.x || 0).toFixed(2),
+          y: Number(frame.y || 1.42).toFixed(2),
+          z: Number(frame.z || 0).toFixed(2),
+          yaw: Math.round(Number(frame.yaw || 0) * (Math.abs(Number(frame.yaw || 0)) < 7 ? 180 / Math.PI : 1)).toString(),
+          speed: '0.00',
+          quality: 'ARKit tracked',
+        },
         step: frame.step || 0,
-        image: frame.image,
-        previewUrl: frame.image,
+        image: frame.image || '',
+        previewUrl: frame.image || '',
       }));
-      if (frames.length === 0) throw new Error('Scan images are missing');
+      if (frames.length === 0 && !hasMesh) throw new Error('Scan data is missing');
       frameStoreRef.current.forEach((frame) => {
         if (frame.previewUrl) URL.revokeObjectURL(frame.previewUrl);
       });
@@ -572,7 +580,7 @@ function App() {
       const importedSession = { ...payload, frames };
       setRoomSession(importedSession);
       setFramesCaptured(frames.length);
-      setObjects(Array.isArray(payload.objects) ? payload.objects : INITIAL_OBJECTS.map((object) => ({ ...object })));
+      setObjects(assetsFromSessionPayload(payload));
       setIsScanning(false);
       setIsFinished(true);
       setViewMode('customize');
@@ -836,6 +844,87 @@ function roomDimensions(session) {
   };
 }
 
+function parsePLYGeometry(plyText) {
+  if (typeof plyText !== 'string' || !plyText.startsWith('ply')) return null;
+  const lines = plyText.split(/\r?\n/);
+  const headerEnd = lines.indexOf('end_header');
+  if (headerEnd < 0) return null;
+  const vertexCount = Number(lines.find((line) => line.startsWith('element vertex '))?.split(' ')[2]);
+  const faceCount = Number(lines.find((line) => line.startsWith('element face '))?.split(' ')[2]);
+  if (!Number.isFinite(vertexCount) || !Number.isFinite(faceCount)) return null;
+
+  const vertices = [];
+  for (let index = 0; index < vertexCount; index += 1) {
+    const values = lines[headerEnd + 1 + index]?.trim().split(/\s+/).map(Number);
+    if (!values || values.length < 3 || values.some((value) => !Number.isFinite(value))) return null;
+    vertices.push(values[0], values[1], values[2]);
+  }
+
+  const faceBuckets = new Map();
+  for (let index = 0; index < faceCount; index += 1) {
+    const values = lines[headerEnd + 1 + vertexCount + index]?.trim().split(/\s+/).map(Number);
+    if (!values || values.length < 4 || values[0] < 3) continue;
+    const classification = Number.isFinite(values[4]) ? values[4] : 0;
+    if (!faceBuckets.has(classification)) faceBuckets.set(classification, []);
+    faceBuckets.get(classification).push(values[1], values[2], values[3]);
+  }
+  if (vertices.length === 0 || faceBuckets.size === 0) return null;
+
+  const indices = [];
+  const surfaceKeys = [];
+  const surfaceNames = ['other', 'wall', 'floor', 'ceiling', 'table', 'seat', 'window', 'door'];
+  const geometry = new THREE.BufferGeometry();
+  faceBuckets.forEach((bucket, classification) => {
+    const start = indices.length;
+    indices.push(...bucket);
+    geometry.addGroup(start, bucket.length, surfaceKeys.length);
+    surfaceKeys.push(surfaceNames[classification] || 'other');
+  });
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
+  geometry.setIndex(indices);
+  geometry.computeVertexNormals();
+  geometry.userData.surfaceKeys = surfaceKeys;
+  return geometry;
+}
+
+function assetFromDetection(observation, index) {
+  const label = String(observation?.label || `Detected object ${index + 1}`);
+  const normalized = label.toLowerCase();
+  const kind = normalized.includes('bed') ? 'bed'
+    : normalized.includes('desk') || normalized.includes('table') ? 'desk'
+      : normalized.includes('chair') || normalized.includes('seat') || normalized.includes('sofa') || normalized.includes('couch') ? 'chair'
+        : 'generic';
+  const position = Number.isFinite(Number(observation?.x)) && Number.isFinite(Number(observation?.z))
+    ? { x: Number(observation.x), z: Number(observation.z) }
+    : undefined;
+  return {
+    name: label.replace(/\b\w/g, (character) => character.toUpperCase()),
+    kind,
+    coverage: 0,
+    confidence: `${Math.round((Number(observation?.confidence) || 0) * 100)}% AI match`,
+    position,
+  };
+}
+
+function assetsFromSessionPayload(payload) {
+  if (Array.isArray(payload.objects) && payload.objects.length > 0) return payload.objects;
+  if (Array.isArray(payload.detectedObjects) && payload.detectedObjects.length > 0) {
+    const bestByLabel = new Map();
+    payload.detectedObjects.forEach((observation) => {
+      const key = String(observation?.label || '').toLowerCase();
+      const current = bestByLabel.get(key);
+      if (!current || Number(observation?.confidence) > Number(current?.confidence)) bestByLabel.set(key, observation);
+    });
+    return [...bestByLabel.values()].map(assetFromDetection);
+  }
+  const summary = payload.surfaceSummary || {};
+  const classifiedAssets = [];
+  if (summary.table) classifiedAssets.push({ name: 'Table (ARKit)', kind: 'desk', coverage: 0, confidence: 'ARKit mesh class' });
+  if (summary.seat) classifiedAssets.push({ name: 'Seat (ARKit)', kind: 'chair', coverage: 0, confidence: 'ARKit mesh class' });
+  if (summary.window) classifiedAssets.push({ name: 'Window (ARKit)', kind: 'window', coverage: 0, confidence: 'ARKit mesh class' });
+  return classifiedAssets.length > 0 ? classifiedAssets : INITIAL_OBJECTS.map((object) => ({ ...object }));
+}
+
 function disposeRoomScene(scene) {
   scene.traverse((child) => {
     if (child.geometry) child.geometry.dispose();
@@ -848,7 +937,7 @@ function disposeRoomScene(scene) {
   });
 }
 
-function RoomScene({ session, objects, selectedAssetName, assetScale, assetColor, assetPosition, activeFrameIndex }) {
+function RoomScene({ session, objects, selectedAssetName, assetScale, assetColor, assetPosition, activeFrameIndex, surfaceColors }) {
   const viewportRef = useRef(null);
   const canvasRef = useRef(null);
   const arSessionRef = useRef(null);
@@ -901,8 +990,23 @@ function RoomScene({ session, objects, selectedAssetName, assetScale, assetColor
     renderer.shadowMap.enabled = true;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
-    const { pathPoints, minX, maxX, minZ, maxZ, width, depth, height } = roomDimensions(session);
+    const dimensions = roomDimensions(session);
+    const scanMeshGeometry = parsePLYGeometry(session.meshPLY);
+    let { pathPoints, minX, maxX, minZ, maxZ } = dimensions;
+    let { width, depth, height } = dimensions;
+    let roomOffset = new THREE.Vector3();
+    if (scanMeshGeometry) {
+      scanMeshGeometry.computeBoundingBox();
+      const bounds = scanMeshGeometry.boundingBox;
+      const size = bounds.getSize(new THREE.Vector3());
+      const center = bounds.getCenter(new THREE.Vector3());
+      width = clamp(size.x, 3.5, 12);
+      depth = clamp(size.z, 3.5, 12);
+      height = clamp(size.y, 2.3, 4.2);
+      roomOffset = new THREE.Vector3(-center.x, -bounds.min.y, -center.z);
+    }
     const room = new THREE.Group();
+    room.position.copy(roomOffset);
     scene.add(room);
 
     const addBox = (parent, size, position, material, castShadow = true, receiveShadow = true) => {
@@ -924,12 +1028,38 @@ function RoomScene({ session, objects, selectedAssetName, assetScale, assetColor
     fillLight.position.set(-2, 2.2, 1.5);
     scene.add(fillLight);
 
-    const floorMaterial = new THREE.MeshStandardMaterial({ color: '#59615a', roughness: 0.88, metalness: 0.02 });
-    addBox(room, [width, 0.12, depth], [0, -0.06, 0], floorMaterial, false, true);
-    const wallMaterial = new THREE.MeshStandardMaterial({ color: '#737a71', roughness: 0.92, metalness: 0 });
-    addBox(room, [width, height, 0.12], [0, height / 2, -depth / 2], wallMaterial, false, true);
-    addBox(room, [0.12, height, depth], [-width / 2, height / 2, 0], wallMaterial, false, true);
-    addBox(room, [0.12, height, depth], [width / 2, height / 2, 0], wallMaterial, false, true);
+    const materialColor = (surface) => surfaceColors?.[surface] || (surface === 'floor' ? '#59615a' : '#737a71');
+    if (scanMeshGeometry) {
+      const surfaceMaterialColors = {
+        other: '#747970',
+        wall: materialColor('wall'),
+        floor: materialColor('floor'),
+        ceiling: materialColor('ceiling'),
+        table: '#8b806c',
+        seat: '#8a7465',
+        window: '#7ea8ae',
+        door: '#796e60',
+      };
+      const surfaceMaterials = (scanMeshGeometry.userData.surfaceKeys || ['other']).map((surface) => new THREE.MeshStandardMaterial({
+        color: surfaceMaterialColors[surface] || surfaceMaterialColors.other,
+        roughness: surface === 'window' ? 0.24 : 0.88,
+        metalness: surface === 'window' ? 0.12 : 0,
+        transparent: surface === 'window',
+        opacity: surface === 'window' ? 0.78 : 1,
+        side: THREE.DoubleSide,
+      }));
+      const scanMesh = new THREE.Mesh(scanMeshGeometry, surfaceMaterials);
+      scanMesh.castShadow = false;
+      scanMesh.receiveShadow = true;
+      room.add(scanMesh);
+    } else {
+      const floorMaterial = new THREE.MeshStandardMaterial({ color: materialColor('floor'), roughness: 0.88, metalness: 0.02 });
+      addBox(room, [width, 0.12, depth], [0, -0.06, 0], floorMaterial, false, true);
+      const wallMaterial = new THREE.MeshStandardMaterial({ color: materialColor('wall'), roughness: 0.92, metalness: 0 });
+      addBox(room, [width, height, 0.12], [0, height / 2, -depth / 2], wallMaterial, false, true);
+      addBox(room, [0.12, height, depth], [-width / 2, height / 2, 0], wallMaterial, false, true);
+      addBox(room, [0.12, height, depth], [width / 2, height / 2, 0], wallMaterial, false, true);
+    }
 
     const gridSize = Math.max(width, depth);
     const grid = new THREE.GridHelper(gridSize, Math.round(gridSize * 2), '#b9b29e', '#7c8379');
@@ -941,11 +1071,13 @@ function RoomScene({ session, objects, selectedAssetName, assetScale, assetColor
 
     const pathRangeX = Math.max(maxX - minX, 0.5);
     const pathRangeZ = Math.max(maxZ - minZ, 0.5);
-    const toRoomPoint = (point) => new THREE.Vector3(
-      (((point.x - minX) / pathRangeX) - 0.5) * (width - 0.7),
-      0.08,
-      (((point.z - minZ) / pathRangeZ) - 0.5) * (depth - 0.7),
-    );
+    const toRoomPoint = scanMeshGeometry
+      ? (point) => new THREE.Vector3(point.x, 0.08, point.z)
+      : (point) => new THREE.Vector3(
+        (((point.x - minX) / pathRangeX) - 0.5) * (width - 0.7),
+        0.08,
+        (((point.z - minZ) / pathRangeZ) - 0.5) * (depth - 0.7),
+      );
     const roomPath = pathPoints.map(toRoomPoint);
     if (roomPath.length > 1) {
       const pathLine = new THREE.Line(
@@ -1026,16 +1158,22 @@ function RoomScene({ session, objects, selectedAssetName, assetScale, assetColor
         addPart([0.72, 0.9, 0.12], [0, 1.08, -0.3]);
         [-0.26, 0.26].forEach((x) => addPart([0.09, 0.66, 0.09], [x, 0.33, -0.24]));
         [-0.26, 0.26].forEach((x) => addPart([0.09, 0.66, 0.09], [x, 0.33, 0.24]));
-      } else {
+      } else if (object.kind === 'window') {
         const glassMaterial = new THREE.MeshStandardMaterial({ color: '#a6ccd0', roughness: 0.18, metalness: 0.12, transparent: true, opacity: 0.78 });
         addPart([1.55, 1.15, 0.08], [0, 1.65, 0], glassMaterial, false, false);
         addPart([1.7, 0.1, 0.12], [0, 2.25, 0]);
         addPart([1.7, 0.1, 0.12], [0, 1.05, 0]);
         addPart([0.1, 1.2, 0.12], [-0.8, 1.65, 0]);
         addPart([0.1, 1.2, 0.12], [0.8, 1.65, 0]);
+      } else {
+        addPart([1.1, 0.8, 0.8], [0, 0.4, 0]);
+        addPart([0.92, 0.18, 0.72], [0, 0.88, 0], new THREE.MeshStandardMaterial({ color: '#c7c0ad', roughness: 0.96 }));
       }
 
-      furniture.position.set(isSelected ? selectedX : slot.x, 0, isSelected ? selectedZ : slot.z);
+      const detectedSlot = Number.isFinite(Number(object.position?.x)) && Number.isFinite(Number(object.position?.z))
+        ? { x: Number(object.position.x), z: Number(object.position.z) }
+        : slot;
+      furniture.position.set(isSelected ? selectedX : detectedSlot.x, 0, isSelected ? selectedZ : detectedSlot.z);
       furniture.scale.setScalar(isSelected ? assetScale : 0.92);
       if (object.kind === 'window') furniture.position.z = isSelected ? selectedZ : -depth / 2 + 0.16;
       if (isSelected) {
@@ -1142,7 +1280,7 @@ function RoomScene({ session, objects, selectedAssetName, assetScale, assetColor
       disposeRoomScene(scene);
       renderer.dispose();
     };
-  }, [session, objects, selectedAssetName, assetScale, assetColor, assetPosition, activeFrameIndex, arSupport]);
+  }, [session, objects, selectedAssetName, assetScale, assetColor, assetPosition, activeFrameIndex, surfaceColors, arSupport]);
 
   const enterAR = () => enterARRef.current?.();
   const exitAR = () => arSessionRef.current?.end();
@@ -1171,6 +1309,7 @@ function RoomCustomizer({ session, objects, onExport, isExporting }) {
   const [assetColor, setAssetColor] = useState('#d8b08a');
   const [assetScale, setAssetScale] = useState(1);
   const [assetPosition, setAssetPosition] = useState({ x: 53, y: 57 });
+  const [surfaceColors, setSurfaceColors] = useState({ wall: '#737a71', floor: '#59615a', ceiling: '#9a9c92' });
   const [isCameraPreview, setIsCameraPreview] = useState(false);
   const [previewError, setPreviewError] = useState('');
 
@@ -1186,6 +1325,10 @@ function RoomCustomizer({ session, objects, onExport, isExporting }) {
 
   const updateAssetPosition = (axis, value) => {
     setAssetPosition((current) => ({ ...current, [axis]: Number(value) }));
+  };
+
+  const updateSurfaceColor = (surface, color) => {
+    setSurfaceColors((current) => ({ ...current, [surface]: color }));
   };
 
   const toggleCameraPreview = async () => {
@@ -1260,11 +1403,12 @@ function RoomCustomizer({ session, objects, onExport, isExporting }) {
                 assetColor={assetColor}
                 assetPosition={assetPosition}
                 activeFrameIndex={activeFrameIndex}
+                surfaceColors={surfaceColors}
               />
             )}
             <div className="customizer-stage-shade" />
             <div className="customizer-stage-meta">
-              <span>{isCameraPreview ? 'CAMERA OVERLAY' : 'ROOM SIMULATOR'}</span>
+              <span>{isCameraPreview ? 'CAMERA OVERLAY' : session.meshPLY ? 'LIDAR ROOM MESH' : 'ESTIMATED ROOM'}</span>
               <span>{selectedAsset?.name || 'Room asset'} / PLACED</span>
             </div>
           </div>
@@ -1290,7 +1434,7 @@ function RoomCustomizer({ session, objects, onExport, isExporting }) {
               <p className="section-label">Simulator controls</p>
               <h2>Room assets</h2>
             </div>
-            <span className="tracking-badge tracking-badge-live">Local session</span>
+            <span className="tracking-badge tracking-badge-live">{session.meshPLY ? 'LiDAR mesh' : 'Estimated room'}</span>
           </div>
 
           <div className="asset-picker">
@@ -1319,6 +1463,20 @@ function RoomCustomizer({ session, objects, onExport, isExporting }) {
             ))}
           </div>
 
+          <div className="surface-materials">
+            <div className="customizer-slider-label"><span>Room surfaces</span><strong>EDITABLE</strong></div>
+            {Object.entries(surfaceColors).map(([surface, color]) => (
+              <div className="surface-material-row" key={surface}>
+                <span>{surface.charAt(0).toUpperCase() + surface.slice(1)}</span>
+                <div className="color-picker">
+                  {['#737a71', '#59615a', '#a5a091', '#8b7465', '#6f8f8e'].map((swatch) => (
+                    <button className={`color-swatch ${color === swatch ? 'color-swatch-active' : ''}`} style={{ backgroundColor: swatch }} type="button" key={swatch} onClick={() => updateSurfaceColor(surface, swatch)} aria-label={`Set ${surface} to ${swatch}`} />
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+
           <label className="customizer-slider-label" htmlFor="asset-position-x">
             <span>Horizontal placement</span><strong>{Math.round(assetPosition.x)}%</strong>
           </label>
@@ -1330,7 +1488,7 @@ function RoomCustomizer({ session, objects, onExport, isExporting }) {
           <input id="asset-position-y" className="customizer-slider" type="range" min="18" max="82" step="1" value={assetPosition.y} onChange={(event) => updateAssetPosition('y', event.target.value)} />
 
           <div className="room-map-panel">
-            <div className="panel-heading-row"><div><p className="section-label">Captured path</p><h2>Room footprint</h2></div><span className="object-count">Estimated</span></div>
+            <div className="panel-heading-row"><div><p className="section-label">Captured path</p><h2>Room footprint</h2></div><span className="object-count">{session.meshPLY ? 'LiDAR mesh' : 'Estimated'}</span></div>
             <svg className="room-map" viewBox="0 0 100 100" role="img" aria-label="Estimated room scan path">
               <rect x="8" y="8" width="84" height="84" rx="2" />
               <polyline points={pathPolyline} />

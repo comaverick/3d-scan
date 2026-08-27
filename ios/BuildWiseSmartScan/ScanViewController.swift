@@ -1,6 +1,8 @@
 import ARKit
 import CoreImage
+import SceneKit
 import UIKit
+import Vision
 
 private enum ScanStep {
     case ready
@@ -14,40 +16,40 @@ private enum ScanStep {
 
     var title: String {
         switch self {
-        case .ready: return "Find the center of the room"
-        case .moveForward: return "Move forward slowly"
-        case .turnRight: return "Turn right slowly"
-        case .scanWall: return "Scan this wall"
-        case .moveLeft: return "Move left along the room"
-        case .scanOpposite: return "Scan the opposite side"
-        case .returnToStart: return "Return to your starting point"
-        case .complete: return "Room scan is ready"
+        case .ready: return "Choose a clear starting view"
+        case .moveForward: return "Move into the open space"
+        case .turnRight: return "Turn toward the next surface"
+        case .scanWall: return "Sweep the next visible surface"
+        case .moveLeft: return "Follow the room edge"
+        case .scanOpposite: return "Sweep the far side"
+        case .returnToStart: return "Close the loop at your starting view"
+        case .complete: return "Room mesh is ready to review"
         }
     }
 
     var instruction: String {
         switch self {
-        case .ready: return "Hold your phone chest-high and face a clear wall."
-        case .moveForward: return "Move forward 1 metre. Keep the crosshair on the wall."
-        case .turnRight: return "Keep your feet planted and turn right 90 degrees."
-        case .scanWall: return "Pan across the wall slowly from left to right."
-        case .moveLeft: return "Move left 0.8 metres while keeping the furniture in view."
-        case .scanOpposite: return "Sweep across the opposite wall. Move slowly."
-        case .returnToStart: return "Walk back to the starting point to close the loop."
-        case .complete: return "Walls, floor, and the camera loop meet the scan minimum."
+        case .ready: return "Hold your phone chest-high and aim at a clear wall or corner."
+        case .moveForward: return "Walk a few steady steps into the open space. Keep the floor line in view."
+        case .turnRight: return "Keep your feet planted and rotate until the next wall or corner is centered."
+        case .scanWall: return "Pan across the visible surface slowly. Keep part of the previous view overlapped."
+        case .moveLeft: return "Take a few slow steps along the room edge and aim for the next corner."
+        case .scanOpposite: return "Sweep the far side and include corners, windows, and doors."
+        case .returnToStart: return "Walk back to the starting view and face the original direction."
+        case .complete: return "Review the captured mesh, classified surfaces, and furniture observations."
         }
     }
 
     var target: String {
         switch self {
-        case .ready: return "Start point"
-        case .moveForward: return "1.0 m"
-        case .turnRight: return "90 deg"
-        case .scanWall: return "6 useful frames"
-        case .moveLeft: return "0.8 m"
-        case .scanOpposite: return "6 useful frames"
-        case .returnToStart: return "Within 0.25 m"
-        case .complete: return "94% coverage"
+        case .ready: return "Reference view"
+        case .moveForward: return "Steady movement"
+        case .turnRight: return "Overlapping turn"
+        case .scanWall: return "Overlapping views"
+        case .moveLeft: return "Room edge"
+        case .scanOpposite: return "Far-side views"
+        case .returnToStart: return "Close the loop"
+        case .complete: return "Ready to review"
         }
     }
 
@@ -83,6 +85,16 @@ private struct ExportedFrame: Codable {
     let imageFileName: String?
 }
 
+private struct DetectedObject: Codable {
+    let label: String
+    let confidence: Float
+    let x: Float
+    let y: Float
+    let z: Float
+    let frameID: Int
+    let source: String
+}
+
 private struct ScanSessionManifest: Codable {
     let schemaVersion: Int
     let sessionID: String
@@ -93,9 +105,12 @@ private struct ScanSessionManifest: Codable {
     let coveragePercent: Int
     let frameCount: Int
     let frames: [ExportedFrame]
+    let meshPLY: String?
+    let surfaceSummary: [String: Int]
+    let detectedObjects: [DetectedObject]
 }
 
-final class ScanViewController: UIViewController, ARSessionDelegate {
+final class ScanViewController: UIViewController, ARSessionDelegate, ARSCNViewDelegate {
     private let sceneView = ARSCNView(frame: .zero)
     private let topBar = UIView()
     private let instructionCard = UIView()
@@ -134,6 +149,12 @@ final class ScanViewController: UIViewController, ARSessionDelegate {
     private var sessionStartedAt: Date?
     private var manifestURL: URL?
     private let imageContext = CIContext()
+    private var meshAnchors: [UUID: ARMeshAnchor] = [:]
+    private var detectedObjects: [DetectedObject] = []
+    private var visionRequestInFlight = false
+    private var hasSceneReconstruction = false
+    private var hasSceneClassification = false
+    private let visionQueue = DispatchQueue(label: "com.buildwise.smartscan.vision", qos: .userInitiated)
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -149,7 +170,11 @@ final class ScanViewController: UIViewController, ARSessionDelegate {
             startButton.isEnabled = false
             return
         }
-        trackingLabel.text = "AR WORLD TRACKING READY"
+        trackingLabel.text = ARWorldTrackingConfiguration.supportsSceneReconstruction(.meshWithClassification)
+            ? "AR TRACKING + ROOM MESH READY"
+            : ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh)
+                ? "AR TRACKING + ROOM MESH READY"
+                : "AR WORLD TRACKING READY"
     }
 
     override func viewWillDisappear(_ animated: Bool) {
@@ -161,6 +186,7 @@ final class ScanViewController: UIViewController, ARSessionDelegate {
         sceneView.translatesAutoresizingMaskIntoConstraints = false
         sceneView.automaticallyUpdatesLighting = true
         sceneView.session.delegate = self
+        sceneView.delegate = self
         sceneView.contentMode = .scaleAspectFill
         sceneView.showsStatistics = false
         view.addSubview(sceneView)
@@ -374,8 +400,14 @@ final class ScanViewController: UIViewController, ARSessionDelegate {
         let configuration = ARWorldTrackingConfiguration()
         configuration.worldAlignment = .gravity
         configuration.isLightEstimationEnabled = true
-        // Deliberately do not enable sceneReconstruction: this works on ordinary
-        // iPhones without LiDAR and keeps this phase focused on guided tracking.
+        configuration.environmentTexturing = .automatic
+        hasSceneClassification = ARWorldTrackingConfiguration.supportsSceneReconstruction(.meshWithClassification)
+        hasSceneReconstruction = hasSceneClassification || ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh)
+        if hasSceneClassification {
+            configuration.sceneReconstruction = .meshWithClassification
+        } else if hasSceneReconstruction {
+            configuration.sceneReconstruction = .mesh
+        }
         sceneView.session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
 
         isScanning = true
@@ -386,6 +418,9 @@ final class ScanViewController: UIViewController, ARSessionDelegate {
         lastCapturedPosition = nil
         lastCapturedYaw = nil
         capturedFrames.removeAll(keepingCapacity: true)
+        meshAnchors.removeAll(keepingCapacity: true)
+        detectedObjects.removeAll(keepingCapacity: true)
+        visionRequestInFlight = false
         beginSession()
         stepStartFrameCount = 0
         stepStartTime = 0
@@ -473,6 +508,56 @@ final class ScanViewController: UIViewController, ARSessionDelegate {
         updateTrackingState(camera.trackingState)
     }
 
+    func session(_ session: ARSession, didAdd anchors: [ARAnchor]) {
+        anchors.compactMap { $0 as? ARMeshAnchor }.forEach { meshAnchors[$0.identifier] = $0 }
+    }
+
+    func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) {
+        anchors.compactMap { $0 as? ARMeshAnchor }.forEach { meshAnchors[$0.identifier] = $0 }
+    }
+
+    func session(_ session: ARSession, didRemove anchors: [ARAnchor]) {
+        anchors.compactMap { $0 as? ARMeshAnchor }.forEach { meshAnchors.removeValue(forKey: $0.identifier) }
+    }
+
+    func renderer(_ renderer: SCNSceneRenderer, nodeFor anchor: ARAnchor) -> SCNNode? {
+        guard let meshAnchor = anchor as? ARMeshAnchor else { return nil }
+        let node = SCNNode()
+        node.geometry = sceneGeometry(for: meshAnchor)
+        return node
+    }
+
+    func renderer(_ renderer: SCNSceneRenderer, didUpdate node: SCNNode, for anchor: ARAnchor) {
+        guard let meshAnchor = anchor as? ARMeshAnchor else { return }
+        node.geometry = sceneGeometry(for: meshAnchor)
+    }
+
+    private func sceneGeometry(for anchor: ARMeshAnchor) -> SCNGeometry {
+        let mesh = anchor.geometry
+        let vertexSource = SCNGeometrySource(
+            buffer: mesh.vertices.buffer,
+            vertexFormat: mesh.vertices.format,
+            semantic: .vertex,
+            vertexCount: mesh.vertices.count,
+            dataOffset: mesh.vertices.offset,
+            dataStride: mesh.vertices.stride
+        )
+        let faceElement = SCNGeometryElement(
+            buffer: mesh.faces.buffer,
+            primitiveType: .triangles,
+            primitiveCount: mesh.faces.count,
+            bytesPerIndex: mesh.faces.bytesPerIndex
+        )
+        let geometry = SCNGeometry(sources: [vertexSource], elements: [faceElement])
+        let material = SCNMaterial()
+        material.diffuse.contents = UIColor(red: 1.0, green: 0.76, blue: 0.48, alpha: 1)
+        material.transparency = 0.18
+        material.isDoubleSided = true
+        material.fillMode = .lines
+        geometry.materials = [material]
+        return geometry
+    }
+
     private func evaluate(currentPosition: SIMD3<Float>, currentYaw: Float, timestamp: TimeInterval) {
         guard let startPosition = instructionStartPosition, let startYaw = instructionStartYaw else { return }
         let horizontalDelta = SIMD2<Float>(currentPosition.x - startPosition.x, currentPosition.z - startPosition.z)
@@ -545,6 +630,41 @@ final class ScanViewController: UIViewController, ARSessionDelegate {
         capturedFrames.append(captured)
         lastCapturedPosition = position
         lastCapturedYaw = yaw
+        if #available(iOS 17.0, *) {
+            classifyFrame(frame, frameID: frameID, position: position)
+        }
+    }
+
+    @available(iOS 17.0, *)
+    private func classifyFrame(_ frame: ARFrame, frameID: Int, position: SIMD3<Float>) {
+        guard !visionRequestInFlight else { return }
+        visionRequestInFlight = true
+        let pixelBuffer = frame.capturedImage
+        visionQueue.async { [weak self] in
+            guard let self else { return }
+            defer { self.visionRequestInFlight = false }
+            let request = VNClassifyImageRequest()
+            let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
+            try? handler.perform([request])
+            let furnitureKeywords = ["bed", "chair", "couch", "sofa", "table", "desk", "cabinet", "wardrobe", "shelf", "dresser"]
+            guard let observation = request.results?.first(where: { result in
+                furnitureKeywords.contains { result.identifier.lowercased().contains($0) }
+            }) else { return }
+
+            let detected = DetectedObject(
+                label: observation.identifier,
+                confidence: observation.confidence,
+                x: position.x,
+                y: position.y,
+                z: position.z,
+                frameID: frameID,
+                source: "Vision image classification"
+            )
+            DispatchQueue.main.async {
+                guard !self.detectedObjects.contains(where: { $0.label == detected.label && $0.frameID == detected.frameID }) else { return }
+                self.detectedObjects.append(detected)
+            }
+        }
     }
 
     private func writeFrameImage(_ pixelBuffer: CVPixelBuffer, frameID: Int) -> String? {
@@ -568,6 +688,77 @@ final class ScanViewController: UIViewController, ARSessionDelegate {
         } catch {
             return nil
         }
+    }
+
+    private func meshClassificationSummary() -> [String: Int] {
+        var summary: [String: Int] = [:]
+        for anchor in meshAnchors.values {
+            for faceIndex in 0..<anchor.geometry.faces.count {
+                let classification = hasSceneClassification ? anchor.geometry.classificationOf(faceWithIndex: faceIndex) : .none
+                let label = classification.label
+                summary[label, default: 0] += 1
+            }
+        }
+        return summary
+    }
+
+    private func makePLY() -> String? {
+        guard !meshAnchors.isEmpty else { return nil }
+
+        let origin = originTransform.map { position(from: $0) } ?? SIMD3<Float>(repeating: 0)
+        var vertices: [SIMD3<Float>] = []
+        var faces: [(a: Int, b: Int, c: Int, classification: UInt8)] = []
+
+        for anchor in meshAnchors.values.sorted(by: { $0.identifier.uuidString < $1.identifier.uuidString }) {
+            let mesh = anchor.geometry
+            let vertexOffset = vertices.count
+            for vertexIndex in 0..<mesh.vertices.count {
+                let local = vertexPosition(at: vertexIndex, source: mesh.vertices)
+                let world = anchor.transform * SIMD4<Float>(local.x, local.y, local.z, 1)
+                vertices.append(SIMD3<Float>(world.x - origin.x, world.y - origin.y, world.z - origin.z))
+            }
+            for faceIndex in 0..<mesh.faces.count {
+                let indices = triangleIndices(at: faceIndex, element: mesh.faces)
+                let classificationValue = hasSceneClassification ? mesh.classificationOf(faceWithIndex: faceIndex).rawValue : ARMeshClassification.none.rawValue
+                let classification = UInt8(truncatingIfNeeded: classificationValue)
+                faces.append((vertexOffset + indices.0, vertexOffset + indices.1, vertexOffset + indices.2, classification))
+            }
+        }
+
+        guard !vertices.isEmpty, !faces.isEmpty else { return nil }
+        var lines: [String] = []
+        lines.reserveCapacity(vertices.count + faces.count + 15)
+        lines.append("ply")
+        lines.append("format ascii 1.0")
+        lines.append("comment BuildWise SmartScan ARKit classified mesh")
+        lines.append("element vertex \(vertices.count)")
+        lines.append("property float x")
+        lines.append("property float y")
+        lines.append("property float z")
+        lines.append("element face \(faces.count)")
+        lines.append("property list uchar int vertex_indices")
+        lines.append("property uchar classification")
+        lines.append("end_header")
+        vertices.forEach { lines.append(String(format: "%.5f %.5f %.5f", $0.x, $0.y, $0.z)) }
+        faces.forEach { lines.append("3 \($0.a) \($0.b) \($0.c) \($0.classification)") }
+        return lines.joined(separator: "\n")
+    }
+
+    private func vertexPosition(at index: Int, source: ARGeometrySource) -> SIMD3<Float> {
+        let address = source.buffer.contents().advanced(by: source.offset + (index * source.stride))
+        let pointer = address.assumingMemoryBound(to: Float.self)
+        return SIMD3<Float>(pointer[0], pointer[1], pointer[2])
+    }
+
+    private func triangleIndices(at index: Int, element: ARGeometryElement) -> (Int, Int, Int) {
+        let byteOffset = element.offset + (index * element.indexCountPerPrimitive * element.bytesPerIndex)
+        let address = element.buffer.contents().advanced(by: byteOffset)
+        if element.bytesPerIndex == MemoryLayout<UInt16>.size {
+            let pointer = address.assumingMemoryBound(to: UInt16.self)
+            return (Int(pointer[0]), Int(pointer[1]), Int(pointer[2]))
+        }
+        let pointer = address.assumingMemoryBound(to: UInt32.self)
+        return (Int(pointer[0]), Int(pointer[1]), Int(pointer[2]))
     }
 
     private func writeManifest() -> URL? {
@@ -601,7 +792,10 @@ final class ScanViewController: UIViewController, ARSessionDelegate {
             durationSeconds: duration,
             coveragePercent: Int(currentStep.coverage),
             frameCount: capturedFrames.count,
-            frames: exportedFrames
+            frames: exportedFrames,
+            meshPLY: makePLY(),
+            surfaceSummary: meshClassificationSummary(),
+            detectedObjects: detectedObjects
         )
 
         let encoder = JSONEncoder()
@@ -627,8 +821,13 @@ final class ScanViewController: UIViewController, ARSessionDelegate {
         reviewTitleLabel.text = "Room scan is ready"
         reviewDetailLabel.text = manifestURL == nil
             ? "The scan is complete, but the session could not be written to local storage."
-            : "Your keyframes and tracking path are stored locally and ready to share."
-        reviewMetricsLabel.text = "COVERAGE  /  \(Int(currentStep.coverage))%\nFRAMES    /  \(capturedFrames.count) total / \(savedFrames) images\nDURATION  /  \(durationText)"
+            : hasSceneReconstruction
+                ? hasSceneClassification
+                    ? "Your room mesh, classified surfaces, AI observations, and tracking path are stored locally and ready to share."
+                    : "Your room mesh and tracking path are stored locally. Surface classification needs a LiDAR device that supports it."
+                : "Your keyframes and tracking path are stored locally. A LiDAR device is needed for a room mesh."
+        let meshText = hasSceneReconstruction ? "\(meshAnchors.count) chunks" : "not available"
+        reviewMetricsLabel.text = "COVERAGE  /  \(Int(currentStep.coverage))%\nFRAMES    /  \(capturedFrames.count) total / \(savedFrames) images\nROOM MESH /  \(meshText)\nAI OBJECTS /  \(detectedObjects.count) observations\nDURATION  /  \(durationText)"
         shareButton.isEnabled = manifestURL != nil
         shareButton.alpha = manifestURL == nil ? 0.45 : 1
     }
@@ -638,7 +837,11 @@ final class ScanViewController: UIViewController, ARSessionDelegate {
         let color: UIColor
         switch state {
         case .normal:
-            text = isScanning ? "TRACKING / LIVE CAMERA" : "AR WORLD TRACKING READY"
+            if isScanning && hasSceneReconstruction {
+                text = "TRACKING + ROOM MESH / LIVE"
+            } else {
+                text = isScanning ? "TRACKING / LIVE CAMERA" : "AR WORLD TRACKING READY"
+            }
             color = UIColor(red: 0.59, green: 0.85, blue: 0.7, alpha: 1)
         case .limited(let reason):
             text = "TRACKING LIMITED / \(reason.label)"
@@ -697,6 +900,22 @@ final class ScanViewController: UIViewController, ARSessionDelegate {
 
     private func shortestAngle(from: Float, to: Float) -> Float {
         atan2(sin(to - from), cos(to - from))
+    }
+}
+
+private extension ARMeshClassification {
+    var label: String {
+        switch self {
+        case .none: return "unclassified"
+        case .wall: return "wall"
+        case .floor: return "floor"
+        case .ceiling: return "ceiling"
+        case .table: return "table"
+        case .seat: return "seat"
+        case .window: return "window"
+        case .door: return "door"
+        @unknown default: return "other"
+        }
     }
 }
 

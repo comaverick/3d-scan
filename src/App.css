@@ -247,6 +247,11 @@ button:focus-visible { outline: 2px solid var(--accent-hot); outline-offset: 3px
 .color-picker { display: flex; gap: 10px; margin-top: 12px; }
 .color-swatch { width: 24px; height: 24px; border: 2px solid transparent; border-radius: 50%; cursor: pointer; }
 .color-swatch-active { border-color: var(--paper); box-shadow: 0 0 0 3px rgba(255, 194, 124, .2); }
+.surface-materials { margin-top: 23px; padding-top: 18px; border-top: 1px solid var(--line); }
+.surface-materials > .customizer-slider-label { margin-top: 0; }
+.surface-material-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; color: var(--paper-muted); font-size: 12px; }
+.surface-material-row .color-picker { flex: 0 0 auto; gap: 7px; margin-top: 0; }
+.surface-material-row .color-swatch { width: 20px; height: 20px; }
 .room-map-panel { margin-top: 25px; padding-top: 18px; border-top: 1px solid var(--line); }
 .room-map { display: block; width: 100%; height: 170px; margin-top: 13px; border: 1px solid rgba(241, 238, 230, .14); background: repeating-linear-gradient(0deg, transparent 0 24px, rgba(241, 238, 230, .06) 25px), repeating-linear-gradient(90deg, transparent 0 24px, rgba(241, 238, 230, .06) 25px); }
 .room-map rect { fill: none; stroke: rgba(241, 238, 230, .25); stroke-width: 1; }

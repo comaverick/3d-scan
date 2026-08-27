@@ -7,10 +7,16 @@ BuildWise SmartScan is a web-first room capture and customization prototype.
 1. Open the site over HTTPS on a mobile phone. Camera and motion permissions do not work from an insecure phone URL.
 2. Tap **Start scan** and follow the guided movement checkpoints.
 3. The mobile browser captures real JPEG keyframes and records heading, timestamps, and an estimated local movement path.
-4. Finish the scan, open the room customizer, or export the scan as a JSON session.
+4. Finish the scan, open the 3D room viewer, or export the scan as a JSON session.
 5. Open the site on a desktop browser and use **Load scan** to import that JSON session. The captured frames, room footprint, and customization controls are then available on desktop.
 
 The website also works as a desktop review/customization tool without a camera. Desktop users can load a scan exported from a phone.
+
+## Native iOS reconstruction workflow
+
+The native iOS target uses ARKit scene reconstruction on LiDAR-equipped devices. It writes a classified room mesh as ASCII PLY inside the manifest, including wall, floor, ceiling, table, seat, window, and door surface groups. On iOS 17 and newer it also runs Vision image classification on useful frames and exports furniture observations with confidence and approximate camera positions.
+
+Importing that manifest in the website renders the real mesh when `meshPLY` is present. The viewer falls back to the browser-estimated room when the session only contains web camera frames.
 
 ## What is real today
 
@@ -18,11 +24,11 @@ The website also works as a desktop review/customization tool without a camera. 
 - Movement and heading signals advance guidance when the browser grants sensor access.
 - Checkpoint progress is manual when sensors are unavailable; a timer does not fake scan progress.
 - Scan sessions contain embedded images, poses, timestamps, and a version number, so they can move between phone and desktop without a backend.
-- The room customizer can review captured frames, visualize the estimated path, preview furniture assets, change material tone and scale, and show a camera overlay.
+- The 3D room viewer can render an imported classified mesh, review captured frames, visualize the estimated path, preview furniture assets, change room surface materials, and show a camera overlay.
 
 ## Important limitation
 
-Web browsers do not expose ARKit's room-mesh reconstruction across all mobile devices. This prototype creates a reliable capture package for a reconstruction service and provides a camera-overlay customization fallback. Exact wall geometry and world-locked AR placement require either a WebXR-capable device/browser or a backend that reconstructs the room from the exported images.
+Web browsers do not expose ARKit's room-mesh reconstruction across all mobile devices. Use the native iOS target on a LiDAR-equipped iPhone or iPad for the real mesh path. Non-LiDAR devices still produce a useful camera and tracking package, but exact geometry and detailed furniture meshes require depth capture or a reconstruction service.
 
 ## Run locally
 
