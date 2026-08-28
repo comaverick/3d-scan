@@ -31,7 +31,7 @@ test('starts with initial mapping guidance and no target request', async () => {
 
   expect(await screen.findByText('Sweep side to side')).toBeInTheDocument();
   expect(screen.queryByRole('region', { name: /measured scan coverage/i })).not.toBeInTheDocument();
-  expect(screen.queryByLabelText(/initial room mapping overlay/i)).not.toBeInTheDocument();
+  expect(screen.getByLabelText(/initial room mapping overlay/i)).toBeInTheDocument();
   expect(screen.getByLabelText(/real-time measured 3d geometry preview/i)).toBeInTheDocument();
   expect(screen.getByLabelText(/calibrating room/i)).toBeInTheDocument();
   expect(screen.getAllByRole('status').length).toBeGreaterThan(0);

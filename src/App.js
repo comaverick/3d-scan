@@ -3861,7 +3861,7 @@ function App() {
             <video ref={videoRef} className={`camera-video ${cameraState === 'live' ? 'camera-video-live' : ''}`} autoPlay muted playsInline />
             <div className="room-fallback" aria-hidden={cameraState === 'live'}><span>LIVE CAMERA REQUIRED</span></div>
             <div className="camera-shade" />
-            {isScanning && SCANNER_DEBUG && <CoverageOverlay scanState={scanState} />}
+            {isScanning && <CoverageOverlay scanState={scanState} />}
             {isScanning && <LiveRoomMap scanState={scanState} />}
             {SCANNER_TARGET_DEBUG && (
               <>
@@ -5116,7 +5116,7 @@ function SpatialOverlayCanvas({ initialMapping, calibrating, projectedCells, spa
         context.clearRect(0, 0, width, height);
         const source = sourceRef.current;
         if (source.initialMapping) {
-          context.fillStyle = source.calibrating ? 'rgba(30, 110, 255, 0.07)' : 'rgba(30, 110, 255, 0.18)';
+          context.fillStyle = source.calibrating ? 'rgba(30, 110, 255, 0.14)' : 'rgba(30, 110, 255, 0.2)';
           context.fillRect(0, 0, width, height);
         } else {
           const reducedMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
@@ -5134,11 +5134,15 @@ function SpatialOverlayCanvas({ initialMapping, calibrating, projectedCells, spa
             const y = bounds.y * height;
             const cellWidth = bounds.width * width;
             const cellHeight = bounds.height * height;
-            context.fillStyle = `rgba(30, 110, 255, ${opacity.toFixed(3)})`;
+            const centerX = x + (cellWidth / 2);
+            const centerY = y + (cellHeight / 2);
+            const radius = Math.max(cellWidth, cellHeight) * 0.72;
+            const gradient = context.createRadialGradient(centerX, centerY, 0, centerX, centerY, radius);
+            gradient.addColorStop(0, `rgba(30, 110, 255, ${opacity.toFixed(3)})`);
+            gradient.addColorStop(0.68, `rgba(30, 110, 255, ${(opacity * 0.58).toFixed(3)})`);
+            gradient.addColorStop(1, 'rgba(30, 110, 255, 0)');
+            context.fillStyle = gradient;
             context.fillRect(x, y, cellWidth, cellHeight);
-            context.strokeStyle = `rgba(160, 220, 255, ${Math.min(0.3, opacity * 0.58).toFixed(3)})`;
-            context.lineWidth = 1;
-            context.strokeRect(x + 0.5, y + 0.5, Math.max(0, cellWidth - 1), Math.max(0, cellHeight - 1));
           });
           smoothedOpacityRef.current.forEach((value, id) => {
             if (!activeIds.has(id) && value < 0.01) smoothedOpacityRef.current.delete(id);
