@@ -1,11 +1,13 @@
 import ARKit
 import CoreImage
+import CoreVideo
 import SceneKit
 import UIKit
 import Vision
 
 private enum ScanStep {
     case ready
+    case scanning
     case moveForward
     case turnRight
     case scanWall
@@ -17,6 +19,7 @@ private enum ScanStep {
     var title: String {
         switch self {
         case .ready: return "Choose a clear starting view"
+        case .scanning: return "Move slowly around the room"
         case .moveForward: return "Move into the open space"
         case .turnRight: return "Turn toward the next surface"
         case .scanWall: return "Sweep the next visible surface"
@@ -30,6 +33,7 @@ private enum ScanStep {
     var instruction: String {
         switch self {
         case .ready: return "Hold your phone chest-high and aim at a clear wall or corner."
+        case .scanning: return "Walk around the room at a steady pace. Follow the blue dots until they disappear, then add another angle for overlap."
         case .moveForward: return "Walk a few steady steps into the open space. Keep the floor line in view."
         case .turnRight: return "Keep your feet planted and rotate until the next wall or corner is centered."
         case .scanWall: return "Pan across the visible surface slowly. Keep part of the previous view overlapped."
@@ -43,6 +47,7 @@ private enum ScanStep {
     var target: String {
         switch self {
         case .ready: return "Reference view"
+        case .scanning: return "Blue areas to scan"
         case .moveForward: return "Steady movement"
         case .turnRight: return "Overlapping turn"
         case .scanWall: return "Overlapping views"
@@ -56,6 +61,7 @@ private enum ScanStep {
     var coverage: Float {
         switch self {
         case .ready: return 0
+        case .scanning: return 0
         case .moveForward: return 16
         case .turnRight: return 28
         case .scanWall: return 47
@@ -112,10 +118,12 @@ private struct ScanSessionManifest: Codable {
 
 final class ScanViewController: UIViewController, ARSessionDelegate, ARSCNViewDelegate {
     private let sceneView = ARSCNView(frame: .zero)
+    private let coverageOverlay = ScanCoverageOverlayView()
     private let topBar = UIView()
     private let instructionCard = UIView()
     private let brandLabel = UILabel()
     private let trackingLabel = UILabel()
+    private let mapHintLabel = UILabel()
     private let instructionStepLabel = UILabel()
     private let instructionTitleLabel = UILabel()
     private let instructionDetailLabel = UILabel()
@@ -154,6 +162,7 @@ final class ScanViewController: UIViewController, ARSessionDelegate, ARSCNViewDe
     private var visionRequestInFlight = false
     private var hasSceneReconstruction = false
     private var hasSceneClassification = false
+    private var liveDepthCoverage: Float = 0
     private let visionQueue = DispatchQueue(label: "com.buildwise.smartscan.vision", qos: .userInitiated)
 
     override func viewDidLoad() {
@@ -197,6 +206,18 @@ final class ScanViewController: UIViewController, ARSessionDelegate, ARSCNViewDe
             sceneView.bottomAnchor.constraint(equalTo: view.bottomAnchor)
         ])
 
+        coverageOverlay.translatesAutoresizingMaskIntoConstraints = false
+        coverageOverlay.onCoverageChanged = { [weak self] coverage in
+            self?.updateLiveDepthCoverage(coverage)
+        }
+        view.addSubview(coverageOverlay)
+        NSLayoutConstraint.activate([
+            coverageOverlay.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            coverageOverlay.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            coverageOverlay.topAnchor.constraint(equalTo: view.topAnchor),
+            coverageOverlay.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+        ])
+
         reticle.translatesAutoresizingMaskIntoConstraints = false
         reticle.layer.borderColor = UIColor(red: 1.0, green: 0.76, blue: 0.48, alpha: 0.9).cgColor
         reticle.layer.borderWidth = 1
@@ -218,6 +239,16 @@ final class ScanViewController: UIViewController, ARSessionDelegate, ARSCNViewDe
             view.addSubview($0)
         }
         reviewCard.isHidden = true
+        mapHintLabel.translatesAutoresizingMaskIntoConstraints = false
+        mapHintLabel.text = "BLUE DOTS  /  SCAN THIS AREA"
+        mapHintLabel.textColor = UIColor(red: 0.68, green: 0.9, blue: 1, alpha: 1)
+        mapHintLabel.font = UIFont.monospacedSystemFont(ofSize: 10, weight: .bold)
+        mapHintLabel.backgroundColor = UIColor(red: 0.03, green: 0.16, blue: 0.34, alpha: 0.86)
+        mapHintLabel.layer.cornerRadius = 9
+        mapHintLabel.layer.masksToBounds = true
+        mapHintLabel.textAlignment = .center
+        mapHintLabel.isHidden = true
+        view.addSubview(mapHintLabel)
 
         brandLabel.text = "BUILDWISE / SMARTSCAN"
         brandLabel.textColor = .white
@@ -242,6 +273,13 @@ final class ScanViewController: UIViewController, ARSessionDelegate, ARSCNViewDe
             trackingLabel.trailingAnchor.constraint(equalTo: topBar.trailingAnchor, constant: -14),
             trackingLabel.centerYAnchor.constraint(equalTo: topBar.centerYAnchor),
             trackingLabel.leadingAnchor.constraint(greaterThanOrEqualTo: brandLabel.trailingAnchor, constant: 12)
+        ])
+
+        NSLayoutConstraint.activate([
+            mapHintLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 20),
+            mapHintLabel.topAnchor.constraint(equalTo: topBar.bottomAnchor, constant: 8),
+            mapHintLabel.heightAnchor.constraint(equalToConstant: 28),
+            mapHintLabel.widthAnchor.constraint(equalToConstant: 220)
         ])
 
         instructionCard.addSubview(instructionStepLabel)
@@ -408,6 +446,11 @@ final class ScanViewController: UIViewController, ARSessionDelegate, ARSCNViewDe
         } else if hasSceneReconstruction {
             configuration.sceneReconstruction = .mesh
         }
+        if ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth) {
+            configuration.frameSemantics.insert(.smoothedSceneDepth)
+        } else if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
+            configuration.frameSemantics.insert(.sceneDepth)
+        }
         sceneView.session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
 
         isScanning = true
@@ -421,6 +464,13 @@ final class ScanViewController: UIViewController, ARSessionDelegate, ARSCNViewDe
         meshAnchors.removeAll(keepingCapacity: true)
         detectedObjects.removeAll(keepingCapacity: true)
         visionRequestInFlight = false
+        liveDepthCoverage = 0
+        coverageOverlay.reset()
+        coverageOverlay.isHidden = !hasSceneReconstruction
+        mapHintLabel.isHidden = false
+        mapHintLabel.text = hasSceneReconstruction
+            ? "BLUE DOTS  /  SCAN THIS AREA"
+            : "CAMERA TRACKING  /  LIVE MESH NEEDS LIDAR"
         beginSession()
         stepStartFrameCount = 0
         stepStartTime = 0
@@ -430,8 +480,11 @@ final class ScanViewController: UIViewController, ARSessionDelegate, ARSCNViewDe
     }
 
     @objc private func finishScan() {
-        guard currentStep == .complete else { return }
+        guard isScanning, capturedFrames.count >= 3 else { return }
         isScanning = false
+        coverageOverlay.reset()
+        coverageOverlay.isHidden = true
+        mapHintLabel.isHidden = true
         sceneView.session.pause()
         manifestURL = writeManifest()
         trackingLabel.text = manifestURL == nil
@@ -489,11 +542,15 @@ final class ScanViewController: UIViewController, ARSessionDelegate, ARSCNViewDe
 
         guard isScanning, case .normal = camera.trackingState else { return }
 
+        if hasSceneReconstruction {
+            coverageOverlay.update(frame: frame, viewportSize: sceneView.bounds.size)
+        }
+
         if originTransform == nil {
             originTransform = camera.transform
             instructionStartPosition = currentPosition
             instructionStartYaw = currentYaw
-            currentStep = .moveForward
+            currentStep = .scanning
             stepStartTime = frame.timestamp
             updateInterface()
             return
@@ -510,14 +567,17 @@ final class ScanViewController: UIViewController, ARSessionDelegate, ARSCNViewDe
 
     func session(_ session: ARSession, didAdd anchors: [ARAnchor]) {
         anchors.compactMap { $0 as? ARMeshAnchor }.forEach { meshAnchors[$0.identifier] = $0 }
+        updateLiveMeshStatus()
     }
 
     func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) {
         anchors.compactMap { $0 as? ARMeshAnchor }.forEach { meshAnchors[$0.identifier] = $0 }
+        updateLiveMeshStatus()
     }
 
     func session(_ session: ARSession, didRemove anchors: [ARAnchor]) {
         anchors.compactMap { $0 as? ARMeshAnchor }.forEach { meshAnchors.removeValue(forKey: $0.identifier) }
+        updateLiveMeshStatus()
     }
 
     func renderer(_ renderer: SCNSceneRenderer, nodeFor anchor: ARAnchor) -> SCNNode? {
@@ -550,12 +610,37 @@ final class ScanViewController: UIViewController, ARSessionDelegate, ARSCNViewDe
         )
         let geometry = SCNGeometry(sources: [vertexSource], elements: [faceElement])
         let material = SCNMaterial()
-        material.diffuse.contents = UIColor(red: 1.0, green: 0.76, blue: 0.48, alpha: 1)
-        material.transparency = 0.18
+        material.diffuse.contents = UIColor(red: 0.76, green: 0.94, blue: 1.0, alpha: 1)
+        material.emission.contents = UIColor(red: 0.18, green: 0.56, blue: 0.86, alpha: 1)
+        material.transparency = 0.24
         material.isDoubleSided = true
-        material.fillMode = .lines
+        material.fillMode = .fill
+        material.writesToDepthBuffer = false
         geometry.materials = [material]
         return geometry
+    }
+
+    private func updateLiveDepthCoverage(_ coverage: Float) {
+        let clampedCoverage = max(0, min(coverage, 1))
+        DispatchQueue.main.async {
+            guard self.isScanning else { return }
+            self.liveDepthCoverage = clampedCoverage
+            self.coverageLabel.text = "CURRENT VIEW  /  \(Int(clampedCoverage * 100))% MAPPED"
+            self.coverageProgress.setProgress(clampedCoverage, animated: true)
+            self.mapHintLabel.text = clampedCoverage < 0.72
+                ? "BLUE DOTS  /  SCAN THIS AREA"
+                : "KEEP MOVING  /  ADD OVERLAP"
+        }
+    }
+
+    private func updateLiveMeshStatus() {
+        let chunkCount = meshAnchors.count
+        DispatchQueue.main.async {
+            guard self.isScanning else { return }
+            if self.hasSceneReconstruction {
+                self.trackingLabel.text = "TRACKING + LIVE MESH  /  \(chunkCount) CHUNKS"
+            }
+        }
     }
 
     private func evaluate(currentPosition: SIMD3<Float>, currentYaw: Float, timestamp: TimeInterval) {
@@ -589,7 +674,7 @@ final class ScanViewController: UIViewController, ARSessionDelegate, ARSCNViewDe
             let distance = simd_distance(currentPosition, originPosition)
             updateStepProgress(1 - min(distance / 0.8, 1))
             if distance <= 0.25 { moveTo(.complete, position: currentPosition, yaw: currentYaw, timestamp: timestamp) }
-        case .ready, .complete:
+        case .ready, .scanning, .complete:
             break
         }
     }
@@ -630,6 +715,7 @@ final class ScanViewController: UIViewController, ARSessionDelegate, ARSCNViewDe
         capturedFrames.append(captured)
         lastCapturedPosition = position
         lastCapturedYaw = yaw
+        updateInterface()
         if #available(iOS 17.0, *) {
             classifyFrame(frame, frameID: frameID, position: position)
         }
@@ -790,7 +876,7 @@ final class ScanViewController: UIViewController, ARSessionDelegate, ARSCNViewDe
             origin: originPosition,
             createdAt: sessionStartedAt ?? Date(),
             durationSeconds: duration,
-            coveragePercent: Int(currentStep.coverage),
+            coveragePercent: Int(max(currentStep.coverage, liveDepthCoverage * 100)),
             frameCount: capturedFrames.count,
             frames: exportedFrames,
             meshPLY: makePLY(),
@@ -827,7 +913,8 @@ final class ScanViewController: UIViewController, ARSessionDelegate, ARSCNViewDe
                     : "Your room mesh and tracking path are stored locally. Surface classification needs a LiDAR device that supports it."
                 : "Your keyframes and tracking path are stored locally. A LiDAR device is needed for a room mesh."
         let meshText = hasSceneReconstruction ? "\(meshAnchors.count) chunks" : "not available"
-        reviewMetricsLabel.text = "COVERAGE  /  \(Int(currentStep.coverage))%\nFRAMES    /  \(capturedFrames.count) total / \(savedFrames) images\nROOM MESH /  \(meshText)\nAI OBJECTS /  \(detectedObjects.count) observations\nDURATION  /  \(durationText)"
+        let coveragePercent = Int(max(currentStep.coverage, liveDepthCoverage * 100))
+        reviewMetricsLabel.text = "COVERAGE  /  \(coveragePercent)%\nFRAMES    /  \(capturedFrames.count) total / \(savedFrames) images\nROOM MESH /  \(meshText)\nAI OBJECTS /  \(detectedObjects.count) observations\nDURATION  /  \(durationText)"
         shareButton.isEnabled = manifestURL != nil
         shareButton.alpha = manifestURL == nil ? 0.45 : 1
     }
@@ -858,14 +945,18 @@ final class ScanViewController: UIViewController, ARSessionDelegate, ARSCNViewDe
 
     private func updateInterface() {
         DispatchQueue.main.async {
-            self.instructionStepLabel.text = self.currentStep == .complete ? "SCAN COMPLETE" : "GUIDED SMARTSCAN"
+            self.instructionStepLabel.text = self.currentStep == .complete ? "SCAN COMPLETE" : self.isScanning ? "LIVE SMARTSCAN" : "GUIDED SMARTSCAN"
             self.instructionTitleLabel.text = self.currentStep.title
             self.instructionDetailLabel.text = self.currentStep.instruction
             self.targetLabel.text = "TARGET  /  \(self.currentStep.target)"
-            self.coverageLabel.text = "\(Int(self.currentStep.coverage))% COVERAGE"
-            self.coverageProgress.setProgress(self.currentStep.coverage / 100, animated: true)
+            if !self.isScanning || self.liveDepthCoverage == 0 {
+                self.coverageLabel.text = "\(Int(self.currentStep.coverage))% COVERAGE"
+                self.coverageProgress.setProgress(self.currentStep.coverage / 100, animated: true)
+            }
             self.startButton.isHidden = self.isScanning
-            self.finishButton.isHidden = self.currentStep != .complete
+            self.finishButton.isHidden = !self.isScanning && self.currentStep != .complete
+            self.finishButton.isEnabled = self.isScanning ? self.capturedFrames.count >= 3 : self.currentStep == .complete
+            self.finishButton.alpha = self.finishButton.isEnabled ? 1 : 0.45
         }
     }
 
@@ -900,6 +991,155 @@ final class ScanViewController: UIViewController, ARSessionDelegate, ARSCNViewDe
 
     private func shortestAngle(from: Float, to: Float) -> Float {
         atan2(sin(to - from), cos(to - from))
+    }
+}
+
+private final class ScanCoverageOverlayView: UIView {
+    private struct Dot {
+        let point: CGPoint
+        let mapped: Bool
+        let confidence: CGFloat
+        let column: Int
+        let row: Int
+    }
+
+    private let columns = 12
+    private let rows = 18
+    private var dots: [Dot] = []
+    private var lastFrameTimestamp: TimeInterval = 0
+
+    private(set) var mappedFraction: Float = 0
+    var onCoverageChanged: ((Float) -> Void)?
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        isUserInteractionEnabled = false
+        backgroundColor = .clear
+        accessibilityLabel = "Blue dots show areas that still need to be scanned"
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        isUserInteractionEnabled = false
+        backgroundColor = .clear
+    }
+
+    func reset() {
+        dots.removeAll(keepingCapacity: true)
+        mappedFraction = 0
+        lastFrameTimestamp = 0
+        setNeedsDisplay()
+    }
+
+    func update(frame: ARFrame, viewportSize: CGSize) {
+        guard viewportSize.width > 0, viewportSize.height > 0 else { return }
+        guard frame.timestamp - lastFrameTimestamp >= 0.1 else { return }
+        lastFrameTimestamp = frame.timestamp
+
+        guard let depthData = frame.smoothedSceneDepth ?? frame.sceneDepth else {
+            publish(dots: makeFallbackDots(in: viewportSize), mappedFraction: 0)
+            return
+        }
+
+        let depthMap = depthData.depthMap
+        CVPixelBufferLockBaseAddress(depthMap, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
+        guard let baseAddress = CVPixelBufferGetBaseAddress(depthMap) else {
+            publish(dots: makeFallbackDots(in: viewportSize), mappedFraction: 0)
+            return
+        }
+
+        let depthWidth = CVPixelBufferGetWidth(depthMap)
+        let depthHeight = CVPixelBufferGetHeight(depthMap)
+        let depthStride = CVPixelBufferGetBytesPerRow(depthMap) / MemoryLayout<Float32>.stride
+        let depthValues = baseAddress.assumingMemoryBound(to: Float32.self)
+        let inverseDisplayTransform = frame
+            .displayTransform(for: .portrait, viewportSize: viewportSize)
+            .inverted()
+        var nextDots: [Dot] = []
+        nextDots.reserveCapacity(columns * rows)
+        var mappedCount = 0
+
+        for row in 0..<rows {
+            for column in 0..<columns {
+                let screenX = (CGFloat(column) + 0.5) / CGFloat(columns)
+                let screenY = (CGFloat(row) + 0.5) / CGFloat(rows)
+                let imagePoint = CGPoint(x: screenX, y: screenY).applying(inverseDisplayTransform)
+                let normalizedX = max(0, min(1, imagePoint.x))
+                let normalizedY = max(0, min(1, imagePoint.y))
+                let pixelX = min(depthWidth - 1, max(0, Int(normalizedX * CGFloat(depthWidth - 1))))
+                let pixelY = min(depthHeight - 1, max(0, Int(normalizedY * CGFloat(depthHeight - 1))))
+                let depth = depthValues[(pixelY * depthStride) + pixelX]
+                let hasDepth = depth.isFinite && depth > 0.08 && depth < 8
+                if hasDepth { mappedCount += 1 }
+                nextDots.append(Dot(
+                    point: CGPoint(x: screenX * viewportSize.width, y: screenY * viewportSize.height),
+                    mapped: hasDepth,
+                    confidence: hasDepth ? CGFloat(max(0.18, min(1, 1 - (depth / 8)))) : 1,
+                    column: column,
+                    row: row
+                ))
+            }
+        }
+
+        publish(dots: nextDots, mappedFraction: Float(mappedCount) / Float(columns * rows))
+    }
+
+    override func draw(_ rect: CGRect) {
+        guard let context = UIGraphicsGetCurrentContext(), !dots.isEmpty else { return }
+        context.saveGState()
+
+        let blue = UIColor(red: 0.08, green: 0.48, blue: 1.0, alpha: 1)
+        let lineColor = blue.withAlphaComponent(0.18).cgColor
+        context.setStrokeColor(lineColor)
+        context.setLineWidth(0.7)
+
+        let dotLookup = Dictionary(uniqueKeysWithValues: dots.map { ("\($0.column)-\($0.row)", $0) })
+        for dot in dots where !dot.mapped {
+            let radius = 2.2 + (dot.confidence * 0.9)
+            context.setFillColor(blue.withAlphaComponent(0.42 + (dot.confidence * 0.3)).cgColor)
+            context.fillEllipse(in: CGRect(x: dot.point.x - radius, y: dot.point.y - radius, width: radius * 2, height: radius * 2))
+
+            if let right = dotLookup["\(dot.column + 1)-\(dot.row)"], !right.mapped {
+                context.move(to: dot.point)
+                context.addLine(to: right.point)
+                context.strokePath()
+            }
+            if let below = dotLookup["\(dot.column)-\(dot.row + 1)"], !below.mapped {
+                context.move(to: dot.point)
+                context.addLine(to: below.point)
+                context.strokePath()
+            }
+        }
+
+        context.restoreGState()
+    }
+
+    private func makeFallbackDots(in viewportSize: CGSize) -> [Dot] {
+        (0..<rows).flatMap { row in
+            (0..<columns).map { column in
+                Dot(
+                    point: CGPoint(
+                        x: ((CGFloat(column) + 0.5) / CGFloat(columns)) * viewportSize.width,
+                        y: ((CGFloat(row) + 0.5) / CGFloat(rows)) * viewportSize.height
+                    ),
+                    mapped: false,
+                    confidence: 1,
+                    column: column,
+                    row: row
+                )
+            }
+        }
+    }
+
+    private func publish(dots: [Dot], mappedFraction: Float) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.dots = dots
+            self.mappedFraction = mappedFraction
+            self.onCoverageChanged?(mappedFraction)
+            self.setNeedsDisplay()
+        }
     }
 }
 
