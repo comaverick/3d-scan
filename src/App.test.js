@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import App, { advanceScannerCalibration, blueCoverageOpacity, canManuallyFinishScan, calculateScanProgress, calculateScanReadiness, chooseGuidancePlacement, compactGuidanceFor, continuousScanInstructionFor, countFeaturesInRegion, coverageOverlayRegionsFor, createCameraDisplayTransform, createDirectionalCoverageGrid, createGuidanceController, createInitialScanState, createScannerCalibrationState, determineNextAction, distinctViewpointsFromFrames, estimateSupportedPlanes, friendlyReconstructionError, isTargetStalled, normalizedToDisplay, ProcessingScreen, projectDirectionalCoverageCells, reconstructionProgressSteps, reconstructionStatusLabel, recordFrameEvaluation, SCANNER_MAPPING_STAGES, selectReconstructionKeyframes, stabilizeScanProgress, structuralEdgesFromPlanes, summarizeDirectionalCoverage, targetPriorityForScan, triangulateSparsePoints, updateCoverageFromFrame, updateDirectionalCoverageGrid, updateFeatureTracks, validateTargetGeometry, viewpointNovelty } from './App';
 
 const goodAnalysis = {
@@ -26,14 +26,15 @@ test('renders the SmartScan starting state', () => {
 });
 
 test('starts with initial mapping guidance and no target request', async () => {
-  const { container } = render(<App />);
+  render(<App />);
   fireEvent.click(screen.getByRole('button', { name: /start scan/i }));
 
-  await waitFor(() => expect(screen.getByText('Sweep side to side')).toBeInTheDocument());
+  expect(await screen.findByText('Sweep side to side')).toBeInTheDocument();
   expect(screen.queryByRole('region', { name: /measured scan coverage/i })).not.toBeInTheDocument();
-  expect(container.querySelector('.scanner-spatial-overlay')).toBeInTheDocument();
-  expect(container.querySelector('.scanner-live-hud')).toBeInTheDocument();
-  expect(container.querySelector('.scanner-compact-guidance')).toBeInTheDocument();
+  expect(screen.queryByLabelText(/initial room mapping overlay/i)).not.toBeInTheDocument();
+  expect(screen.getByLabelText(/real-time measured 3d geometry preview/i)).toBeInTheDocument();
+  expect(screen.getByLabelText(/calibrating room/i)).toBeInTheDocument();
+  expect(screen.getAllByRole('status').length).toBeGreaterThan(0);
   expect(screen.getByRole('button', { name: /pause scan/i })).toBeInTheDocument();
   expect(screen.queryByText(/left ceiling|right ceiling|upper wall/i)).not.toBeInTheDocument();
 });

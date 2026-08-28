@@ -3861,7 +3861,7 @@ function App() {
             <video ref={videoRef} className={`camera-video ${cameraState === 'live' ? 'camera-video-live' : ''}`} autoPlay muted playsInline />
             <div className="room-fallback" aria-hidden={cameraState === 'live'}><span>LIVE CAMERA REQUIRED</span></div>
             <div className="camera-shade" />
-            {isScanning && <CoverageOverlay scanState={scanState} />}
+            {isScanning && SCANNER_DEBUG && <CoverageOverlay scanState={scanState} />}
             {isScanning && <LiveRoomMap scanState={scanState} />}
             {SCANNER_TARGET_DEBUG && (
               <>
@@ -4787,6 +4787,8 @@ function LiveRoomMap({ scanState }) {
   const sparsePointCount = Array.isArray(scanState?.sparsePoints)
     ? scanState.sparsePoints.length
     : Array.isArray(scanState?.liveMap?.sparsePoints) ? scanState.liveMap.sparsePoints.length : 0;
+  const cameraPathCount = Array.isArray(scanState?.liveMap?.cameraPath) ? scanState.liveMap.cameraPath.length : 0;
+  const measuredGeometryCount = sparsePointCount + cameraPathCount;
   const mapStatus = scanState?.mappingStage === SCANNER_MAPPING_STAGES.CALIBRATING
     ? 'Calibrating room'
     : isInitialTrackingPhase(scanState?.phase) && scanState?.mappingStage !== SCANNER_MAPPING_STAGES.MAPPING
@@ -4809,57 +4811,19 @@ function LiveRoomMap({ scanState }) {
     let disposed = false;
     let animationFrame = 0;
     let lastMapSignature = '';
-    let mapProjector = (point) => new THREE.Vector3(Number(point?.x) || 0, 0.16, Number(point?.z) || 0);
+    let mapProjector = (point) => new THREE.Vector3(Number(point?.x) || 0, Number(point?.y) || 0, Number(point?.z) || 0);
     const scene = new THREE.Scene();
     const camera = new THREE.PerspectiveCamera(38, 1, 0.1, 30);
     const mapRoot = new THREE.Group();
-    const tileRoot = new THREE.Group();
     const geometryRoot = new THREE.Group();
     const cameraRoot = new THREE.Group();
-    mapRoot.add(tileRoot, geometryRoot, cameraRoot);
+    mapRoot.add(geometryRoot, cameraRoot);
     scene.add(mapRoot);
 
     renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
-    renderer.setClearColor(0x061223, 0.96);
+    renderer.setClearColor(0x071018, 0.98);
 
-    const roomSize = 6.4;
-    const roomHeight = 2.7;
-    const halfRoom = roomSize / 2;
-    const shellMaterial = new THREE.MeshBasicMaterial({
-      color: 0x1e6eff,
-      transparent: true,
-      opacity: 0.1,
-      side: THREE.DoubleSide,
-      depthWrite: false,
-    });
-    const floor = new THREE.Mesh(new THREE.PlaneGeometry(roomSize, roomSize), shellMaterial);
-    floor.rotation.x = -Math.PI / 2;
-    floor.position.y = 0.02;
-    mapRoot.add(floor);
-    [
-      { position: [0, roomHeight / 2, -halfRoom], rotation: [0, 0, 0] },
-      { position: [-halfRoom, roomHeight / 2, 0], rotation: [0, Math.PI / 2, 0] },
-      { position: [halfRoom, roomHeight / 2, 0], rotation: [0, -Math.PI / 2, 0] },
-    ].forEach((wall) => {
-      const mesh = new THREE.Mesh(new THREE.PlaneGeometry(roomSize, roomHeight), shellMaterial.clone());
-      mesh.position.set(...wall.position);
-      mesh.rotation.set(...wall.rotation);
-      mapRoot.add(mesh);
-    });
-    const grid = new THREE.GridHelper(roomSize, 16, 0x7ad5ff, 0x194975);
-    grid.position.y = 0.04;
-    grid.material.transparent = true;
-    grid.material.opacity = 0.32;
-    grid.material.depthWrite = false;
-    mapRoot.add(grid);
-    const roomOutline = new THREE.LineSegments(
-      new THREE.EdgesGeometry(new THREE.BoxGeometry(roomSize, roomHeight, roomSize)),
-      new THREE.LineBasicMaterial({ color: 0x8bdcff, transparent: true, opacity: 0.58 }),
-    );
-    roomOutline.position.y = roomHeight / 2;
-    mapRoot.add(roomOutline);
-
-    const target = new THREE.Vector3(0, 1.1, 0);
+    const target = new THREE.Vector3(0, 0, 0);
     const orbit = { azimuth: 0.65, elevation: 0.62, distance: 8.5 };
     const pointer = { active: false, x: 0, y: 0 };
     const updateCamera = () => {
@@ -4911,17 +4875,16 @@ function LiveRoomMap({ scanState }) {
 
     const rawMapPoint = (point, mapBounds) => {
       const x = Number(point?.x) || 0;
+      const y = Number(point?.y) || 0;
       const z = Number(point?.z) || 0;
-      const y = Number(point?.y);
       return new THREE.Vector3(
         (x - mapBounds.centerX) * mapBounds.scale,
-        Number.isFinite(y) ? clamp(y - 0.25, 0.12, roomHeight - 0.12) : 0.16,
+        (y - mapBounds.centerY) * mapBounds.scale,
         (z - mapBounds.centerZ) * mapBounds.scale,
       );
     };
 
     const rebuildMap = (state) => {
-      clearDynamicRoot(tileRoot);
       clearDynamicRoot(geometryRoot);
       clearDynamicRoot(cameraRoot);
 
@@ -4929,95 +4892,94 @@ function LiveRoomMap({ scanState }) {
       const sparsePoints = Array.isArray(state?.sparsePoints)
         ? state.sparsePoints
         : Array.isArray(state?.liveMap?.sparsePoints) ? state.liveMap.sparsePoints : [];
+      const cameraPose = state?.cameraPose || state?.mapping?.keyframes?.[state.mapping.keyframes.length - 1]?.pose;
       const rawGeometryPoints = [
         ...path,
         ...sparsePoints.map((point) => point.estimatedPosition).filter(Boolean),
+        ...(cameraPose ? [cameraPose] : []),
       ];
       const bounds = rawGeometryPoints.length > 0
         ? rawGeometryPoints.reduce((result, point) => ({
           minX: Math.min(result.minX, Number(point.x) || 0),
           maxX: Math.max(result.maxX, Number(point.x) || 0),
+          minY: Math.min(result.minY, Number(point.y) || 0),
+          maxY: Math.max(result.maxY, Number(point.y) || 0),
           minZ: Math.min(result.minZ, Number(point.z) || 0),
           maxZ: Math.max(result.maxZ, Number(point.z) || 0),
-        }), { minX: Infinity, maxX: -Infinity, minZ: Infinity, maxZ: -Infinity })
-        : { minX: -1, maxX: 1, minZ: -1, maxZ: 1 };
-      const span = Math.max(2.8, bounds.maxX - bounds.minX, bounds.maxZ - bounds.minZ);
+        }), { minX: Infinity, maxX: -Infinity, minY: Infinity, maxY: -Infinity, minZ: Infinity, maxZ: -Infinity })
+        : { minX: -1, maxX: 1, minY: -1, maxY: 1, minZ: -1, maxZ: 1 };
+      const span = Math.max(2.8, bounds.maxX - bounds.minX, bounds.maxY - bounds.minY, bounds.maxZ - bounds.minZ);
       const mapBounds = {
         centerX: (bounds.minX + bounds.maxX) / 2,
+        centerY: (bounds.minY + bounds.maxY) / 2,
         centerZ: (bounds.minZ + bounds.maxZ) / 2,
         scale: Math.min(1.65, 4.7 / span),
       };
       mapProjector = (point) => rawMapPoint(point, mapBounds);
 
-      const cells = Array.isArray(state?.directionalCells) && state.directionalCells.length > 0
-        ? state.directionalCells
-        : createDirectionalCoverageGrid(Number(state?.mapping?.keyframes?.[0]?.orientation?.heading) || 0);
-      const bandHeights = { upper: 2.15, middle: 1.35, lower: 0.55 };
-      const bandSizes = { upper: 0.48, middle: 0.58, lower: 0.48 };
-      cells.forEach((cell) => {
-        const yaw = ((Number(cell.yaw) || 0) * Math.PI) / 180;
-        const directionX = Math.sin(yaw);
-        const directionZ = -Math.cos(yaw);
-        const perimeterScale = halfRoom / Math.max(Math.abs(directionX), Math.abs(directionZ), 0.001);
-        const coverage = clamp(Number(cell.coverage) || 0, 0, 1);
-        const mapped = cell.status === 'SUFFICIENT' || coverage >= 0.78;
-        const material = new THREE.MeshBasicMaterial({
-          color: mapped ? 0x9bd8b1 : 0x1e6eff,
-          transparent: true,
-          opacity: mapped ? 0.15 : 0.18 + ((1 - coverage) * 0.34),
-          side: THREE.DoubleSide,
-          depthWrite: false,
-        });
-        const tile = new THREE.Mesh(
-          new THREE.BoxGeometry(Math.max(0.5, (Math.PI * roomSize / 18) * 0.76), bandSizes[cell.band] || 0.5, 0.045),
-          material,
-        );
-        tile.position.set(directionX * perimeterScale, bandHeights[cell.band] || 1.35, directionZ * perimeterScale);
-        tile.rotation.y = yaw;
-        tileRoot.add(tile);
-      });
-
-      const pathPoints = path.map((point) => mapProjector(point).setY(0.09));
+      const pathPoints = path.map((point) => mapProjector(point));
       if (pathPoints.length > 1) {
         geometryRoot.add(new THREE.Line(
           new THREE.BufferGeometry().setFromPoints(pathPoints),
-          new THREE.LineBasicMaterial({ color: 0xffc27c, transparent: true, opacity: 0.95 }),
+          new THREE.LineBasicMaterial({ color: 0xffc27c, transparent: true, opacity: 0.88 }),
         ));
       }
-      pathPoints.forEach((point) => {
-        const node = new THREE.Mesh(
-          new THREE.SphereGeometry(0.055, 8, 6),
-          new THREE.MeshBasicMaterial({ color: 0xffc27c }),
-        );
-        node.position.copy(point);
-        geometryRoot.add(node);
-      });
+      if (pathPoints.length > 0) {
+        geometryRoot.add(new THREE.Points(
+          new THREE.BufferGeometry().setFromPoints(pathPoints),
+          new THREE.PointsMaterial({ color: 0xffc27c, size: 0.1, transparent: true, opacity: 0.95, sizeAttenuation: true }),
+        ));
+      }
 
-      const pointPositions = sparsePoints
+      const measuredPoints = sparsePoints
         .filter((point) => point?.estimatedPosition && (Number(point.confidence) || 0) >= 0.35)
-        .slice(0, 700)
-        .map((point) => mapProjector(point.estimatedPosition));
-      if (pointPositions.length > 0) {
-        const pointGeometry = new THREE.BufferGeometry().setFromPoints(pointPositions);
+        .slice(0, 700);
+      if (measuredPoints.length > 0) {
+        const pointPositions = [];
+        const pointColors = [];
+        const lowConfidenceColor = new THREE.Color(0x718996);
+        const highConfidenceColor = new THREE.Color(0xb8efd0);
+        measuredPoints.forEach((point) => {
+          const projected = mapProjector(point.estimatedPosition);
+          const confidence = clamp(Number(point.confidence) || 0, 0, 1);
+          const color = lowConfidenceColor.clone().lerp(highConfidenceColor, confidence);
+          pointPositions.push(projected.x, projected.y, projected.z);
+          pointColors.push(color.r, color.g, color.b);
+        });
+        const pointGeometry = new THREE.BufferGeometry();
+        pointGeometry.setAttribute('position', new THREE.Float32BufferAttribute(pointPositions, 3));
+        pointGeometry.setAttribute('color', new THREE.Float32BufferAttribute(pointColors, 3));
         geometryRoot.add(new THREE.Points(
           pointGeometry,
-          new THREE.PointsMaterial({ color: 0xd8f7ff, size: 0.07, transparent: true, opacity: 0.92, sizeAttenuation: true }),
+          new THREE.PointsMaterial({ vertexColors: true, size: 0.085, transparent: true, opacity: 0.94, sizeAttenuation: true }),
         ));
       }
 
       const structuralEdges = Array.isArray(state?.liveMap?.structuralEdges) ? state.liveMap.structuralEdges : [];
       const edgePoints = structuralEdges.flatMap((edge) => {
         if (!edge?.point || !edge?.direction) return [];
-        const spanLength = 1.25;
+        const sourcePointIds = new Set(edge.sourcePointIds || []);
+        const supportingPoints = sparsePoints
+          .filter((point) => sourcePointIds.has(point.id) && point.estimatedPosition)
+          .map((point) => point.estimatedPosition);
+        if (supportingPoints.length < 2) return [];
+        const extents = supportingPoints.map((point) => (
+          ((Number(point.x) || 0) - (Number(edge.point.x) || 0)) * (Number(edge.direction.x) || 0)
+          + ((Number(point.y) || 0) - (Number(edge.point.y) || 0)) * (Number(edge.direction.y) || 0)
+          + ((Number(point.z) || 0) - (Number(edge.point.z) || 0)) * (Number(edge.direction.z) || 0)
+        ));
+        const firstDistance = Math.min(...extents);
+        const secondDistance = Math.max(...extents);
+        if (!Number.isFinite(firstDistance) || !Number.isFinite(secondDistance) || secondDistance - firstDistance < 0.12) return [];
         const first = {
-          x: edge.point.x - (edge.direction.x * spanLength),
-          y: edge.point.y - (edge.direction.y * spanLength),
-          z: edge.point.z - (edge.direction.z * spanLength),
+          x: edge.point.x + (edge.direction.x * firstDistance),
+          y: edge.point.y + (edge.direction.y * firstDistance),
+          z: edge.point.z + (edge.direction.z * firstDistance),
         };
         const second = {
-          x: edge.point.x + (edge.direction.x * spanLength),
-          y: edge.point.y + (edge.direction.y * spanLength),
-          z: edge.point.z + (edge.direction.z * spanLength),
+          x: edge.point.x + (edge.direction.x * secondDistance),
+          y: edge.point.y + (edge.direction.y * secondDistance),
+          z: edge.point.z + (edge.direction.z * secondDistance),
         };
         return [mapProjector(first), mapProjector(second)];
       });
@@ -5028,21 +4990,22 @@ function LiveRoomMap({ scanState }) {
         ));
       }
 
-      const cameraPose = state?.cameraPose || state?.mapping?.keyframes?.[state.mapping.keyframes.length - 1]?.pose;
       if (cameraPose) {
         const cameraMarker = new THREE.Mesh(
           new THREE.ConeGeometry(0.16, 0.34, 8),
           new THREE.MeshBasicMaterial({ color: 0x9bd8b1 }),
         );
-        cameraMarker.position.copy(mapProjector(cameraPose).setY(0.25));
-        cameraMarker.rotation.x = Math.PI / 2;
+        const cameraPoint = mapProjector(cameraPose);
+        cameraMarker.position.copy(cameraPoint);
+        cameraMarker.rotation.x = -Math.PI / 2;
+        cameraMarker.rotation.y = ((Number(state?.currentOrientation?.heading) || 0) * Math.PI) / 180;
         cameraRoot.add(cameraMarker);
         const halo = new THREE.Mesh(
           new THREE.RingGeometry(0.2, 0.23, 24),
           new THREE.MeshBasicMaterial({ color: 0x9bd8b1, transparent: true, opacity: 0.75, side: THREE.DoubleSide }),
         );
         halo.rotation.x = -Math.PI / 2;
-        halo.position.copy(mapProjector(cameraPose).setY(0.08));
+        halo.position.copy(cameraPoint);
         cameraRoot.add(halo);
       }
     };
@@ -5061,16 +5024,17 @@ function LiveRoomMap({ scanState }) {
     const draw = () => {
       if (disposed) return;
       const state = sourceRef.current || {};
-      const directionalCells = Array.isArray(state.directionalCells) ? state.directionalCells : [];
-      const directionalCoverage = directionalCells.reduce((sum, cell) => sum + (Number(cell.coverage) || 0), 0);
       const signature = [
         state.phase,
+        state.mappingStage,
         state.acceptedFrames,
         state.liveMap?.cameraPath?.length || 0,
         state.sparsePoints?.length || state.liveMap?.sparsePoints?.length || 0,
-        Math.round(directionalCoverage * 100),
+        state.liveMap?.structuralEdges?.length || 0,
         Math.round((Number(state.cameraPose?.x) || 0) * 20),
+        Math.round((Number(state.cameraPose?.y) || 0) * 20),
         Math.round((Number(state.cameraPose?.z) || 0) * 20),
+        Math.round((Number(state.currentOrientation?.heading) || 0) / 4),
       ].join('|');
       if (signature !== lastMapSignature) {
         rebuildMap(state);
@@ -5101,16 +5065,24 @@ function LiveRoomMap({ scanState }) {
     <div className="live-room-map" ref={viewportRef}>
       <div className="live-room-map-heading">
         <div>
-          <span className="live-room-map-kicker"><span className="live-room-map-pulse" /> Live 3D map</span>
+          <span className="live-room-map-kicker"><span className="live-room-map-pulse" /> Measured 3D map</span>
           <strong>{mapStatus}</strong>
         </div>
         <b>{mapProgress}%</b>
       </div>
-      <canvas className="live-room-map-canvas" ref={canvasRef} aria-label="Real-time 3D room mapping preview" />
+      <div className="live-room-map-surface">
+        <canvas className="live-room-map-canvas" ref={canvasRef} aria-label="Real-time measured 3D geometry preview" />
+        {!renderError && measuredGeometryCount === 0 && (
+          <div className="live-room-map-empty" role="status">
+            <strong>{scanState?.mappingStage === SCANNER_MAPPING_STAGES.CALIBRATING ? 'Move side to side' : 'Keep moving slowly'}</strong>
+            <small>Measured depth appears here</small>
+          </div>
+        )}
+      </div>
       <div className="live-room-map-footer">
-        <span><i className="live-room-map-key live-room-map-key-unmapped" /> Unmapped</span>
-        <span><i className="live-room-map-key live-room-map-key-mapped" /> Mapped</span>
-        <small>{renderError || (sparsePointCount > 0 ? `${sparsePointCount} points` : 'Collecting geometry')}</small>
+        <span><i className="live-room-map-key live-room-map-key-points" /> {sparsePointCount} points</span>
+        <span><i className="live-room-map-key live-room-map-key-path" /> Path</span>
+        <small>{renderError || (sparsePointCount > 0 ? 'Drag to inspect' : 'Collecting measured depth')}</small>
       </div>
     </div>
   );

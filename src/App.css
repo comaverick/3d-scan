@@ -335,9 +335,9 @@ button:focus-visible { outline: 2px solid var(--accent-hot); outline-offset: 3px
   right: 16px;
   width: min(238px, calc(100% - 32px));
   overflow: hidden;
-  border: 1px solid rgba(116, 205, 255, .5);
+  border: 1px solid rgba(241, 238, 230, .28);
   border-radius: 14px;
-  background: rgba(4, 15, 30, .82);
+  background: rgba(13, 17, 16, .86);
   box-shadow: 0 12px 34px rgba(0, 10, 24, .3), inset 0 0 0 1px rgba(255, 255, 255, .04);
   backdrop-filter: blur(12px);
   pointer-events: auto;
@@ -345,18 +345,22 @@ button:focus-visible { outline: 2px solid var(--accent-hot); outline-offset: 3px
 }
 .live-room-map-heading { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; padding: 10px 11px 7px; color: #d8f7ff; }
 .live-room-map-heading > div { display: grid; gap: 3px; min-width: 0; }
-.live-room-map-kicker { display: inline-flex; align-items: center; gap: 6px; color: #8bdcff; font: 9px/1 'SFMono-Regular', Consolas, monospace; letter-spacing: .09em; text-transform: uppercase; }
-.live-room-map-heading strong { overflow: hidden; color: rgba(216, 247, 255, .72); font-size: 10px; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
+.live-room-map-kicker { display: inline-flex; align-items: center; gap: 6px; color: var(--accent-hot); font: 9px/1 'SFMono-Regular', Consolas, monospace; letter-spacing: .09em; text-transform: uppercase; }
+.live-room-map-heading strong { overflow: hidden; color: rgba(241, 238, 230, .68); font-size: 10px; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
 .live-room-map-heading > b { flex: 0 0 auto; color: #9bd8b1; font: 600 15px/1 'SFMono-Regular', Consolas, monospace; }
-.live-room-map-pulse { width: 6px; height: 6px; border-radius: 50%; background: #7ad5ff; box-shadow: 0 0 0 3px rgba(122, 213, 255, .13), 0 0 10px rgba(122, 213, 255, .75); }
+.live-room-map-pulse { width: 6px; height: 6px; border-radius: 50%; background: var(--accent-hot); box-shadow: 0 0 0 3px rgba(255, 194, 124, .13), 0 0 10px rgba(255, 194, 124, .58); }
+.live-room-map-surface { position: relative; min-height: 154px; background: radial-gradient(circle at 50% 48%, rgba(151, 216, 177, .08), transparent 58%); }
 .live-room-map-canvas { display: block; width: 100%; height: 154px; outline: none; cursor: grab; }
 .live-room-map-canvas:active { cursor: grabbing; }
-.live-room-map-footer { display: flex; align-items: center; gap: 9px; min-height: 30px; padding: 6px 11px 8px; border-top: 1px solid rgba(139, 220, 255, .14); color: rgba(216, 247, 255, .66); font: 8px/1 'SFMono-Regular', Consolas, monospace; }
+.live-room-map-empty { position: absolute; inset: 50% auto auto 50%; display: grid; gap: 4px; width: max-content; max-width: calc(100% - 24px); transform: translate(-50%, -50%); text-align: center; pointer-events: none; }
+.live-room-map-empty strong { color: var(--paper); font-size: 10px; font-weight: 650; }
+.live-room-map-empty small { color: rgba(241, 238, 230, .52); font: 8px/1.2 'SFMono-Regular', Consolas, monospace; }
+.live-room-map-footer { display: flex; align-items: center; gap: 9px; min-height: 30px; padding: 6px 11px 8px; border-top: 1px solid rgba(241, 238, 230, .12); color: rgba(241, 238, 230, .62); font: 8px/1 'SFMono-Regular', Consolas, monospace; }
 .live-room-map-footer span { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
-.live-room-map-footer small { overflow: hidden; margin-left: auto; color: rgba(216, 247, 255, .48); font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
-.live-room-map-key { width: 7px; height: 7px; display: inline-block; border-radius: 2px; }
-.live-room-map-key-unmapped { background: #1e6eff; box-shadow: 0 0 7px rgba(30, 110, 255, .7); }
-.live-room-map-key-mapped { background: #9bd8b1; box-shadow: 0 0 7px rgba(155, 216, 177, .52); }
+.live-room-map-footer small { overflow: hidden; margin-left: auto; color: rgba(241, 238, 230, .42); font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
+.live-room-map-key { width: 7px; height: 7px; display: inline-block; border-radius: 50%; }
+.live-room-map-key-points { background: #b8efd0; box-shadow: 0 0 7px rgba(184, 239, 208, .64); }
+.live-room-map-key-path { background: var(--accent-hot); box-shadow: 0 0 7px rgba(255, 194, 124, .62); }
 
 .scanner-live-hud {
   position: absolute;
@@ -622,6 +626,7 @@ button:focus-visible { outline: 2px solid var(--accent-hot); outline-offset: 3px
     width: 168px;
     border-radius: 12px;
   }
+  .workspace-live-compact .live-room-map-surface { min-height: 104px; }
   .workspace-live-compact .live-room-map-canvas { height: 104px; }
   .workspace-live-compact .live-room-map-heading { padding: 8px 9px 6px; }
   .workspace-live-compact .live-room-map-footer { min-height: 25px; padding: 5px 9px 6px; font-size: 7px; }
