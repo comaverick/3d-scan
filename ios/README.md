@@ -12,9 +12,10 @@ This is the native scanner core for the SmartScan room reconstruction path. It u
 
 ## Polycam-style live scanning
 
-- The first normally tracked AR frame becomes the origin.
+- The first normally tracked AR frame becomes the origin, then the scanner spends about two seconds in a side-to-side calibration pass so the room can stabilize before the coverage guide appears.
 - LiDAR-capable devices enable ARKit scene reconstruction and scene depth. The room mesh appears live over the camera as ARKit updates its mesh anchors.
-- Blue dots and connecting grid lines mark screen areas without usable depth. As depth becomes available, those blue marks disappear. Keep moving until the blue areas are covered, then add another angle for overlap.
+- Once calibration finishes, the whole view starts as a blue-tinted dot/grid guide. Blue cells remain until they have been observed with valid depth while the camera moves; scanning that area makes the blue tint clear so the live camera color and projected mesh texture show through.
+- Mesh chunks use the current camera image projected onto their reconstructed vertices, with a light wireframe on top. This creates the live textured-mesh feel while scanning; final baked texture atlases still require a reconstruction/export step after capture.
 - The scanner saves overlapping keyframes automatically when the camera translates or rotates enough. There is no forced turn-and-return route; walk around the room at a steady pace and tap **Finish Scan** after at least three useful frames.
 - Devices without LiDAR keep AR world tracking and frame capture, but cannot provide the same live room mesh or depth coverage guide.
 

@@ -122,6 +122,68 @@ function scannerTargetDebugEnabled() {
 const SCANNER_TARGET_DEBUG = scannerTargetDebugEnabled();
 const SCANNER_DEBUG = scannerDebugEnabled() || SCANNER_TARGET_DEBUG;
 
+export const SCANNER_MAPPING_STAGES = Object.freeze({
+  IDLE: 'IDLE',
+  CALIBRATING: 'CALIBRATING',
+  MAPPING: 'MAPPING',
+});
+
+export const scannerCalibrationConfig = Object.freeze({
+  durationMs: 2000,
+  minimumSweepDegrees: 24,
+  minimumVisualMovement: 0.08,
+});
+
+export function createScannerCalibrationState(startedAt = 0) {
+  return {
+    startedAt: Number(startedAt) || 0,
+    elapsedMs: 0,
+    progress: 0,
+    sweptDegrees: 0,
+    directionChanges: 0,
+    lastHeading: null,
+    lastDirection: 0,
+    complete: false,
+  };
+}
+
+export function advanceScannerCalibration(previous = {}, {
+  now = Date.now(),
+  heading = null,
+  visualParallax = 0,
+  sceneChange = 0,
+} = {}) {
+  const timestamp = Number.isFinite(Number(now)) ? Number(now) : Date.now();
+  const next = {
+    ...createScannerCalibrationState(),
+    ...previous,
+  };
+  if (!Number.isFinite(Number(next.startedAt)) || Number(next.startedAt) <= 0) next.startedAt = timestamp;
+
+  const nextHeading = Number.isFinite(Number(heading)) ? ((Number(heading) % 360) + 360) % 360 : null;
+  if (nextHeading !== null && Number.isFinite(Number(next.lastHeading))) {
+    const delta = normalizedAngleDelta(Number(next.lastHeading), nextHeading);
+    if (Math.abs(delta) >= 1.5) {
+      const direction = Math.sign(delta);
+      next.sweptDegrees = Math.min(360, (Number(next.sweptDegrees) || 0) + Math.abs(delta));
+      if (next.lastDirection && direction !== next.lastDirection) next.directionChanges = (Number(next.directionChanges) || 0) + 1;
+      next.lastDirection = direction;
+    }
+  } else if (nextHeading === null) {
+    const visualMovement = Math.max(Number(visualParallax) || 0, Number(sceneChange) || 0);
+    next.sweptDegrees = Math.min(360, (Number(next.sweptDegrees) || 0) + (visualMovement * 90));
+  }
+  if (nextHeading !== null) next.lastHeading = nextHeading;
+
+  next.elapsedMs = Math.max(0, timestamp - Number(next.startedAt));
+  next.progress = clamp(next.elapsedMs / scannerCalibrationConfig.durationMs, 0, 1);
+  const movementEvidence = (Number(next.sweptDegrees) || 0) >= scannerCalibrationConfig.minimumSweepDegrees
+    || (Number(next.directionChanges) || 0) > 0
+    || (nextHeading === null && Math.max(Number(visualParallax) || 0, Number(sceneChange) || 0) >= scannerCalibrationConfig.minimumVisualMovement);
+  next.complete = next.progress >= 1 && movementEvidence;
+  return next;
+}
+
 /* Legacy fixed-route guidance is intentionally disabled. Adaptive guidance below uses live scan state.
 const GUIDANCE_STEPS = [
   {
@@ -550,6 +612,8 @@ function createInitialScanState() {
   const regions = createCoverageRegions();
   return {
     phase: SCANNER_PHASES.INITIAL_TRACKING,
+    mappingStage: SCANNER_MAPPING_STAGES.IDLE,
+    calibration: createScannerCalibrationState(),
     mapping: {
       referenceCameraPose: null,
       acceptedKeyframes: 0,
@@ -1360,13 +1424,29 @@ export function determineNextAction(scanState) {
     ? eligibleTargets.find((region) => region.id === scanState.activeTargetId) || null
     : null;
   const targetRegion = lockedTarget || eligibleTargets[0];
+  if (scanState?.mappingStage === SCANNER_MAPPING_STAGES.CALIBRATING) {
+    const calibrationProgress = Math.round((Number(scanState?.calibration?.progress) || 0) * 100);
+    return {
+      type: 'INITIAL_MAPPING',
+      direction: '↔',
+      label: 'CALIBRATING ROOM',
+      eyebrow: 'Side-to-side sweep',
+      title: 'Sweep side to side',
+      instruction: 'Slowly pan left and right for two seconds so the room can be tracked before the blue coverage guide appears.',
+      helper: 'Keep the phone level and move across a few visible room features.',
+      target: `${calibrationProgress}% calibrated`,
+      priority: 1,
+      confidence: 1,
+      adaptiveGuidance: null,
+    };
+  }
   if ((scanState?.framesEvaluated || 0) === 0 && (scanState?.acceptedFrames || 0) === 0) {
     return { type: 'START_SCAN', direction: 'O', label: 'READY TO SCAN', eyebrow: 'Initial room mapping', title: 'Start with a slow room sweep', instruction: 'Move slowly around the room.', helper: 'The scanner will build a spatial map before it suggests any area to capture.', target: 'Initial mapping', priority: 1, confidence: 1, adaptiveGuidance: null };
   }
   if (scanState?.trackingStatus === 'LOST' || scanState?.motionState === MOTION_STATES.TRACKING_LOST) {
     return { type: 'TRACKING_LOST', direction: 'O', label: 'STAY WITH THE SCAN', eyebrow: 'Automatic relocalization is still running', title: 'I lost track of the room', instruction: "Slowly point the camera toward an area you've already scanned.", helper: 'Your captured coverage is safe. Once the room comes back into view, keep scanning.', target: 'Finding the room again', priority: 1.2, confidence: 0.95, adaptiveGuidance: null };
   }
-  if (isInitialTrackingPhase(phase)) {
+  if (isInitialTrackingPhase(phase) && scanState?.mappingStage !== SCANNER_MAPPING_STAGES.MAPPING) {
     const mappingReadiness = scanState?.mappingReadiness || calculateInitialMappingReadiness(scanState);
     return {
       type: 'INITIAL_MAPPING',
@@ -1377,6 +1457,21 @@ export function determineNextAction(scanState) {
       instruction: 'Move slowly around the room.',
       helper: mappingReadiness.reason,
       target: `${mappingReadiness.acceptedKeyframes || 0} accepted keyframes`,
+      priority: 0.7,
+      confidence: 0.9,
+      adaptiveGuidance: null,
+    };
+  }
+  if (isInitialTrackingPhase(phase) && scanState?.mappingStage === SCANNER_MAPPING_STAGES.MAPPING) {
+    return {
+      type: 'SCAN_LOW_COVERAGE_REGION',
+      direction: 'O',
+      label: 'SCAN BLUE AREAS',
+      eyebrow: 'Coverage guide is ready',
+      title: 'Scan the blue areas',
+      instruction: 'Move slowly through the room and keep overlapping the blue sections until they clear.',
+      helper: 'The map is still collecting enough tracked views to unlock detailed guidance.',
+      target: `${Math.round((scanState?.totalCoverage || 0) * 100)}% useful coverage`,
       priority: 0.7,
       confidence: 0.9,
       adaptiveGuidance: null,
@@ -1453,7 +1548,13 @@ export function determineNextAction(scanState) {
 // normal scanning should not expose its chosen region as the user's workflow.
 // This adapter keeps only the few corrections that protect scan quality.
 export function continuousScanInstructionFor(scanState, diagnosticInstruction = {}) {
-  if (isInitialTrackingPhase(scanState?.phase)) return {
+  if (scanState?.mappingStage === SCANNER_MAPPING_STAGES.CALIBRATING) return {
+    ...diagnosticInstruction,
+    type: 'INITIAL_MAPPING',
+    targetRegion: undefined,
+    adaptiveGuidance: null,
+  };
+  if (isInitialTrackingPhase(scanState?.phase) && scanState?.mappingStage !== SCANNER_MAPPING_STAGES.MAPPING) return {
     ...diagnosticInstruction,
     type: 'INITIAL_MAPPING',
     targetRegion: undefined,
@@ -1526,7 +1627,8 @@ export function chooseGuidancePlacement(targetBounds) {
 }
 
 export function coverageOverlayRegionsFor(scanState, config = coverageOverlayConfig) {
-  if (!isContinuousMappingPhase(scanState?.phase)) return [];
+  const mappingHasStarted = scanState?.mappingStage === SCANNER_MAPPING_STAGES.MAPPING;
+  if (!isContinuousMappingPhase(scanState?.phase) && !mappingHasStarted) return [];
   const regions = projectCoverageOverlayRegions(
     Array.isArray(scanState?.coverageRegions) ? scanState.coverageRegions : [],
     scanState.currentOrientation,
@@ -1557,7 +1659,11 @@ export function compactGuidanceFor(instruction, scanState = {}) {
     SKIP_AREA: '↗',
     SCAN_COMPLETE: '✓',
   };
-  if (isInitialTrackingPhase(scanState.phase)) {
+  if (scanState.mappingStage === SCANNER_MAPPING_STAGES.CALIBRATING) {
+    const progress = Math.round((Number(scanState.calibration?.progress) || 0) * 100);
+    return { mode: 'SCANNING', icon: '↔', text: 'Sweep side to side', hint: `${progress}% calibrating` };
+  }
+  if (isInitialTrackingPhase(scanState.phase) && scanState.mappingStage !== SCANNER_MAPPING_STAGES.MAPPING) {
     return { mode: 'SCANNING', icon: '↔', text: 'Move slowly around the room', hint: '' };
   }
   if (instruction?.type === 'TRACKING_LOST' || scanState.trackingStatus === 'LOST') {
@@ -2575,6 +2681,7 @@ function App() {
   const cameraFrameRef = useRef(null);
   const streamRef = useRef(null);
   const scanStartedAtRef = useRef(null);
+  const scanCalibrationRef = useRef(createScannerCalibrationState());
   const scanSessionIdRef = useRef(null);
   const pathRef = useRef({ x: 0, y: 0, z: 0, velocity: 0, lastMotionAt: null });
   const lastTelemetryRef = useRef(EMPTY_POSE);
@@ -2653,6 +2760,9 @@ function App() {
   };
   const telemetry = liveTelemetry;
   const roomCoverage = Math.round((scanState.displayProgress ?? scanState.scanProgress ?? scanState.totalCoverage ?? 0) * 100);
+  const liveHudProgress = scanState.mappingStage === SCANNER_MAPPING_STAGES.CALIBRATING
+    ? Math.round((Number(scanState.calibration?.progress) || 0) * 100)
+    : roomCoverage;
   const canFinish = isFinished || scanState.finishUnlocked || canManuallyFinishScan(scanState) || scanState.scanReady;
 
   const finishHint = useMemo(() => {
@@ -2976,9 +3086,14 @@ function App() {
     guidanceControllerRef.current.reset();
     guidanceWatchdogRef.current = { targetId: null, startedAt: 0, startingCoverage: 0 };
     activeTargetIdRef.current = null;
-    const initialScanState = createInitialScanState();
+    const initialScanState = {
+      ...createInitialScanState(),
+      mappingStage: SCANNER_MAPPING_STAGES.CALIBRATING,
+      calibration: createScannerCalibrationState(),
+    };
     scanStateRef.current = initialScanState;
     setScanState(initialScanState);
+    scanCalibrationRef.current = createScannerCalibrationState();
     orientationRef.current = { alpha: null, beta: null, gamma: null, heading: null, pitch: 0, pitchDegrees: 0, headingDegrees: null, rollDegrees: 0 };
     previousFrameGrayRef.current = null;
     featureTracksRef.current = [];
@@ -3135,6 +3250,26 @@ function App() {
           };
           const pose = { ...lastTelemetryRef.current };
            const now = Date.now();
+           let mappingStage = scanStateRef.current.mappingStage || SCANNER_MAPPING_STAGES.CALIBRATING;
+           let calibrationState = scanCalibrationRef.current;
+           if (mappingStage === SCANNER_MAPPING_STAGES.CALIBRATING) {
+             calibrationState = advanceScannerCalibration(calibrationState, {
+               now,
+               heading: orientationRef.current.heading,
+               visualParallax: analysis.visualParallax,
+               sceneChange: analysis.sceneChange,
+             });
+             scanCalibrationRef.current = calibrationState;
+             mappingStage = calibrationState.complete
+               ? SCANNER_MAPPING_STAGES.MAPPING
+               : SCANNER_MAPPING_STAGES.CALIBRATING;
+             scanStateRef.current = {
+               ...scanStateRef.current,
+               mappingStage,
+               calibration: calibrationState,
+             };
+             if (calibrationState.complete) setLastEvent('Calibration complete. Scan the blue areas until they clear.');
+           }
            const parallaxDistance = lastCoveragePoseRef.current ? poseDistance(lastCoveragePoseRef.current, pose) : 0;
            const nextState = updateCoverageFromFrame(scanStateRef.current, orientationRef.current, pose, analysis, parallaxDistance, {
              accepted: false,
@@ -3144,6 +3279,8 @@ function App() {
              trackedFeatureCount: analysis.trackedFeatureCount,
              multiFrameFeatureTrackCount: analysis.multiFrameFeatureTrackCount,
            });
+           nextState.mappingStage = mappingStage;
+           nextState.calibration = calibrationState;
            const watchdog = guidanceWatchdogRef.current;
            const watchedTarget = watchdog.targetId ? nextState.coverageRegions.find((region) => region.id === watchdog.targetId) : null;
            nextState.targetStalled = isTargetStalled(watchdog, watchedTarget, now);
@@ -3286,6 +3423,8 @@ function App() {
       coordinateSystem: 'browser-estimated local path; synchronized DeviceOrientation and DeviceMotion when available',
       scanState: {
         phase: scanState.phase,
+        mappingStage: scanState.mappingStage,
+        calibration: scanState.calibration,
         mapping: scanState.mapping,
         mappingReadiness: scanState.mappingReadiness,
         trackedFeatureCount: scanState.trackedFeatureCount,
@@ -3609,6 +3748,7 @@ function App() {
         acceptedFrames: frames.length,
         ...(payload.scanState || {}),
       };
+      scanCalibrationRef.current = createScannerCalibrationState(importedScanState.calibration?.startedAt);
       scanStateRef.current = importedScanState;
       setScanState(importedScanState);
       setLastEvent(`Loaded ${frames.length} measured keyframes from ${file.name}.`);
@@ -3638,6 +3778,7 @@ function App() {
     setCameraState('idle');
     setSensorState('idle');
     const initialScanState = createInitialScanState();
+    scanCalibrationRef.current = createScannerCalibrationState();
     featureTracksRef.current = [];
     featureFrameIndexRef.current = 0;
     guidanceControllerRef.current.reset();
@@ -3771,13 +3912,22 @@ function App() {
             )}
             {isScanning && !SCANNER_DEBUG && (
               <>
-                <div className="scanner-live-hud" aria-label={`Scan room ${roomCoverage}%`}>
+                <div className="scanner-live-hud" aria-label={`${scanState.mappingStage === SCANNER_MAPPING_STAGES.CALIBRATING ? 'Calibrating room' : 'Scan room'} ${liveHudProgress}%`}>
                   <div className="scanner-live-hud-heading">
-                    <span>Scan room</span>
-                    <strong>{roomCoverage}%</strong>
+                    <span>{scanState.mappingStage === SCANNER_MAPPING_STAGES.CALIBRATING ? 'Calibrating room' : 'Scan room'}</span>
+                    <strong>{liveHudProgress}%</strong>
                   </div>
-                  <div className="scanner-live-progress" aria-hidden="true"><span style={{ width: `${roomCoverage}%` }} /></div>
+                  <div className="scanner-live-progress" aria-hidden="true"><span style={{ width: `${liveHudProgress}%` }} /></div>
                 </div>
+                {scanState.mappingStage === SCANNER_MAPPING_STAGES.CALIBRATING && (
+                  <div className="scanner-calibration-card" role="status" aria-live="polite">
+                    <span className="scanner-calibration-icon" aria-hidden="true">↔</span>
+                    <div>
+                      <strong>SWEEP SIDE TO SIDE</strong>
+                      <small>Calibrating the room map · {liveHudProgress}%</small>
+                    </div>
+                  </div>
+                )}
                 {mappingToast && <div className="scanner-mapping-toast" role="status">✓ {mappingToast}</div>}
                 <div className={`scanner-compact-guidance scanner-compact-guidance-${guidancePlacement} scanner-compact-guidance-${compactGuidance.mode.toLowerCase()}`} role="status" aria-live="polite">
                   <span className="scanner-compact-icon" aria-hidden="true">{compactGuidance.icon}</span>
@@ -4631,11 +4781,16 @@ function LiveRoomMap({ scanState }) {
   sourceRef.current = scanState;
 
   const roomCoverage = Math.round(((Number(scanState?.displayProgress) || Number(scanState?.scanProgress) || 0) * 100));
+  const mapProgress = scanState?.mappingStage === SCANNER_MAPPING_STAGES.CALIBRATING
+    ? Math.round((Number(scanState?.calibration?.progress) || 0) * 100)
+    : roomCoverage;
   const sparsePointCount = Array.isArray(scanState?.sparsePoints)
     ? scanState.sparsePoints.length
     : Array.isArray(scanState?.liveMap?.sparsePoints) ? scanState.liveMap.sparsePoints.length : 0;
-  const mapStatus = isInitialTrackingPhase(scanState?.phase)
-    ? 'Building map'
+  const mapStatus = scanState?.mappingStage === SCANNER_MAPPING_STAGES.CALIBRATING
+    ? 'Calibrating room'
+    : isInitialTrackingPhase(scanState?.phase) && scanState?.mappingStage !== SCANNER_MAPPING_STAGES.MAPPING
+      ? 'Building map'
     : scanState?.scanReady ? 'Map ready' : 'Live mapping';
 
   useEffect(() => {
@@ -4949,7 +5104,7 @@ function LiveRoomMap({ scanState }) {
           <span className="live-room-map-kicker"><span className="live-room-map-pulse" /> Live 3D map</span>
           <strong>{mapStatus}</strong>
         </div>
-        <b>{roomCoverage}%</b>
+        <b>{mapProgress}%</b>
       </div>
       <canvas className="live-room-map-canvas" ref={canvasRef} aria-label="Real-time 3D room mapping preview" />
       <div className="live-room-map-footer">
@@ -4961,11 +5116,11 @@ function LiveRoomMap({ scanState }) {
   );
 }
 
-function SpatialOverlayCanvas({ initialMapping, projectedCells, sparsePoints, structuralEdges }) {
+function SpatialOverlayCanvas({ initialMapping, calibrating, projectedCells, sparsePoints, structuralEdges }) {
   const canvasRef = useRef(null);
-  const sourceRef = useRef({ initialMapping, projectedCells, sparsePoints, structuralEdges });
+  const sourceRef = useRef({ initialMapping, calibrating, projectedCells, sparsePoints, structuralEdges });
   const smoothedOpacityRef = useRef(new Map());
-  sourceRef.current = { initialMapping, projectedCells, sparsePoints, structuralEdges };
+  sourceRef.current = { initialMapping, calibrating, projectedCells, sparsePoints, structuralEdges };
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -4989,7 +5144,7 @@ function SpatialOverlayCanvas({ initialMapping, projectedCells, sparsePoints, st
         context.clearRect(0, 0, width, height);
         const source = sourceRef.current;
         if (source.initialMapping) {
-          context.fillStyle = 'rgba(30, 110, 255, 0.18)';
+          context.fillStyle = source.calibrating ? 'rgba(30, 110, 255, 0.07)' : 'rgba(30, 110, 255, 0.18)';
           context.fillRect(0, 0, width, height);
         } else {
           const reducedMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
@@ -5066,7 +5221,9 @@ function CoverageOverlay({ scanState }) {
   return (
     <>
       <SpatialOverlayCanvas
-        initialMapping={isInitialTrackingPhase(scanState?.phase)}
+        initialMapping={scanState?.mappingStage === SCANNER_MAPPING_STAGES.CALIBRATING
+          || (isInitialTrackingPhase(scanState?.phase) && scanState?.mappingStage !== SCANNER_MAPPING_STAGES.MAPPING)}
+        calibrating={scanState?.mappingStage === SCANNER_MAPPING_STAGES.CALIBRATING}
         projectedCells={projectedCells}
         sparsePoints={sparsePoints}
         structuralEdges={structuralEdges}
@@ -5103,7 +5260,8 @@ function CoverageMap({ scanState, targetRegion }) {
         <span className="tracking-badge" title="Weighted useful scan progress">{Math.round(((scanState.scanProgress ?? scanState.totalCoverage) || 0) * 100)}%</span>
       </div>
       <div className="coverage-map" role="img" aria-label="Coverage from observed spatial regions">
-        {isInitialTrackingPhase(scanState.phase) ? (
+        {scanState.mappingStage === SCANNER_MAPPING_STAGES.CALIBRATING
+          || (isInitialTrackingPhase(scanState.phase) && scanState.mappingStage !== SCANNER_MAPPING_STAGES.MAPPING) ? (
           <div className="coverage-map-row"><span className="coverage-map-label">Spatial map</span><span className="coverage-map-empty">Collecting accepted views and feature tracks…</span></div>
         ) : (
           <div className="coverage-map-row">

@@ -1,5 +1,5 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
-import App, { blueCoverageOpacity, canManuallyFinishScan, calculateScanProgress, calculateScanReadiness, chooseGuidancePlacement, compactGuidanceFor, continuousScanInstructionFor, countFeaturesInRegion, coverageOverlayRegionsFor, createCameraDisplayTransform, createDirectionalCoverageGrid, createGuidanceController, createInitialScanState, determineNextAction, distinctViewpointsFromFrames, estimateSupportedPlanes, friendlyReconstructionError, isTargetStalled, normalizedToDisplay, ProcessingScreen, projectDirectionalCoverageCells, reconstructionProgressSteps, reconstructionStatusLabel, recordFrameEvaluation, selectReconstructionKeyframes, stabilizeScanProgress, structuralEdgesFromPlanes, summarizeDirectionalCoverage, targetPriorityForScan, triangulateSparsePoints, updateCoverageFromFrame, updateDirectionalCoverageGrid, updateFeatureTracks, validateTargetGeometry, viewpointNovelty } from './App';
+import App, { advanceScannerCalibration, blueCoverageOpacity, canManuallyFinishScan, calculateScanProgress, calculateScanReadiness, chooseGuidancePlacement, compactGuidanceFor, continuousScanInstructionFor, countFeaturesInRegion, coverageOverlayRegionsFor, createCameraDisplayTransform, createDirectionalCoverageGrid, createGuidanceController, createInitialScanState, createScannerCalibrationState, determineNextAction, distinctViewpointsFromFrames, estimateSupportedPlanes, friendlyReconstructionError, isTargetStalled, normalizedToDisplay, ProcessingScreen, projectDirectionalCoverageCells, reconstructionProgressSteps, reconstructionStatusLabel, recordFrameEvaluation, SCANNER_MAPPING_STAGES, selectReconstructionKeyframes, stabilizeScanProgress, structuralEdgesFromPlanes, summarizeDirectionalCoverage, targetPriorityForScan, triangulateSparsePoints, updateCoverageFromFrame, updateDirectionalCoverageGrid, updateFeatureTracks, validateTargetGeometry, viewpointNovelty } from './App';
 
 const goodAnalysis = {
   qualityScore: 0.82,
@@ -29,7 +29,7 @@ test('starts with initial mapping guidance and no target request', async () => {
   const { container } = render(<App />);
   fireEvent.click(screen.getByRole('button', { name: /start scan/i }));
 
-  await waitFor(() => expect(screen.getByText('Move slowly around the room')).toBeInTheDocument());
+  await waitFor(() => expect(screen.getByText('Sweep side to side')).toBeInTheDocument());
   expect(screen.queryByRole('region', { name: /measured scan coverage/i })).not.toBeInTheDocument();
   expect(container.querySelector('.scanner-spatial-overlay')).toBeInTheDocument();
   expect(container.querySelector('.scanner-live-hud')).toBeInTheDocument();
@@ -42,6 +42,22 @@ test('insufficient live data keeps guidance in initial mapping', () => {
   const action = determineNextAction({ ...createInitialScanState(), framesEvaluated: 4, acceptedFrames: 4 });
   expect(action.type).toBe('INITIAL_MAPPING');
   expect(action.instruction).toBe('Move slowly around the room.');
+});
+
+test('mobile web calibration completes after two seconds of side-to-side movement', () => {
+  let calibration = createScannerCalibrationState();
+  calibration = advanceScannerCalibration(calibration, { now: 1000, heading: 0 });
+  calibration = advanceScannerCalibration(calibration, { now: 1900, heading: 20 });
+  calibration = advanceScannerCalibration(calibration, { now: 3100, heading: 350 });
+
+  expect(calibration.progress).toBe(1);
+  expect(calibration.sweptDegrees).toBeGreaterThanOrEqual(24);
+  expect(calibration.complete).toBe(true);
+  expect(compactGuidanceFor({}, {
+    ...createInitialScanState(),
+    mappingStage: SCANNER_MAPPING_STAGES.CALIBRATING,
+    calibration,
+  }).text).toBe('Sweep side to side');
 });
 
 test('rejected frames do not add keyframes or spatial observations', () => {
